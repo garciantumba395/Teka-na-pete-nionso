@@ -11,6 +11,7 @@
     "test": "vitest run",
     "sync:design": "python3 replica/design/build_tokens.py && cp replica/design/tokens.json replica/design/tokens.css replica/design/primitives.css replica/design/tailwind.tokens.ts src/styles/",
     "e2e": "node e2e/journey.cjs",
+    "gen:icons": "tsx scripts/gen-icons.ts",
     "db:migrate": "tsx scripts/db.ts migrate",
     "db:seed": "tsx scripts/db.ts seed",
     "db:seed-demo": "tsx scripts/db.ts seed-demo",

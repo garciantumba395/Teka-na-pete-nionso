@@ -24,6 +24,7 @@ test.describe("SEC Sécurité", () => {
   });
 
   test("SEC-2 identifiants invalides sur toutes les routes à identifiant : jamais 5xx", async ({ makeActor }) => {
+    test.setTimeout(120_000); // ~200 requêtes séquentielles : plus de 45 s sur PostgreSQL quand la machine est chargée
     const a = await makeActor("Id invalides");
     const values = ["x", "1;drop table items", "..%2F..%2Fetc%2Fpasswd", "%00", "00000000-0000-4000-8000-000000000000", "a".repeat(3000), "%F0%9F%8C%8D"];
     for (const v of values) {

@@ -22,6 +22,8 @@ import { CONDITIONS, validateListing } from "../../validation";
 import type { DataLayer } from "../types";
 import { UUID_RE } from "../ids";
 import { pgCode, withTx, type Client, type Pool, type Queryable } from "./pool";
+import { checkListingText, publicRule } from "../../prohibited";
+import { createProhibitedLoader } from "./prohibited";
 import { createSettingsLoader } from "./settings";
 
 export interface PgOptions {
@@ -106,6 +108,7 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
   const fixedOtp = prod ? undefined : (opts.otpCode ?? process.env.DEV_FIXED_OTP);
   const otpSecret = opts.otpSecret ?? process.env.OTP_SECRET ?? "dev-only-otp-secret-change-me";
   const getFees = createSettingsLoader(pool, now, opts.settingsTtlMs ?? 30_000);
+  const prohibited = createProhibitedLoader(pool, now, opts.settingsTtlMs ?? 30_000); // agent E
   const queue: ProviderEvent[] = [];
 
   const hashOtp = (phone: string, code: string) => createHmac("sha256", otpSecret).update(`${phone}:${code}`).digest("hex");
@@ -649,6 +652,7 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
     async publishItem(sellerId, itemId) {
       if (!isUuid(itemId)) throw notFound("Annonce");
       const fees = await getFees();
+      const bannedRules = await prohibited.compiled(); // agent E : chargé avant la transaction
       return withTx(pool, async (c) => {
         const it = (await c.query(`select * from items where id = $1 and seller_id = $2 for update`, [itemId, sellerId])).rows[0];
         if (!it) throw notFound("Annonce");
@@ -660,6 +664,10 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
           { title: it.title, description: it.description, categoryId: it.category_id, condition: it.condition, sizeLabel: it.size_label, brand: it.brand,
             priceMinor: it.price_minor, currency: it.currency, areaId: it.area_id, photos }, cats, fees);
         if (Object.keys(errors).length) throw new AppError("VALIDATION", "Corrige les champs signalés.", 422, errors as Record<string, string>);
+        // ---- agent E : articles interdits (aucun contournement ; la transaction est annulée, l'annonce reste en brouillon)
+        const banned = checkListingText({ title: it.title, description: it.description, brand: it.brand }, bannedRules);
+        if (banned) throw new AppError("PROHIBITED_ITEM", banned.hit.message, 422, { [banned.field]: banned.hit.message });
+        // ---- fin agent E
         const u = await c.query(`update items set status = 'active', published_at = $2 where id = $1 returning *`, [itemId, ts(now())]);
         return itemOf(u.rows[0], photos);
       });
@@ -1301,6 +1309,12 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
       const r = await pool.query(`select * from payouts where user_id = $1 order by requested_at desc limit 100`, [userId]);
       return r.rows.map(payoutOf);
     },
+
+    // ---- agent E : articles interdits
+    async listProhibitedRules() {
+      return (await prohibited.list()).map(publicRule);
+    },
+    // ---- fin agent E
   };
 
   async function refundAtProvider(r: { providerRef: string; amountMinor: number }) {

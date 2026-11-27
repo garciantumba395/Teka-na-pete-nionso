@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { api, ApiError } from "./api";
 import { PhotoPicker } from "./PhotoPicker";
@@ -36,6 +37,7 @@ export function SellForm({ categories, areas, defaultAreaId }: { categories: Cat
   const [errors, setErrors] = useState<FieldErrors>({});
   const [formError, setFormError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [prohibited, setProhibited] = useState(false); // agent E : refus « article interdit »
 
   const parents = categories.filter((c) => c.parentId === null);
   const err = (k: keyof FieldErrors) => errors[k];
@@ -45,6 +47,7 @@ export function SellForm({ categories, areas, defaultAreaId }: { categories: Cat
     e.preventDefault();
     if (busy) return;
     setFormError(null);
+    setProhibited(false);
     const priceMinor = parseMoneyInput(priceRaw, currency);
     const input = { title, description, categoryId, condition, sizeLabel, brand, priceMinor: priceMinor ?? NaN, currency, areaId: areaId || null, photos };
     const found = validateListing(input, categories);
@@ -68,6 +71,12 @@ export function SellForm({ categories, areas, defaultAreaId }: { categories: Cat
       }
       if (e2 instanceof ApiError && e2.details) setErrors(e2.details as FieldErrors);
       setFormError(e2 instanceof ApiError ? e2.message : "Erreur inattendue.");
+      if (e2 instanceof ApiError && e2.code === "PROHIBITED_ITEM") {
+        setProhibited(true);
+        // le refus désigne le champ (titre, description ou marque) : on y amène le focus une fois le message affiché
+        const field = (["title", "description", "brand"] as const).find((k) => e2.details?.[k]);
+        if (field) setTimeout(() => document.getElementById(field)?.focus(), 0);
+      }
       setBusy(false);
     }
   }
@@ -76,9 +85,13 @@ export function SellForm({ categories, areas, defaultAreaId }: { categories: Cat
 
   return (
     <form className="stack-lg" onSubmit={submit} noValidate>
+      <p className="hint" style={{ margin: 0 }}>Avant de publier : <Link href="/legal/articles-interdits">ce qu&apos;on ne peut pas vendre</Link>.</p>
       {(formError || errorCount > 0) && (
         <div className="banner danger" role="alert">
-          <div><strong>{formError ?? "Corrige les champs signalés"}</strong>{errorCount > 0 && `${errorCount} champ${errorCount > 1 ? "s" : ""} à vérifier.`}</div>
+          <div>
+            <strong>{formError ?? "Corrige les champs signalés"}</strong>{!prohibited && errorCount > 0 && `${errorCount} champ${errorCount > 1 ? "s" : ""} à vérifier.`}
+            {prohibited && <> <Link href="/legal/articles-interdits">Voir ce qu&apos;on ne peut pas vendre</Link></>}
+          </div>
         </div>
       )}
 

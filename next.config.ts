@@ -39,6 +39,17 @@ const config: NextConfig = {
             : []),
         ],
       },
+      // Service worker : type JavaScript explicite et JAMAIS de cache HTTP (une mise à jour doit être vue à la visite suivante).
+      {
+        source: "/sw.js",
+        headers: [
+          { key: "Content-Type", value: "application/javascript; charset=utf-8" },
+          { key: "Cache-Control", value: "no-cache, no-store, must-revalidate" },
+          { key: "Service-Worker-Allowed", value: "/" },
+        ],
+      },
+      // Icônes de l'application : cache d'une semaine (réseaux lents), revalidation en arrière-plan.
+      { source: "/icons/:path*", headers: [{ key: "Cache-Control", value: "public, max-age=604800, stale-while-revalidate=86400" }] },
     ];
   },
 };
