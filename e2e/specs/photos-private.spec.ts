@@ -1,5 +1,5 @@
 import { alerts, apiBuyAndPay, apiListing, expect, file, jpegBuffer, open, PHOTO, randomIp, signUp, staffPhone, test, type Actor } from "../support";
-import type { Locator } from "@playwright/test";
+import type { APIRequestContext, Locator } from "@playwright/test";
 
 // Photos jointes aux messages et aux preuves de litige : envoi, affichage, contrôle d'accès, refus des faux fichiers.
 
@@ -16,13 +16,17 @@ async function duo(makeActor: (n?: string, p?: string) => Promise<Actor>) {
 }
 // Litiges ouverts par ces tests : clos à la fin de chacun, pour ne pas encombrer la file de l'assistance que d'autres tests parcourent.
 const opened: string[] = [];
+let cleaner: Promise<APIRequestContext> | null = null; // une seule connexion de l'assistance par processus (les envois de code sont limités)
 test.afterEach(async ({ playwright }) => {
   const ids = opened.splice(0);
   if (ids.length === 0) return;
-  const ctx = await playwright.request.newContext({ baseURL: process.env.BASE_URL ?? "http://localhost:3100", extraHTTPHeaders: { "x-forwarded-for": randomIp() } });
-  await signUp(ctx, staffPhone(), "Assistance nettoyage");
+  cleaner ??= (async () => {
+    const c = await playwright.request.newContext({ baseURL: process.env.BASE_URL ?? "http://localhost:3100", extraHTTPHeaders: { "x-forwarded-for": randomIp() } });
+    await signUp(c, staffPhone(), "Assistance nettoyage");
+    return c;
+  })();
+  const ctx = await cleaner;
   for (const id of ids) await ctx.post(`/api/v1/staff/disputes/${id}/resolve`, { data: { outcome: "refund_buyer" } });
-  await ctx.dispose();
 });
 
 async function disputed(makeActor: (n?: string, p?: string) => Promise<Actor>) {
@@ -196,8 +200,7 @@ test.describe("Photos de messages et de preuves", () => {
     const e = await addEvidence(d.buyer, d.disputeId, { photo: PHOTO, note: "preuve" });
     expect(e.status()).toBe(201);
     const evUrl = (await e.json()).dispute.evidence[0].photoUrl as string;
-    const staff2 = await makeActor("Assistance Preuves", staffPhone());
-    for (const who of [d.buyer, d.seller, staff2]) expect((await who.request.get(evUrl)).status()).toBe(200);
+    for (const who of [d.buyer, d.seller, staff]) expect((await who.request.get(evUrl)).status()).toBe(200);
     expect((await tiers.request.get(evUrl)).status()).toBe(404);
     expect((await request.get(evUrl)).status()).toBe(401);
     expect((await tiers.request.get(`/api/v1/disputes/${d.disputeId}`)).status()).toBe(404);
