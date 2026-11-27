@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="Icône de l'application">
+  <rect width="512" height="512" rx="112.64" fill="#2f5bea"/>
+  <path d="M194.56 204.8a61.44 61.44 0 0 1 122.88 0" fill="none" stroke="#ffffff" stroke-width="23.04"/>
+  <rect x="128" y="194.56" width="256" height="204.8" rx="30.72" fill="#ffffff"/>
+  <path d="M204.8 276.48a51.2 51.2 0 0 0 102.4 0" fill="none" stroke="#2f5bea" stroke-width="20.48"/>
+</svg>

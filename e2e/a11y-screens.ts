@@ -34,6 +34,7 @@ export function defineA11y(label: string) {
       });
       await check("404", page, "/items/inexistant");
       await check("Articles interdits (page publique)", page, "/legal/articles-interdits");
+      await check("Hors ligne (/offline)", page, "/offline");
       // acheteur connecté
       const bp = buyer.page;
       await check("S05 vente (vide)", bp, "/sell");

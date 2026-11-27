@@ -70,3 +70,7 @@ a.chip { text-decoration: none; }
 .bubble-warn { font-size: var(--text-sm-size); border-top: 1px solid currentColor; padding-top: var(--space-4); }
 .chat-form { display: flex; gap: var(--space-8); align-items: flex-start; }
 .chat-form .btn { margin-top: 0; flex: none; }
+
+/* Invitation à installer l'application (InstallBanner) : dans le flux, sous la navigation, jamais par-dessus le contenu. */
+.install-banner { margin: var(--space-8) var(--space-16); }
+.install-banner > .iconbtn { flex: none; margin: calc(var(--space-8) * -1) calc(var(--space-12) * -1) 0 0; }
