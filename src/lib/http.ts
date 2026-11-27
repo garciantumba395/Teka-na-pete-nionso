@@ -1,3 +1,4 @@
+import { cleanLine } from "./text";
 import { NextResponse } from "next/server";
 import { AppError, isAppError } from "./types";
 
@@ -26,6 +27,8 @@ const MAX_BODY = 15 * 1024 * 1024; // 15 Mo : 20 photos compressées + marge
 export async function readJson<T = Record<string, unknown>>(req: Request): Promise<T> {
   const len = Number(req.headers.get("content-length") ?? 0);
   if (len > MAX_BODY) throw new AppError("PAYLOAD_TOO_LARGE", "Les données envoyées sont trop volumineuses.", 413);
+  // Un formulaire HTML d'un autre site ne peut envoyer que text/plain, urlencoded ou multipart : exiger du JSON coupe cette voie (CSRF).
+  if (!/^application\/json\b/i.test(req.headers.get("content-type") ?? "")) throw new AppError("UNSUPPORTED_MEDIA_TYPE", "Format de requête non pris en charge.", 415);
   try {
     return (await req.json()) as T;
   } catch {
@@ -33,7 +36,7 @@ export async function readJson<T = Record<string, unknown>>(req: Request): Promi
   }
 }
 
-export const asString = (v: unknown, max = 5000): string => (typeof v === "string" ? v.slice(0, max) : "");
+export const asString = (v: unknown, max = 5000): string => (typeof v === "string" ? cleanLine(v).slice(0, max) : "");
 export const asNumber = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : NaN);
 
 export function num(v: string | null): number | undefined {

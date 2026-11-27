@@ -8,7 +8,7 @@ import { Icon, type IconName } from "./icons";
 
 export function AppBar({ title, back, children }: { title: string; back?: string; children?: ReactNode }) {
   return (
-    <div className="appbar" role="banner">
+    <div className="appbar">
       {back ? (
         <Link href={back} className="iconbtn" aria-label="Retour">
           <Icon name="back" />
@@ -35,13 +35,13 @@ export function Banner({ kind = "info", title, children, role }: { kind?: "info"
   );
 }
 
-export function EmptyState({ icon = "search", title, children, action }: { icon?: IconName; title: string; children?: ReactNode; action?: ReactNode }) {
+export function EmptyState({ icon = "search", title, children, action, heading = false }: { icon?: IconName; title: string; children?: ReactNode; action?: ReactNode; heading?: boolean }) {
   return (
     <div className="empty">
       <div className="art">
         <Icon name={icon} size={40} />
       </div>
-      <strong>{title}</strong>
+      {heading ? <h1 style={{ font: "inherit", fontWeight: 700, margin: 0 }}>{title}</h1> : <strong>{title}</strong>}
       {children ? <span className="muted">{children}</span> : null}
       {action}
     </div>
@@ -90,7 +90,7 @@ export function PriceTag({ item, large = false }: { item: Pick<ItemCard, "priceM
 export function ListingCard({ item, showDistance = false }: { item: ItemCard; showDistance?: boolean }) {
   const unavailable = item.status === "sold" || item.status === "reserved";
   return (
-    <Link href={`/items/${item.id}`} className="card" aria-label={`${item.title}, ${formatMoney(item.priceMinor, item.currency)}${unavailable ? ", indisponible" : ""}`}>
+    <Link href={`/items/${item.id}`} className="card">
       <div className="media">
         {item.photo ? (
           // eslint-disable-next-line @next/next/no-img-element
@@ -113,7 +113,7 @@ export function ListingCard({ item, showDistance = false }: { item: ItemCard; sh
 
 export function SkeletonGrid({ count = 6 }: { count?: number }) {
   return (
-    <div className="grid" aria-busy="true" aria-label="Chargement des annonces">
+    <div className="grid" aria-busy="true">
       {Array.from({ length: count }, (_, i) => (
         <div className="card" key={i} aria-hidden="true">
           <div className="media skeleton" />

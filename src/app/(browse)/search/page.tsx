@@ -1,3 +1,4 @@
+import { cleanLine } from "@/lib/text";
 import type { Metadata } from "next";
 import Link from "next/link";
 import { AppBar, EmptyState, ListingCard } from "@/components/ui";
@@ -12,7 +13,7 @@ const one = (v: string | string[] | undefined) => (Array.isArray(v) ? v[0] : v) 
 
 export default async function SearchPage({ searchParams }: { searchParams: Promise<SP> }) {
   const sp = await searchParams;
-  const q = one(sp.q).trim();
+  const q = cleanLine(one(sp.q)).trim();
   const category = one(sp.category);
   const area = one(sp.area);
   const radius = Number(one(sp.radius)) || 0;
@@ -52,7 +53,7 @@ export default async function SearchPage({ searchParams }: { searchParams: Promi
             <Icon name="search" />
             <input name="q" type="search" defaultValue={q} aria-label="Mot-clé" placeholder="Chercher un article" enterKeyHint="search" />
           </label>
-          <div style={{ display: "grid", gap: "var(--space-8)", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))" }}>
+          <div style={{ display: "grid", gap: "var(--space-8)", gridTemplateColumns: "repeat(auto-fit, minmax(min(150px, 100%), 1fr))" }}>
             <div className="field">
               <label htmlFor="category">Catégorie</label>
               <select id="category" name="category" className="input" defaultValue={category}>
@@ -91,7 +92,7 @@ export default async function SearchPage({ searchParams }: { searchParams: Promi
             {q && <Link className="chip" href={without("q")} aria-label={`Retirer le mot-clé ${q}`}>« {q} » <Icon name="x" size={16} /></Link>}
             {activeCat && <Link className="chip" href={without("category")} aria-label={`Retirer la catégorie ${activeCat.name}`}>{activeCat.name} <Icon name="x" size={16} /></Link>}
             {activeArea && <Link className="chip" href={without("area")} aria-label={`Retirer le lieu ${activeArea.name}`}>{activeArea.name}{radius ? `, ${radius} km` : ""} <Icon name="x" size={16} /></Link>}
-            {maxUsd > 0 && <Link className="chip" href={without("max")} aria-label="Retirer le prix maximum">≤ {maxUsd} $ <Icon name="x" size={16} /></Link>}
+            {maxUsd > 0 && <Link className="chip" href={without("max")}>≤ {maxUsd} $ <Icon name="x" size={16} /><span className="sr-only">, retirer ce filtre</span></Link>}
           </div>
         )}
 

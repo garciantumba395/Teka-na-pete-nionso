@@ -1,5 +1,6 @@
 import { z, type ZodType } from "zod";
 import { AppError } from "./types";
+import { cleanLine, cleanText } from "./text";
 
 // Validation SERVEUR de toutes les entrées. Le client valide pour le confort, jamais pour la sécurité.
 
@@ -7,26 +8,30 @@ const uuid = z.string().uuid("Identifiant invalide.");
 const phone = z.string().trim().min(5, "Numéro trop court.").max(30, "Numéro trop long.");
 const method = z.enum(["mpesa", "orange_money", "airtel_money", "africell_money"], { message: "Moyen de paiement non pris en charge." });
 const currency = z.enum(["USD", "CDF"], { message: "Devise non prise en charge." });
+/** Texte libre nettoyé (voir text.ts) puis borné : la longueur compte après nettoyage. */
+const line = (max: number) => z.string().transform(cleanLine).pipe(z.string().trim().max(max));
+const multiline = (max: number) => z.string().transform(cleanText).pipe(z.string().max(max));
 const idempotencyKey = z.string().min(8).max(100);
 
 export const otpRequest = z.object({ phone });
 export const otpVerify = z.object({
   phone,
   code: z.string().trim().regex(/^\d{6}$/, "Le code a 6 chiffres."),
-  displayName: z.string().trim().max(60).optional(),
+  displayName: line(60).optional(),
 });
 export const mePatch = z.object({
-  displayName: z.string().trim().max(60).optional(),
-  bio: z.string().max(500).optional(),
+  displayName: line(60).optional(),
+  bio: multiline(500).optional(),
   areaId: uuid.nullable().optional(),
 });
 export const itemCreate = z.object({
-  title: z.string().max(200),
-  description: z.string().max(5000).default(""),
+  // Même borne que la contrainte de la base (3 à 80) : sinon la couche factice accepterait un brouillon que PostgreSQL refuse.
+  title: z.string().transform(cleanLine).pipe(z.string().trim().min(3, "Le titre doit faire entre 3 et 80 caractères.").max(80, "Le titre doit faire entre 3 et 80 caractères.")),
+  description: multiline(5000).default(""),
   categoryId: uuid,
   condition: z.string().max(30),
-  sizeLabel: z.string().max(40).nullish(),
-  brand: z.string().max(80).nullish(),
+  sizeLabel: line(40).nullish(),
+  brand: line(80).nullish(),
   priceMinor: z.number({ message: "Indique un prix valide." }).int("Indique un prix valide."),
   currency,
   areaId: uuid.nullish(),
@@ -36,7 +41,7 @@ export const orderCreate = z.object({
   itemIds: z.array(uuid).min(1, "Choisis au moins un article.").max(20),
   deliveryMethod: z.enum(["hand_delivery", "courier", "relay_point"]).default("hand_delivery"),
   deliveryAreaId: uuid.nullish(),
-  deliveryLandmark: z.string().max(200).nullish(),
+  deliveryLandmark: line(200).nullish(),
 });
 export const payOrder = z.object({ method, msisdn: phone, idempotencyKey });
 export const confirmDelivery = z.object({ code: z.string().trim().regex(/^\d{6}$/, "Le code a 6 chiffres.") });

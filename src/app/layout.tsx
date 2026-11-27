@@ -24,7 +24,7 @@ export default async function RootLayout({ children }: { children: React.ReactNo
         <a href="#main" className="skip-link">Aller au contenu</a>
         <div className="shell">
           <MainNav userName={user?.displayName ?? null} />
-          <main id="main">{children}</main>
+          <main id="main" tabIndex={-1}>{children}</main>
         </div>
       </body>
     </html>

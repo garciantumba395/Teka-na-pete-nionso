@@ -13,11 +13,14 @@ const FAILURE_TEXT: Record<string, string> = {
   INSUFFICIENT_FUNDS: "Solde insuffisant sur ton compte mobile money.",
 };
 
-function Countdown({ expiresAt, onExpire }: { expiresAt: number; onExpire: () => void }) {
-  const [left, setLeft] = useState(() => Math.max(0, expiresAt - Date.now()));
+/** Compte à rebours basé sur la durée restante calculée par le serveur et une horloge monotone :
+ *  l'heure du téléphone (souvent fausse) n'entre jamais en jeu. */
+function Countdown({ expiresInMs, onExpire }: { expiresInMs: number; onExpire: () => void }) {
+  const [left, setLeft] = useState(Math.max(0, expiresInMs));
   useEffect(() => {
+    const start = performance.now();
     const t = setInterval(() => {
-      const l = Math.max(0, expiresAt - Date.now());
+      const l = Math.max(0, expiresInMs - (performance.now() - start));
       setLeft(l);
       if (l === 0) {
         clearInterval(t);
@@ -25,7 +28,7 @@ function Countdown({ expiresAt, onExpire }: { expiresAt: number; onExpire: () =>
       }
     }, 1000);
     return () => clearInterval(t);
-  }, [expiresAt, onExpire]);
+  }, [expiresInMs, onExpire]);
   const m = Math.floor(left / 60000);
   const s = Math.floor((left % 60000) / 1000);
   return (
@@ -34,8 +37,8 @@ function Countdown({ expiresAt, onExpire }: { expiresAt: number; onExpire: () =>
 }
 
 export function PayForm({
-  orderId, totalLabel, defaultPhone, expiresAt, initialPending,
-}: { orderId: string; totalLabel: string; defaultPhone: string; expiresAt: number; initialPending: boolean }) {
+  orderId, totalLabel, defaultPhone, expiresInMs, initialPending,
+}: { orderId: string; totalLabel: string; defaultPhone: string; expiresInMs: number; initialPending: boolean }) {
   const hydrated = useHydrated();
   const router = useRouter();
   const [phase, setPhase] = useState<Phase>(initialPending ? "pending" : "form");
@@ -115,7 +118,7 @@ export function PayForm({
           <span className="muted">Entre ton code secret quand le message apparaît. Ne ferme pas cette page, elle se met à jour toute seule.</span>
         </div>
         <p className="hint" style={{ textAlign: "center", margin: 0 }}>
-          Article réservé encore <Countdown expiresAt={expiresAt} onExpire={expire} />
+          Article réservé encore <Countdown expiresInMs={expiresInMs} onExpire={expire} />
         </p>
       </div>
     );
@@ -154,7 +157,7 @@ export function PayForm({
         <button className="btn btn-primary btn-lg" type="submit" disabled={busy || !hydrated} aria-busy={busy || undefined}>Payer {totalLabel}</button>
         <button className="btn btn-ghost" type="button" onClick={cancel}>Annuler la commande</button>
       </div>
-      <p className="hint" style={{ margin: 0, textAlign: "center" }}>Article réservé encore <Countdown expiresAt={expiresAt} onExpire={expire} /></p>
+      <p className="hint" style={{ margin: 0, textAlign: "center" }}>Article réservé encore <Countdown expiresInMs={expiresInMs} onExpire={expire} /></p>
     </form>
   );
 }

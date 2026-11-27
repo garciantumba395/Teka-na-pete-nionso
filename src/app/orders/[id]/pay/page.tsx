@@ -58,7 +58,7 @@ export default async function PayPage({ params }: { params: Promise<{ id: string
           orderId={id}
           totalLabel={formatMoney(order.totalMinor, order.currency)}
           defaultPhone={me.phone.replace(/^\+243/, "")}
-          expiresAt={order.paymentExpiresAt ?? Date.now()}
+          expiresInMs={order.paymentExpiresAt ? Math.max(0, order.paymentExpiresAt - Date.now()) : 0}
           initialPending={pending}
         />
       </div>

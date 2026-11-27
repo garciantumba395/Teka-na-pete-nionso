@@ -1,5 +1,5 @@
 import { getData } from "@/lib/data";
-import { handle, json, num, readJson } from "@/lib/http";
+import { asString, handle, json, num, readJson } from "@/lib/http";
 import { enforce } from "@/lib/ratelimit";
 import { itemCreate, parse } from "@/lib/schemas";
 import { requireUser } from "@/lib/session";
@@ -8,7 +8,7 @@ export async function GET(req: Request) {
   return handle(async () => {
     const p = new URL(req.url).searchParams;
     const items = await getData().listItems({
-      q: p.get("q")?.slice(0, 100) ?? undefined,
+      q: asString(p.get("q"), 100) || undefined,
       categoryId: p.get("category") ?? undefined,
       areaId: p.get("area") ?? undefined,
       lat: num(p.get("lat")),

@@ -8,3 +8,4 @@ next-env.d.ts
 *.tsbuildinfo
 test-results/
 .env*.local
+playwright-report/

@@ -31,7 +31,7 @@ export default async function OrderPage({ params }: { params: Promise<{ id: stri
       <OrderLive orderId={id} status={order.status} />
       <div className="pad stack-lg">
         <div className="stack">
-          <span className="chip" aria-pressed={order.status === "completed"} style={{ justifySelf: "start", cursor: "default" }}>
+          <span className="chip" style={{ justifySelf: "start", cursor: "default" }}>
             {ORDER_STATUS_LABEL[order.status] ?? order.status}
           </span>
           <OrderStepper status={order.status} />

@@ -26,6 +26,10 @@ export async function api<T = unknown>(path: string, opts: { method?: string; bo
     throw new ApiError("NETWORK", NETWORK_ERROR);
   }
   const data = (await res.json().catch(() => null)) as { error?: { code?: string; message?: string; details?: Record<string, string> } } | null;
+  // Session expirée en cours de route : retour à la connexion, puis retour à la page courante.
+  if (res.status === 401 && data?.error?.code === "UNAUTHENTICATED" && typeof window !== "undefined" && !path.startsWith("/auth/") && !window.location.pathname.startsWith("/signin")) {
+    window.location.assign(`/signin?next=${encodeURIComponent(window.location.pathname + window.location.search)}`);
+  }
   if (!res.ok) throw new ApiError(data?.error?.code ?? "ERROR", data?.error?.message ?? ERROR_FALLBACK, data?.error?.details, res.status);
   return data as T;
 }
