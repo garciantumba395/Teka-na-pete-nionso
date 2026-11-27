@@ -29,7 +29,7 @@ export default async function WalletPage() {
         <section aria-labelledby="balance" className="stack">
           <h2 id="balance" className="h2">Solde</h2>
           {wallet.balances.length === 0 ? (
-            <EmptyState icon="info" title="Ton solde est vide">Il augmente dès qu&apos;une vente est confirmée avec le code de remise.</EmptyState>
+            <EmptyState icon="info" title="Ton solde est vide">Il augmente dès qu&apos;une vente est terminée : code de remise validé, colis accepté par l&apos;acheteur ou délai de réclamation écoulé.</EmptyState>
           ) : (
             wallet.balances.map((b) => (
               <div key={b.currency} style={{ background: "var(--color-surface)", borderRadius: "var(--radius-md)", padding: "var(--space-16)" }}>

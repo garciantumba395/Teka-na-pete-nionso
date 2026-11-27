@@ -107,7 +107,7 @@ test.describe("A Connexion et compte", () => {
 
   test("A-E7b ?next= malveillant après une vraie connexion par l'interface", async ({ page }) => {
     await signInUi(page, uniquePhone(), "Nouveau Malin", "//evil.com");
-    await expect(page).toHaveURL(/localhost:3100\/$/, { timeout: 15_000 });
+    await expect(page).toHaveURL(new RegExp(`${new URL(process.env.BASE_URL ?? "http://localhost:3100").host.replace(".", "\\.")}/$`), { timeout: 15_000 });
   });
 
   test("A-E8 pages protégées sans session : vrai 307 vers la connexion", async ({ request }) => {
@@ -135,7 +135,7 @@ test.describe("A Connexion et compte", () => {
 
   test("A-E10 « se déconnecter partout » révoque la session d'un autre appareil", async ({ makeActor, browser }) => {
     const a = await makeActor("Multi appareils");
-    const ctx2 = await browser.newContext({ extraHTTPHeaders: { "x-forwarded-for": randomIp() }, baseURL: "http://localhost:3100" });
+    const ctx2 = await browser.newContext({ extraHTTPHeaders: { "x-forwarded-for": randomIp() }, baseURL: process.env.BASE_URL ?? "http://localhost:3100" });
     await otp(ctx2.request, a.phone);
     expect((await verify(ctx2.request, a.phone, OTP)).status()).toBe(200);
     expect((await ctx2.request.get("/api/v1/me")).status()).toBe(200);
@@ -155,8 +155,8 @@ test.describe("A Connexion et compte", () => {
     await a.request.post(`/api/v1/orders/${orderId}/cancel`, { data: {} });
     const sid = (await a.context.cookies()).find((c) => /sid$/.test(c.name))!;
     expect((await a.request.delete("/api/v1/me")).status()).toBe(200);
-    const ctx2 = await browser.newContext({ baseURL: "http://localhost:3100" });
-    await ctx2.addCookies([{ name: sid.name, value: sid.value, url: "http://localhost:3100" }]);
+    const ctx2 = await browser.newContext({ baseURL: process.env.BASE_URL ?? "http://localhost:3100" });
+    await ctx2.addCookies([{ name: sid.name, value: sid.value, url: process.env.BASE_URL ?? "http://localhost:3100" }]);
     expect((await ctx2.request.get("/api/v1/me")).status(), "l'ancien cookie ne doit plus fonctionner").toBe(401);
     await ctx2.close();
     const again = await signUp(a.request, a.phone, "Nouveau Compte"); // le numéro est libéré : un NOUVEAU compte se crée
