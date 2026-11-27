@@ -1,6 +1,7 @@
 import { z, type ZodType } from "zod";
 import { AppError } from "./types";
 import { cleanLine, cleanText } from "./text";
+import { PHOTO_INVALID_MESSAGE, PHOTO_MAX_CHARS } from "./photos";
 
 // Validation SERVEUR de toutes les entrées. Le client valide pour le confort, jamais pour la sécurité.
 
@@ -44,8 +45,17 @@ export const orderCreate = z.object({
   deliveryLandmark: line(200).nullish(),
 });
 export const conversationCreate = z.object({ itemId: uuid });
+// ---- agent B : photos de preuve et de messagerie
+/** Photo envoyée en data URL ; le type réel et la taille sont revérifiés par la couche de données (src/lib/photos.ts). */
+const photoData = z.string({ message: PHOTO_INVALID_MESSAGE }).max(PHOTO_MAX_CHARS, PHOTO_INVALID_MESSAGE);
+/** Un message a du texte, une photo, ou les deux : jamais ni l'un ni l'autre. */
 export const messageCreate = z.object({
-  body: z.string().transform(cleanText).pipe(z.string().trim().min(1, "Écris un message.").max(2000, "Un message est limité à 2 000 caractères.")),
+  body: z.string().transform(cleanText).pipe(z.string().trim().max(2000, "Un message est limité à 2 000 caractères.")).default(""),
+  photo: photoData.optional(),
+}).refine((v) => v.body.length > 0 || !!v.photo, { message: "Écris un message.", path: ["body"] });
+export const disputeEvidence = z.object({
+  photo: photoData,
+  note: z.string().transform(cleanText).pipe(z.string().trim().max(500, "La note est limitée à 500 caractères.")).default(""),
 });
 export const disputeOpen = z.object({
   reason: z.enum(["not_received", "damaged", "not_as_described", "other"], { message: "Choisis le motif du problème." }),

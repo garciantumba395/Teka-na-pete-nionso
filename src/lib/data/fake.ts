@@ -9,10 +9,10 @@ import {
 } from "../ledger";
 import { detectOffPlatform, MESSAGE_MAX } from "../messaging";
 import { normalizeDrcPhone } from "../phone";
+import { decodePhotoDataUrl, MAX_EVIDENCE_PER_MEMBER, PHOTO_INVALID_MESSAGE, privatePhotoUrl } from "../photos";
 import { FakeMobileMoneyProvider } from "../payments/fake-provider";
 import {
-  AppError, type Area, type Category, type ChatMessage, type ConversationSummary, type Currency, type DisputeNote, type DisputeOutcome, type DisputeReason, type DisputeStatus, type DisputeSummary, type DisputeView, type ReportAction, type ReportReason, type ReportStatus, type ReportTarget, type ReportView, type Review, type UserRole, type Item, type ItemCard, type ItemDetail, type ItemQuery,
-  type LedgerEntry, type Order, type OrderAction, type OrderView, type CancelRequestStatus, type Payment, type PaymentMethod, type Payout,
+  AppError, type Area, type Category, type ChatMessage, type ConversationSummary, type Currency, type DisputeNote, type DisputeOutcome, type DisputeReason, type DisputeStatus, type DisputeSummary, type DisputeView, type ReportAction, type ReportReason, type ReportStatus, type ReportTarget, type ReportView, type Review, type UserRole, type Item, type ItemCard, type ItemDetail, type ItemQuery, type LedgerEntry, type Order, type OrderAction, type OrderView, type CancelRequestStatus, type Payment, type PaymentMethod, type Payout, type DisputeEvidence,
   type ProviderEvent, type PublicProfile, type User, type Wallet,
 } from "../types";
 import { checkListingText, defaultCompiledRules, DEFAULT_RULES, publicRule } from "../prohibited";
@@ -74,7 +74,7 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
   const limits = new Map<string, { start: number; count: number }>();
   const deleted = new Set<string>();
   interface ConvRec { id: string; itemId: string; buyerId: string; sellerId: string; lastMessageAt: number | null; createdAt: number }
-  interface MsgRec { id: string; convId: string; senderId: string | null; kind: "text" | "system"; body: string; flagged: boolean; readAt: number | null; createdAt: number }
+  interface MsgRec { id: string; convId: string; senderId: string | null; kind: "text" | "system" | "image"; body: string; flagged: boolean; readAt: number | null; createdAt: number; photoId?: string }
   interface DisputeRec { id: string; orderId: string; openedBy: string; reason: DisputeReason; description: string; status: DisputeStatus; openedAt: number; resolvedAt: number | null }
   interface NoteRec { id: string; disputeId: string; authorId: string; staff: boolean; note: string; createdAt: number }
   interface ReviewRec { id: string; orderId: string; authorId: string; targetId: string; rating: number; comment: string; createdAt: number }
@@ -90,6 +90,13 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
   const suspensions: { userId: string; endsAt: number }[] = [];
   const convs = new Map<string, ConvRec>();
   const messages: MsgRec[] = [];
+  // ---- agent B : photos de preuve et de messagerie
+  // Photos privées gardées en mémoire. `scope` dit qui peut les lire : les deux membres d'une conversation, ou les
+  // parties d'un litige et l'assistance.
+  interface PrivatePhotoRec { id: string; ownerId: string; mime: string; bytes: Buffer; scope: { type: "message"; convId: string } | { type: "evidence"; disputeId: string } }
+  interface EvidenceRec { id: string; disputeId: string; authorId: string; staff: boolean; photoId: string; note: string; createdAt: number }
+  const privatePhotos = new Map<string, PrivatePhotoRec>();
+  const evidenceRows: EvidenceRec[] = [];
 
   if (opts.seed !== false) {
     const t = now();
@@ -215,13 +222,14 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
     return {
       id: c.id, itemId: c.itemId, itemTitle: it.title, itemPhoto: it.photos[0] ?? null,
       counterpart: profileOf(viewerId === c.buyerId ? c.sellerId : c.buyerId),
-      lastMessage: last ? last.body.slice(0, 140) : null, lastMessageAt: c.lastMessageAt,
+      lastMessage: last ? (last.kind === "image" && !last.body ? "Photo" : last.body.slice(0, 140)) : null, lastMessageAt: c.lastMessageAt,
       unread: mine.filter((m) => m.senderId !== viewerId && m.readAt === null).length,
     };
   }
 
   const chatMessage = (m: MsgRec, viewerId: string): ChatMessage => ({
     id: m.id, mine: m.senderId === viewerId, kind: m.kind, body: m.body, flagged: m.flagged, createdAt: m.createdAt,
+    photoUrl: m.photoId ? privatePhotoUrl(m.photoId) : null, senderName: m.senderId ? profileOf(m.senderId).displayName : null,
   });
 
   // ---- agent A : annulation encadrée
@@ -281,6 +289,10 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
       openedByName: profileOf(d.openedBy).displayName, openedByMe: d.openedBy === viewerId, openedAt: d.openedAt, resolvedAt: d.resolvedAt,
       notes: disputeNotes.filter((n) => n.disputeId === d.id).sort((a, b) => a.createdAt - b.createdAt).map((n): DisputeNote => ({
         id: n.id, authorName: n.staff ? "Assistance" : profileOf(n.authorId).displayName, mine: n.authorId === viewerId, staff: n.staff, note: n.note, createdAt: n.createdAt,
+      })),
+      evidence: evidenceRows.filter((e) => e.disputeId === d.id).map((e): DisputeEvidence => ({
+        id: e.id, authorName: e.staff ? "Assistance" : profileOf(e.authorId).displayName, mine: e.authorId === viewerId, staff: e.staff,
+        photoUrl: privatePhotoUrl(e.photoId), note: e.note, createdAt: e.createdAt,
       })),
       order: { itemTitle: it?.title ?? "Article", totalMinor: order.totalMinor, currency: order.currency, buyerName: profileOf(order.buyerId).displayName, sellerName: profileOf(order.sellerId).displayName },
       viewerRole: staff && viewerId !== order.buyerId && viewerId !== order.sellerId ? "staff" : viewerId === order.buyerId ? "buyer" : "seller",
@@ -904,6 +916,54 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
       const text = (note ?? "").trim();
       if (text) disputeNotes.push({ id: randomUUID(), disputeId, authorId: staffId, staff: true, note: text.slice(0, 1000), createdAt: now() });
       return disputeView(d, staffId);
+    },
+
+    // ---- agent B : photos de preuve et de messagerie
+    async sendPhotoMessage(conversationId, senderId, input) {
+      const c = loadConv(conversationId, senderId);
+      const text = (input.body ?? "").trim();
+      if (text.length > MESSAGE_MAX) throw new AppError("VALIDATION", "Un message est limité à 2 000 caractères.", 422, { body: "Un message est limité à 2 000 caractères." });
+      const photo = decodePhotoDataUrl(input.photo);
+      if (!photo) throw new AppError("VALIDATION", "Une photo est invalide ou trop lourde.", 422, { photo: PHOTO_INVALID_MESSAGE });
+      const other = senderId === c.buyerId ? c.sellerId : c.buyerId;
+      if (deleted.has(other)) throw new AppError("MEMBER_DELETED", "Ce membre a supprimé son compte.", 409);
+      const photoId = randomUUID();
+      privatePhotos.set(photoId, { id: photoId, ownerId: senderId, mime: photo.mime, bytes: photo.bytes, scope: { type: "message", convId: c.id } });
+      const m: MsgRec = { id: randomUUID(), convId: c.id, senderId, kind: "image", body: text, flagged: detectOffPlatform(text) !== null, readAt: null, createdAt: now(), photoId };
+      messages.push(m);
+      c.lastMessageAt = m.createdAt;
+      return chatMessage(m, senderId);
+    },
+
+    async addDisputeEvidence(disputeId, authorId, input) {
+      const d = disputes.get(disputeId);
+      if (!d) throw notFound("Litige");
+      const view0 = disputeView(d, authorId); // 404 pour un tiers
+      if (d.status !== "open") throw new AppError("INVALID_STATE", "Ce litige est clos.", 409);
+      const note = (input.note ?? "").trim();
+      if (note.length > 500) throw new AppError("VALIDATION", "La note est limitée à 500 caractères.", 422, { note: "La note est limitée à 500 caractères." });
+      const photo = decodePhotoDataUrl(input.photo);
+      if (!photo) throw new AppError("VALIDATION", "Une photo est invalide ou trop lourde.", 422, { photo: PHOTO_INVALID_MESSAGE });
+      if (evidenceRows.filter((e) => e.disputeId === d.id && e.authorId === authorId).length >= MAX_EVIDENCE_PER_MEMBER)
+        throw new AppError("EVIDENCE_LIMIT", `Tu as déjà ajouté ${MAX_EVIDENCE_PER_MEMBER} photos à ce litige : c'est le maximum.`, 409);
+      const photoId = randomUUID();
+      privatePhotos.set(photoId, { id: photoId, ownerId: authorId, mime: photo.mime, bytes: photo.bytes, scope: { type: "evidence", disputeId: d.id } });
+      evidenceRows.push({ id: randomUUID(), disputeId: d.id, authorId, staff: view0.viewerRole === "staff", photoId, note, createdAt: now() });
+      return disputeView(d, authorId);
+    },
+
+    async getPrivatePhoto(id, viewerId) {
+      const p = privatePhotos.get(id);
+      if (!p || !users.has(viewerId) || deleted.has(viewerId)) return null;
+      if (p.scope.type === "message") {
+        const c = convs.get(p.scope.convId);
+        if (!c || (c.buyerId !== viewerId && c.sellerId !== viewerId)) return null;
+      } else {
+        const d = disputes.get(p.scope.disputeId);
+        if (!d) return null;
+        try { disputeView(d, viewerId); } catch { return null; } // parties ou assistance seulement
+      }
+      return { mime: p.mime, bytes: p.bytes };
     },
 
     async expireStalePaidOrders() {

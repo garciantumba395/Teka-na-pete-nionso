@@ -1,5 +1,5 @@
 import { writeFileSync } from "node:fs";
-import { apiBuyAndPay, apiCode, apiListing, apiOrder, expect, noHorizontalScroll, open, scan, test, uniquePhone, type A11yIssue } from "./support";
+import { PHOTO, apiBuyAndPay, apiCode, apiListing, apiOrder, expect, noHorizontalScroll, open, scan, staffPhone, test, uniquePhone, type A11yIssue } from "./support";
 
 /** Écrans à analyser : un parcours complet crée les données nécessaires. */
 export function defineA11y(label: string) {
@@ -63,6 +63,26 @@ export function defineA11y(label: string) {
       await check("S04 fiche (propriétaire)", sp, `/items/${item.id}`);
       await sp.request.post(`/api/v1/orders/${paidId}/confirm-delivery`, { data: { code } });
       await check("S16 portefeuille (avec solde)", sp, "/wallet");
+
+      // photos de messages et de preuves (litige ouvert sur une troisième commande : la deuxième sert à la remise ci-dessus)
+      await buyer.request.post(`/api/v1/conversations/${conv}/messages`, { data: { body: "Voici une photo", photo: PHOTO } });
+      await check("S07 conversation (photo envoyée)", bp, `/inbox/${conv}`);
+      await check("S07 photo agrandie", bp, `/inbox/${conv}`, async () => { await bp.getByRole("button", { name: /Agrandir : Photo envoyée par/ }).first().click(); await bp.getByRole("dialog").waitFor(); });
+      const item3 = await apiListing(seller.request);
+      const disputedId = await apiBuyAndPay(buyer.request, item3.id);
+      const dsp = await buyer.request.post(`/api/v1/orders/${disputedId}/dispute`, { data: { reason: "damaged", description: "L'article est abîmé, voir les photos." } });
+      const disputeId = (await dsp.json()).dispute.id as string;
+      await buyer.request.post(`/api/v1/disputes/${disputeId}/evidence`, { data: { photo: PHOTO, note: "Le col est déchiré" } });
+      await check("S11 litige : preuves (membre, ajout possible)", bp, `/orders/${disputedId}/dispute`);
+      await check("S11 litige : photo de preuve avec aperçu avant envoi", bp, `/orders/${disputedId}/dispute`, async () => {
+        const buf = Buffer.from(PHOTO.split(",")[1], "base64");
+        await bp.getByLabel("Choisir une photo").setInputFiles({ name: "p.jpg", mimeType: "image/jpeg", buffer: buf });
+        await bp.getByRole("alert").filter({ hasText: "n'a pas pu être lue" }).waitFor(); // l'image minimale n'est pas décodable : l'erreur s'affiche
+      });
+      const staff = await makeActor("Assistance access", staffPhone());
+      await check("S12 assistance : litige avec preuves", staff.page, `/staff/disputes/${disputeId}`);
+      // on clôt ce litige : la file de l'assistance doit rester vide pour les tests qui la parcourent
+      expect((await staff.request.post(`/api/v1/staff/disputes/${disputeId}/resolve`, { data: { outcome: "refund_buyer" } })).status()).toBe(200);
 
       const flat = found.flatMap((f) => f.issues.map((i) => ({ screen: f.screen, ...i })));
       writeFileSync(`test-results/a11y-${label}.json`, JSON.stringify(flat, null, 2));

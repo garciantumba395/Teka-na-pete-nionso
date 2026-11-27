@@ -12,10 +12,10 @@ import { FakeMobileMoneyProvider } from "../../payments/fake-provider";
 import type { PaymentProvider } from "../../payments/provider";
 import { detectOffPlatform, MESSAGE_MAX } from "../../messaging";
 import { normalizeDrcPhone } from "../../phone";
+import { decodePhotoDataUrl, MAX_EVIDENCE_PER_MEMBER, PHOTO_INVALID_MESSAGE, privatePhotoUrl } from "../../photos";
 import { ConsoleSmsProvider, type SmsProvider } from "../../sms/provider";
 import {
-  AppError, type Area, type Category, type ChatMessage, type Condition, type ConversationSummary, type DisputeNote, type DisputeOutcome, type DisputeSummary, type DisputeView, type ReportAction, type ReportView, type Review, type UserRole, type Currency, type Item, type ItemCard, type ItemDetail,
-  type LedgerEntry, type Order, type OrderAction, type OrderView, type CancelRequestStatus, type Payment, type PaymentMethod,
+  AppError, type Area, type Category, type ChatMessage, type Condition, type ConversationSummary, type DisputeNote, type DisputeOutcome, type DisputeSummary, type DisputeView, type ReportAction, type ReportView, type Review, type UserRole, type Currency, type Item, type ItemCard, type ItemDetail, type LedgerEntry, type Order, type OrderAction, type OrderView, type CancelRequestStatus, type Payment, type PaymentMethod, type DisputeEvidence,
   type PaymentStatus, type Payout, type PayoutStatus, type ProviderEvent, type PublicProfile, type User, type Wallet,
 } from "../../types";
 import { CONDITIONS, validateListing } from "../../validation";
@@ -60,12 +60,11 @@ const norm = (s: string) => s.toLowerCase().normalize("NFD").replace(/\p{M}/gu, 
 const likeEscape = (s: string) => s.replace(/[\\%_]/g, (m) => `\\${m}`);
 const photoUrl = (path: string) => (path.startsWith("db:") ? `/api/v1/photos/${path.slice(3)}` : path);
 
-function detectMime(b: Buffer): "image/jpeg" | "image/png" | "image/webp" | null {
-  if (b.length > 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return "image/jpeg";
-  if (b.length > 8 && b.subarray(0, 4).toString("hex") === "89504e47") return "image/png";
-  if (b.length > 12 && b.subarray(0, 4).toString("ascii") === "RIFF" && b.subarray(8, 12).toString("ascii") === "WEBP") return "image/webp";
-  return null;
-}
+// ---- agent B : photos de preuve et de messagerie
+const chatMessageOf = (m: Row, viewerId: string): ChatMessage => ({
+  id: m.id, mine: m.sender_id === viewerId, kind: m.kind === "system" ? "system" : m.photo_id ? "image" : "text", body: m.body,
+  photoUrl: m.photo_id ? privatePhotoUrl(m.photo_id) : null, senderName: m.sender_name ?? null, flagged: m.flagged, createdAt: m.created_at.getTime(),
+});
 
 const userOf = (r: Row): User => ({
   id: r.id, phone: r.phone ?? "", displayName: r.display_name, bio: r.bio ?? "", areaId: r.area_id,
@@ -287,13 +286,21 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
     if (!staff && !party) throw notFound("Litige");
     const notes = await q.query(
       `select n.id, n.author_id, n.note, n.created_at, p.display_name, p.role from dispute_evidence n join profiles p on p.id = n.author_id
-       where n.dispute_id = $1 and n.note is not null order by n.seq`, [disputeId]);
+       where n.dispute_id = $1 and n.note is not null and n.storage_path is null order by n.seq`, [disputeId]);
+    // ---- agent B : photos de preuve et de messagerie
+    const ev = await q.query(
+      `select e.id, e.author_id, e.storage_path, e.note, e.created_at, p.display_name, p.role from dispute_evidence e join profiles p on p.id = e.author_id
+       where e.dispute_id = $1 and e.storage_path like 'pp:%' order by e.seq`, [disputeId]);
     return {
       id: x.id, orderId: x.order_id, status: x.status, reason: x.reason, description: x.description,
       openedByName: x.opener_name, openedByMe: x.opened_by === viewerId, openedAt: x.opened_at.getTime(), resolvedAt: x.resolved_at ? x.resolved_at.getTime() : null,
       notes: notes.rows.map((n): DisputeNote => {
         const isStaff = ["support", "admin"].includes(n.role);
         return { id: n.id, authorName: isStaff ? "Assistance" : n.display_name, mine: n.author_id === viewerId, staff: isStaff, note: n.note, createdAt: n.created_at.getTime() };
+      }),
+      evidence: ev.rows.map((e): DisputeEvidence => {
+        const isStaff = ["support", "admin"].includes(e.role);
+        return { id: e.id, authorName: isStaff ? "Assistance" : e.display_name, mine: e.author_id === viewerId, staff: isStaff, photoUrl: privatePhotoUrl(String(e.storage_path).slice(3)), note: e.note ?? "", createdAt: e.created_at.getTime() };
       }),
       order: { itemTitle: x.item_title ?? "Article", totalMinor: Number(x.total_minor), currency: x.currency, buyerName: x.buyer_name, sellerName: x.seller_name },
       viewerRole: staff && !party ? "staff" : viewerId === x.buyer_id ? "buyer" : "seller",
@@ -615,14 +622,8 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
       const photos = input.photos ?? [];
       if (photos.length > fees.maxPhotos) throw new AppError("VALIDATION", `Tu peux ajouter ${fees.maxPhotos} photos au maximum.`, 422, { photos: `Maximum ${fees.maxPhotos} photos.` });
       const bad = (): never => { throw new AppError("VALIDATION", "Une photo est invalide ou trop lourde.", 422, { photos: "Photo invalide ou trop lourde (JPEG, PNG ou WebP, compressée)." }); };
-      const decoded = photos.map((p) => {
-        const m = /^data:image\/(?:jpeg|png|webp);base64,([A-Za-z0-9+/=]+)$/.exec(p);
-        if (!m || p.length > 600_000) return bad();
-        const bytes = Buffer.from(m[1], "base64");
-        const mime = detectMime(bytes); // le type est déduit du CONTENU, jamais de ce que le client annonce
-        if (!mime || bytes.length > 450_000) return bad();
-        return { bytes, mime };
-      });
+      // Le type est déduit du CONTENU, jamais de ce que le client annonce (règles partagées : src/lib/photos.ts).
+      const decoded = photos.map((p) => decodePhotoDataUrl(p) ?? bad());
       return withTx(pool, async (c) => {
         const seller = (await c.query(`select id from profiles where id = $1 and deleted_at is null`, [sellerId])).rows[0];
         if (!seller) throw notFound("Compte");
@@ -984,7 +985,7 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
         `select c.id, c.item_id, c.last_message_at, c.buyer_id, c.seller_id, i.title,
            (select storage_path from item_photos where item_id = i.id order by position limit 1) as first_photo,
            p.id as p_id, p.display_name, p.bio, p.area_id as p_area, p.verification_level, p.rating_avg, p.rating_count, p.deleted_at,
-           (select body from messages where conversation_id = c.id order by seq desc limit 1) as last_body,
+           (select case when kind = 'image' and body = '' then 'Photo' else body end from messages where conversation_id = c.id order by seq desc limit 1) as last_body,
            (select count(*)::int from messages where conversation_id = c.id and read_at is null and sender_id is distinct from $1) as unread
          from conversations c join items i on i.id = c.item_id
          join profiles p on p.id = case when c.buyer_id = $1 then c.seller_id else c.buyer_id end
@@ -1007,10 +1008,13 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
       await pool.query(`update messages set read_at = $3 where conversation_id = $1 and read_at is null and sender_id is distinct from $2`, [conversationId, viewerId, ts(now())]);
       const summary = (await api.listConversations(viewerId)).find((s) => s.id === conversationId);
       if (!summary) throw notFound("Conversation");
-      const msgs = await pool.query(`select id, sender_id, kind, body, flagged, created_at from messages where conversation_id = $1 order by seq`, [conversationId]);
+      const msgs = await pool.query(
+        `select m.id, m.sender_id, m.kind, m.body, m.flagged, m.created_at, pp.id as photo_id, sp.display_name as sender_name
+         from messages m left join private_photos pp on pp.message_id = m.id left join profiles sp on sp.id = m.sender_id
+         where m.conversation_id = $1 order by m.seq`, [conversationId]);
       return {
         ...summary,
-        messages: msgs.rows.map((m): ChatMessage => ({ id: m.id, mine: m.sender_id === viewerId, kind: m.kind === "system" ? "system" : "text", body: m.body, flagged: m.flagged, createdAt: m.created_at.getTime() })),
+        messages: msgs.rows.map((m): ChatMessage => chatMessageOf(m, viewerId)),
       };
     },
 
@@ -1034,7 +1038,80 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
         await tx.query(`update conversations set last_message_at = $2 where id = $1`, [conversationId, at]);
         return m;
       });
-      return { id: row.id as string, mine: true, kind: "text" as const, body: text, flagged: flagged !== null, createdAt: at.getTime() };
+      const me = (await pool.query(`select display_name from profiles where id = $1`, [senderId])).rows[0];
+      return { id: row.id as string, mine: true, kind: "text" as const, body: text, photoUrl: null, senderName: me?.display_name ?? null, flagged: flagged !== null, createdAt: at.getTime() };
+    },
+
+    // ---- agent B : photos de preuve et de messagerie
+    async sendPhotoMessage(conversationId, senderId, input) {
+      if (!isUuid(conversationId) || !isUuid(senderId)) throw notFound("Conversation");
+      const text = (input.body ?? "").trim();
+      if (text.length > MESSAGE_MAX) throw new AppError("VALIDATION", "Un message est limité à 2 000 caractères.", 422, { body: "Un message est limité à 2 000 caractères." });
+      const photo = decodePhotoDataUrl(input.photo);
+      if (!photo) throw new AppError("VALIDATION", "Une photo est invalide ou trop lourde.", 422, { photo: PHOTO_INVALID_MESSAGE });
+      const c = (await pool.query(
+        `select c.buyer_id, c.seller_id, p.deleted_at, me.display_name as my_name from conversations c
+         join profiles p on p.id = case when c.buyer_id = $2 then c.seller_id else c.buyer_id end
+         join profiles me on me.id = $2
+         where c.id = $1 and (c.buyer_id = $2 or c.seller_id = $2)`, [conversationId, senderId])).rows[0];
+      if (!c) throw notFound("Conversation");
+      if (c.deleted_at) throw new AppError("MEMBER_DELETED", "Ce membre a supprimé son compte.", 409);
+      const flagged = detectOffPlatform(text);
+      const at = ts(now());
+      const row = await withTx(pool, async (tx) => {
+        const m = (await tx.query(
+          `insert into messages (conversation_id, sender_id, kind, body, flagged, flag_reason, created_at) values ($1, $2, 'image', $3, $4, $5, $6) returning id`,
+          [conversationId, senderId, text, flagged !== null, flagged, at])).rows[0];
+        const ph = (await tx.query(
+          `insert into private_photos (owner_id, mime, size, content, message_id, created_at) values ($1,$2,$3,$4,$5,$6) returning id`,
+          [senderId, photo.mime, photo.bytes.length, photo.bytes, m.id, at])).rows[0];
+        await tx.query(`update conversations set last_message_at = $2 where id = $1`, [conversationId, at]);
+        return { id: m.id as string, photoId: ph.id as string };
+      });
+      return { id: row.id, mine: true, kind: "image" as const, body: text, photoUrl: privatePhotoUrl(row.photoId), senderName: c.my_name as string, flagged: flagged !== null, createdAt: at.getTime() };
+    },
+
+    async addDisputeEvidence(disputeId, authorId, input) {
+      await disputeViewOf(pool, disputeId, authorId); // 404 pour un tiers
+      const note = (input.note ?? "").trim();
+      if (note.length > 500) throw new AppError("VALIDATION", "La note est limitée à 500 caractères.", 422, { note: "La note est limitée à 500 caractères." });
+      const photo = decodePhotoDataUrl(input.photo);
+      if (!photo) throw new AppError("VALIDATION", "Une photo est invalide ou trop lourde.", 422, { photo: PHOTO_INVALID_MESSAGE });
+      await withTx(pool, async (c) => {
+        // Verrou sur le litige : deux envois simultanés ne peuvent pas dépasser la limite.
+        const d = (await c.query(`select status from disputes where id = $1 for update`, [disputeId])).rows[0];
+        if (!d) throw notFound("Litige");
+        if (d.status !== "open") throw new AppError("INVALID_STATE", "Ce litige est clos.", 409);
+        const n = (await c.query(`select count(*)::int as n from dispute_evidence where dispute_id = $1 and author_id = $2 and storage_path is not null`, [disputeId, authorId])).rows[0].n as number;
+        if (n >= MAX_EVIDENCE_PER_MEMBER) throw new AppError("EVIDENCE_LIMIT", `Tu as déjà ajouté ${MAX_EVIDENCE_PER_MEMBER} photos à ce litige : c'est le maximum.`, 409);
+        const at = ts(now());
+        const photoId = randomUUID();
+        const e = (await c.query(
+          `insert into dispute_evidence (dispute_id, author_id, storage_path, note, created_at) values ($1,$2,$3,$4,$5) returning id`,
+          [disputeId, authorId, `pp:${photoId}`, note || null, at])).rows[0];
+        await c.query(
+          `insert into private_photos (id, owner_id, mime, size, content, evidence_id, created_at) values ($1,$2,$3,$4,$5,$6,$7)`,
+          [photoId, authorId, photo.mime, photo.bytes.length, photo.bytes, e.id, at]);
+      });
+      return disputeViewOf(pool, disputeId, authorId);
+    },
+
+    async getPrivatePhoto(id, viewerId) {
+      if (!isUuid(id) || !isUuid(viewerId)) return null;
+      // Une seule requête décide de l'accès : participant de la conversation du message, ou partie / assistance du litige de la preuve.
+      const r = await pool.query(
+        `select pp.mime, pp.content from private_photos pp
+         left join messages m on m.id = pp.message_id
+         left join conversations cv on cv.id = m.conversation_id
+         left join dispute_evidence ev on ev.id = pp.evidence_id
+         left join disputes d on d.id = ev.dispute_id
+         left join orders o on o.id = d.order_id
+         join profiles v on v.id = $2 and v.deleted_at is null
+         where pp.id = $1 and (
+           (pp.message_id is not null and $2 in (cv.buyer_id, cv.seller_id))
+           or (pp.evidence_id is not null and ($2 in (o.buyer_id, o.seller_id) or v.role in ('support', 'admin')))
+         )`, [id, viewerId]);
+      return r.rows[0] ? { mime: r.rows[0].mime as string, bytes: r.rows[0].content as Buffer } : null;
     },
 
     async openDispute(orderId, userId, input) {
