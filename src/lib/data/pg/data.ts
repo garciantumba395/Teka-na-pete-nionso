@@ -15,7 +15,7 @@ import { normalizeDrcPhone } from "../../phone";
 import { ConsoleSmsProvider, type SmsProvider } from "../../sms/provider";
 import {
   AppError, type Area, type Category, type ChatMessage, type Condition, type ConversationSummary, type DisputeNote, type DisputeOutcome, type DisputeSummary, type DisputeView, type ReportAction, type ReportView, type Review, type UserRole, type Currency, type Item, type ItemCard, type ItemDetail,
-  type LedgerEntry, type Order, type OrderAction, type OrderView, type Payment, type PaymentMethod,
+  type LedgerEntry, type Order, type OrderAction, type OrderView, type CancelRequestStatus, type Payment, type PaymentMethod,
   type PaymentStatus, type Payout, type PayoutStatus, type ProviderEvent, type PublicProfile, type User, type Wallet,
 } from "../../types";
 import { CONDITIONS, validateListing } from "../../validation";
@@ -147,6 +147,40 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
     return orderOf(r.rows[0]);
   }
 
+  // ---- agent A : annulation encadrée
+  const closePendingTx = (q: Queryable, orderId: string) =>
+    q.query(`update order_cancel_requests set status = 'closed', resolved_at = $2 where order_id = $1 and status = 'pending'`, [orderId, ts(now())]);
+  /** Commande verrouillée + rôle exigé : un participant sans ce rôle n'a pas l'action (404, comme confirmDelivery). */
+  async function cancelCtx(c: Client, orderId: string, userId: string, role: "buyer" | "seller"): Promise<Order> {
+    const order = await loadOrder(c, orderId, true);
+    if (order.buyerId !== userId && order.sellerId !== userId) throw notFound("Commande");
+    if ((role === "buyer" ? order.buyerId : order.sellerId) !== userId) throw notFound("Commande");
+    if (order.status !== "paid" && order.status !== "in_delivery") throw new AppError("INVALID_STATE", "L'annulation ne concerne qu'une commande payée et pas encore remise.", 409);
+    return order;
+  }
+  /** Demandes de la commande : une « pending » trop ancienne vaut refus (lecture seule, aucune écriture d'argent). */
+  async function cancelRequestsOf(q: Queryable, orderId: string) {
+    const ttl = (await getFees()).cancelRequestTtlMs;
+    const rows = (await q.query(`select status, requested_at from order_cancel_requests where order_id = $1 order by requested_at desc, id`, [orderId])).rows;
+    const recs = rows.map((r) => {
+      const at = (r.requested_at as Date).getTime();
+      const expired = r.status === "pending" && now() - at >= ttl;
+      return { status: r.status as string, at, expired };
+    });
+    return { recs, ttl, livePending: recs.some((r) => r.status === "pending" && !r.expired), refused: recs.some((r) => r.status === "declined" || r.expired) };
+  }
+  const noOrExpired = (expired: boolean) => expired
+    ? new AppError("CANCEL_REQUEST_EXPIRED", "Cette demande d'annulation est restée sans réponse trop longtemps : elle est close. L'acheteur peut ouvrir un litige.", 409)
+    : new AppError("CANCEL_REQUEST_NONE", "Aucune demande d'annulation en attente sur cette commande.", 409);
+  /** Lit la demande en attente (verrouillée) ; lève si elle n'existe pas ou a expiré. */
+  async function pendingRequestTx(c: Client, orderId: string): Promise<string> {
+    const r = (await c.query(`select id, requested_at from order_cancel_requests where order_id = $1 and status = 'pending' for update`, [orderId])).rows[0];
+    if (!r) throw noOrExpired(false);
+    if (now() - (r.requested_at as Date).getTime() >= (await getFees()).cancelRequestTtlMs) throw noOrExpired(true);
+    return r.id as string;
+  }
+  // ---- fin agent A
+
   /** Libère les commandes dont le délai de paiement est dépassé. Les triggers de la base remettent les articles en vente. */
   async function expireUnpaid(q: Queryable): Promise<number> {
     const r = await q.query(`update orders set status = 'expired' where status = 'pending_payment' and payment_expires_at < $1`, [ts(now())]);
@@ -169,13 +203,21 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
     const ship = shipR.rows[0];
     const live = order.status === "paid" || order.status === "in_delivery";
     const actions: OrderAction[] = [];
+    const cr = await cancelRequestsOf(q, order.id); // agent A : les actions dépendent de l'état des demandes d'annulation
     if (role === "buyer") {
       if (order.status === "pending_payment") actions.push("pay", "cancel");
-      if (live) actions.push("reveal_code", "cancel", "issue");
+      if (live) {
+        actions.push("reveal_code", "issue");
+        if (cr.livePending) actions.push("withdraw_cancel");
+        else if (!cr.refused) actions.push("request_cancel");
+      }
       if (order.status === "delivered") actions.push("accept", "issue");
     } else {
       if (order.status === "pending_payment") actions.push("cancel");
-      if (live) actions.push("confirm_delivery", "cancel", "issue");
+      if (live) {
+        actions.push("confirm_delivery", "cancel", "issue");
+        if (cr.livePending) actions.push("accept_cancel", "decline_cancel");
+      }
     }
     const dspR = await q.query(`select id, status from disputes where order_id = $1 order by opened_at desc limit 1`, [order.id]);
     if (order.status === "completed") {
@@ -192,6 +234,11 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
       handover: role === "seller" && live && ship ? { attemptsLeft: Math.max(0, fees.handoverMaxAttempts - ship.handover_attempts), lockedUntil: locked } : null,
       actions,
       dispute: dspR.rows[0] ? { id: dspR.rows[0].id, status: dspR.rows[0].status } : null,
+      cancelRequest: (() => {
+        const last = cr.recs.find((x) => x.status !== "withdrawn" && x.status !== "closed");
+        if (!last || (last.status === "pending" && !live)) return null;
+        return { status: (last.expired ? "expired" : last.status) as CancelRequestStatus, requestedAt: last.at, expiresAt: last.at + cr.ttl };
+      })(),
     };
   }
 
@@ -761,6 +808,7 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
         await c.query(`update shipments set status = 'delivered', delivered_confirmed_by = 'buyer_code' where order_id = $1`, [orderId]);
         await c.query(`update orders set status = 'delivered', delivered_at = $2 where id = $1`, [orderId, ts(now())]);
         await c.query(`update orders set status = 'completed', completed_at = $2 where id = $1`, [orderId, ts(now())]);
+        await closePendingTx(c, orderId); // agent A : le code vaut acceptation, la demande d'annulation est close
         await post(c, releaseEntries(ctx("order", orderId, order.currency), { sellerId: order.sellerId, itemsMinor: order.itemsMinor, shippingMinor: order.shippingMinor, feeMinor: order.protectionFeeMinor }));
         return { ok: true };
       });
@@ -787,7 +835,12 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
         if (order.status === "pending_payment") {
           await c.query(`update orders set status = 'cancelled', cancelled_at = $2 where id = $1`, [orderId, ts(now())]);
         } else if (order.status === "paid" || order.status === "in_delivery") {
-          // Non remis : remboursement intégral de l'acheteur.
+          // Après paiement, l'acheteur ne peut plus annuler seul (il pourrait avoir reçu l'article sans donner le code).
+          if (actorId === order.buyerId) {
+            throw new AppError("CANCEL_REQUEST_REQUIRED", "Après paiement, tu ne peux plus annuler seul : demande l'annulation au vendeur. S'il refuse, tu peux ouvrir un litige.", 409);
+          }
+          await closePendingTx(c, orderId);
+          // Vendeur, non remis : remboursement intégral de l'acheteur.
           await post(c, refundEntries(ctx("order", orderId, order.currency), order.totalMinor));
           const pay = (await c.query(`update payments set status = 'refunded', refunded_minor = amount_minor where order_id = $1 and status = 'succeeded' returning *`, [orderId])).rows[0];
           if (pay?.provider_ref) refund = { providerRef: pay.provider_ref, amountMinor: pay.amount_minor };
@@ -799,6 +852,50 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
       if (refund) await refundAtProvider(refund);
       return buildView(pool, await loadOrder(pool, orderId), actorId);
     },
+
+    // ---- agent A : annulation encadrée
+    async requestCancellation(orderId, buyerId) {
+      await withTx(pool, async (c) => {
+        await cancelCtx(c, orderId, buyerId, "buyer");
+        const st = await cancelRequestsOf(c, orderId);
+        if (st.livePending) throw new AppError("CANCEL_REQUEST_EXISTS", "Ta demande d'annulation est déjà envoyée au vendeur.", 409);
+        if (st.refused) throw new AppError("CANCEL_REQUEST_REFUSED", "Le vendeur n'a pas accepté l'annulation. Si tu as un problème avec cette commande, ouvre un litige.", 409);
+        await c.query(`insert into order_cancel_requests (order_id, requested_by, requested_at) values ($1,$2,$3)`, [orderId, buyerId, ts(now())]);
+      });
+      return buildView(pool, await loadOrder(pool, orderId), buyerId);
+    },
+
+    async withdrawCancellation(orderId, buyerId) {
+      await withTx(pool, async (c) => {
+        await cancelCtx(c, orderId, buyerId, "buyer");
+        const id = await pendingRequestTx(c, orderId);
+        await c.query(`update order_cancel_requests set status = 'withdrawn', resolved_at = $2, resolved_by = $3 where id = $1`, [id, ts(now()), buyerId]);
+      });
+      return buildView(pool, await loadOrder(pool, orderId), buyerId);
+    },
+
+    async acceptCancellation(orderId, sellerId) {
+      let refund: { providerRef: string; amountMinor: number } | null = null;
+      await withTx(pool, async (c) => {
+        const order = await cancelCtx(c, orderId, sellerId, "seller");
+        const id = await pendingRequestTx(c, orderId);
+        refund = await refundEscrowTx(c, order);
+        await c.query(`update orders set status = 'cancelled', cancelled_at = $2 where id = $1`, [orderId, ts(now())]);
+        await c.query(`update order_cancel_requests set status = 'accepted', resolved_at = $2, resolved_by = $3 where id = $1`, [id, ts(now()), sellerId]);
+      });
+      if (refund) await refundAtProvider(refund);
+      return buildView(pool, await loadOrder(pool, orderId), sellerId);
+    },
+
+    async declineCancellation(orderId, sellerId) {
+      await withTx(pool, async (c) => {
+        await cancelCtx(c, orderId, sellerId, "seller");
+        const id = await pendingRequestTx(c, orderId);
+        await c.query(`update order_cancel_requests set status = 'declined', resolved_at = $2, resolved_by = $3 where id = $1`, [id, ts(now()), sellerId]);
+      });
+      return buildView(pool, await loadOrder(pool, orderId), sellerId);
+    },
+    // ---- fin agent A
 
     async handleProviderEvent(ev) {
       let refund: { providerRef: string; amountMinor: number } | null = null;
@@ -1022,6 +1119,7 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
           if (order.status !== "paid" && order.status !== "in_delivery") return false; // changé entre-temps (litige, remise)
           refund = await refundEscrowTx(c, order);
           await c.query(`update orders set status = 'cancelled', cancelled_at = $2 where id = $1`, [id, ts(now())]);
+          await closePendingTx(c, id);
           return true;
         });
         if (done) { n++; if (refund) await refundAtProvider(refund); }

@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound, redirect } from "next/navigation";
+import { BuyerCancelRequest, SellerCancelRequest } from "@/components/client/CancelRequest";
 import { CancelOrder, ConfirmCodeForm, HandoverCodeCard, OrderLive } from "@/components/client/OrderPanels";
 import { Avatar, AppBar, Banner, OrderStepper } from "@/components/ui";
 import { ORDER_STATUS_LABEL } from "@/lib/copy";
@@ -52,7 +53,7 @@ export default async function OrderPage({ params }: { params: Promise<{ id: stri
           <>
             <Banner kind="ok" title="Paiement reçu">Ton argent est bloqué en sécurité. Retrouve {order.counterpart.displayName} pour la remise.</Banner>
             <HandoverCodeCard orderId={id} />
-            <CancelOrder orderId={id} intro="Tu seras remboursé en totalité, frais de protection compris." confirmLabel="Oui, annuler et me faire rembourser" />
+            <BuyerCancelRequest orderId={id} request={order.cancelRequest} canRequest={a("request_cancel")} canWithdraw={a("withdraw_cancel")} />
             <Link className="btn btn-ghost" href={`/orders/${id}/dispute`}>J&apos;ai un problème</Link>
           </>
         )}
@@ -60,6 +61,7 @@ export default async function OrderPage({ params }: { params: Promise<{ id: stri
         {!buyer && a("confirm_delivery") && (
           <>
             <Banner kind="ok" title="Paiement reçu">L&apos;argent est bloqué en sécurité. Remets l&apos;article à {order.counterpart.displayName}.</Banner>
+            <SellerCancelRequest orderId={id} request={order.cancelRequest} canAnswer={a("accept_cancel")} />
             <ConfirmCodeForm orderId={id} attemptsLeft={order.handover?.attemptsLeft ?? 5} lockedUntil={order.handover?.lockedUntil ?? null} />
             <CancelOrder orderId={id} intro="L'acheteur sera remboursé en totalité et l'article remis en vente." confirmLabel="Oui, annuler la vente" />
             <Link className="btn btn-ghost" href={`/orders/${id}/dispute`}>J&apos;ai un problème</Link>
@@ -81,7 +83,11 @@ export default async function OrderPage({ params }: { params: Promise<{ id: stri
           <Link className="btn btn-secondary" href={`/orders/${id}/review`}>Donner mon avis sur {order.counterpart.displayName}</Link>
         )}
         {(order.status === "cancelled" || order.status === "refunded") && (
-          <Banner kind="info" title={order.dispute?.status === "resolved_refund" ? "Litige clos : tu as été remboursé" : "Commande annulée"}>{buyer && order.paidAt ? "Tu as été remboursé en totalité." : "Aucun paiement n'a été retenu."}</Banner>
+          <Banner kind="info" title={order.dispute?.status === "resolved_refund" ? "Litige clos : tu as été remboursé" : "Commande annulée"}>
+            {order.cancelRequest?.status === "accepted"
+              ? buyer ? "Le vendeur a accepté ta demande. Tu as été remboursé en totalité." : "Tu as accepté la demande de l'acheteur : il a été remboursé et l'article est remis en vente."
+              : buyer && order.paidAt ? "Tu as été remboursé en totalité." : "Aucun paiement n'a été retenu."}
+          </Banner>
         )}
         {order.status === "expired" && (
           <Banner kind="warn" title="Délai de paiement dépassé">

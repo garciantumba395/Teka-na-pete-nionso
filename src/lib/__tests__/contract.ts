@@ -254,9 +254,14 @@ export function defineContract(label: string, factory: () => Promise<ContractEnv
         expect(env.refunds()).toBe(1);
         expect((await data.getItem(item.id))!.status).toBe("active");
       });
-      it("annulation après paiement : remboursement intégral et article libéré", async () => {
-        const { order, buyer, item } = await paidOrder("Acheteur I", "+243821222222");
-        const v = await data.cancelOrder(order.id, buyer.id);
+      it("annulation du VENDEUR après paiement : remboursement intégral et article libéré (l'acheteur, lui, ne peut plus annuler seul)", async () => {
+        const { order, buyer, seller, item } = await paidOrder("Acheteur I", "+243821222222");
+        const refused = await rejects(data.cancelOrder(order.id, buyer.id));
+        expect(refused.code).toBe("CANCEL_REQUEST_REQUIRED");
+        expect(refused.status).toBe(409);
+        expect((await data.getOrder(order.id, buyer.id)).status).toBe("paid");
+        expect(await account("order_escrow")).toBe(-order.totalMinor);
+        const v = await data.cancelOrder(order.id, seller.id);
         expect(v.status).toBe("cancelled");
         expect(await account("order_escrow")).toBe(0);
         expect(await account("psp_clearing")).toBe(0);
@@ -723,5 +728,186 @@ export function defineContract(label: string, factory: () => Promise<ContractEnv
         expect(await ids({ brand: "100%_" })).toEqual([]);
       });
     });
+
+    // ---- agent A : annulation encadrée
+    describe("annulation encadrée après paiement", () => {
+      it("avant paiement : annulation libre pour l'acheteur comme pour le vendeur, sans demande", async () => {
+        const seller = (await data.getUser(S("user-marie")))!;
+        const buyer = await signup("+243821700001", "Acheteur C0");
+        const a = await data.createOrder(buyer.id, { itemIds: [(await listing(seller.id)).id], deliveryMethod: "hand_delivery" });
+        expect((await data.getOrder(a.id, buyer.id)).actions).not.toContain("request_cancel");
+        expect((await data.cancelOrder(a.id, buyer.id)).status).toBe("cancelled");
+        const b = await data.createOrder(buyer.id, { itemIds: [(await listing(seller.id)).id], deliveryMethod: "hand_delivery" });
+        expect((await data.cancelOrder(b.id, seller.id)).status).toBe("cancelled");
+      });
+      it("l'acheteur demande, le vendeur voit la demande et les bonnes actions apparaissent des deux côtés", async () => {
+        const { order, buyer, seller } = await paidOrder("Acheteur C1", "+243821700101");
+        const before = await data.getOrder(order.id, buyer.id);
+        expect(before.cancelRequest).toBeNull();
+        expect(before.actions).toContain("request_cancel");
+        expect(before.actions).not.toContain("cancel");
+        const v = await data.requestCancellation(order.id, buyer.id);
+        expect(v.cancelRequest?.status).toBe("pending");
+        expect(v.cancelRequest?.requestedAt).toBe(env.now());
+        expect(v.cancelRequest?.expiresAt).toBe(env.now() + FEES.cancelRequestTtlMs);
+        expect(v.actions).toContain("withdraw_cancel");
+        expect(v.actions).not.toContain("request_cancel");
+        expect(v.status).toBe("paid");
+        const sv = await data.getOrder(order.id, seller.id);
+        expect(sv.cancelRequest?.status).toBe("pending");
+        expect(sv.actions).toEqual(expect.arrayContaining(["accept_cancel", "decline_cancel", "cancel", "confirm_delivery"]));
+        expect(await account("order_escrow")).toBe(-order.totalMinor); // rien ne bouge tant que le vendeur n'a pas accepté
+      });
+      it("une seconde demande identique (double clic) est refusée sans doublon", async () => {
+        const { order, buyer } = await paidOrder("Acheteur C2", "+243821700102");
+        await data.requestCancellation(order.id, buyer.id);
+        expect(code(await rejects(data.requestCancellation(order.id, buyer.id)))).toBe("CANCEL_REQUEST_EXISTS");
+        expect((await data.getOrder(order.id, buyer.id)).cancelRequest?.status).toBe("pending");
+      });
+      it("acceptation : remboursement intégral, commande annulée, article remis en vente, grand livre équilibré", async () => {
+        const { order, buyer, seller, item } = await paidOrder("Acheteur C3", "+243821700103", 10_000);
+        await data.requestCancellation(order.id, buyer.id);
+        const v = await data.acceptCancellation(order.id, seller.id);
+        expect(v.status).toBe("cancelled");
+        expect(v.cancelRequest?.status).toBe("accepted");
+        expect(v.payment?.status).toBe("refunded");
+        expect(await account("order_escrow")).toBe(0);
+        expect(await account("psp_clearing")).toBe(0);
+        expect(await account("seller_available")).toBe(0);
+        expect(await account("platform_revenue")).toBe(0);
+        expect(await ledgerSum("USD")).toBe(0);
+        expect(env.refunds()).toBe(1);
+        expect((await data.getItem(item.id))!.status).toBe("active");
+        const bv = await data.getOrder(order.id, buyer.id);
+        expect(bv.status).toBe("cancelled");
+        expect(bv.cancelRequest?.status).toBe("accepted");
+        expect(bv.actions).toEqual([]);
+        // plus rien à faire : ni seconde acceptation, ni nouvelle demande
+        expect(code(await rejects(data.acceptCancellation(order.id, seller.id)))).toBe("INVALID_STATE");
+        expect(code(await rejects(data.requestCancellation(order.id, buyer.id)))).toBe("INVALID_STATE");
+        expect(env.refunds()).toBe(1);
+      });
+      it("refus : la commande reste payée, pas de nouvelle demande, l'acheteur peut ouvrir un litige que l'assistance tranche", async () => {
+        const { order, buyer, seller } = await paidOrder("Acheteur C4", "+243821700104", 10_000);
+        await data.requestCancellation(order.id, buyer.id);
+        const v = await data.declineCancellation(order.id, seller.id);
+        expect(v.status).toBe("paid");
+        expect(v.cancelRequest?.status).toBe("declined");
+        expect(v.actions).not.toContain("accept_cancel");
+        const bv = await data.getOrder(order.id, buyer.id);
+        expect(bv.actions).not.toContain("request_cancel");
+        expect(bv.actions).not.toContain("withdraw_cancel");
+        expect(bv.actions).toContain("issue");
+        expect(code(await rejects(data.requestCancellation(order.id, buyer.id)))).toBe("CANCEL_REQUEST_REFUSED");
+        expect(code(await rejects(data.cancelOrder(order.id, buyer.id)))).toBe("CANCEL_REQUEST_REQUIRED");
+        expect(await account("order_escrow")).toBe(-order.totalMinor);
+        const d = await data.openDispute(order.id, buyer.id, { reason: "other", description: "Le vendeur refuse d'annuler la vente." });
+        expect(d.status).toBe("open");
+        await data.resolveDispute(S("user-support-1"), d.id, "refund_buyer");
+        expect((await data.getOrder(order.id, buyer.id)).status).toBe("refunded");
+        expect(await account("order_escrow")).toBe(0);
+        expect(await ledgerSum("USD")).toBe(0);
+      });
+      it("retrait : l'acheteur retire sa demande, le vendeur ne peut plus l'accepter, l'acheteur peut en refaire une", async () => {
+        const { order, buyer, seller } = await paidOrder("Acheteur C5", "+243821700105");
+        await data.requestCancellation(order.id, buyer.id);
+        const v = await data.withdrawCancellation(order.id, buyer.id);
+        expect(v.cancelRequest).toBeNull();
+        expect(v.actions).toContain("request_cancel");
+        expect((await data.getOrder(order.id, seller.id)).cancelRequest).toBeNull();
+        expect(code(await rejects(data.acceptCancellation(order.id, seller.id)))).toBe("CANCEL_REQUEST_NONE");
+        expect(code(await rejects(data.declineCancellation(order.id, seller.id)))).toBe("CANCEL_REQUEST_NONE");
+        expect(code(await rejects(data.withdrawCancellation(order.id, buyer.id)))).toBe("CANCEL_REQUEST_NONE");
+        expect((await data.requestCancellation(order.id, buyer.id)).cancelRequest?.status).toBe("pending");
+      });
+      it("expiration : au-delà du délai (3 jours par défaut), la demande vaut refus, sans mouvement d'argent, et ne peut plus être acceptée", async () => {
+        expect(FEES.cancelRequestTtlMs).toBe(3 * 86_400_000);
+        const { order, buyer, seller } = await paidOrder("Acheteur C6", "+243821700106", 10_000);
+        await data.requestCancellation(order.id, buyer.id);
+        env.advance(FEES.cancelRequestTtlMs - 60_000);
+        expect((await data.getOrder(order.id, seller.id)).cancelRequest?.status).toBe("pending");
+        env.advance(120_000);
+        const sv = await data.getOrder(order.id, seller.id);
+        expect(sv.cancelRequest?.status).toBe("expired");
+        expect(sv.actions).not.toContain("accept_cancel");
+        expect(sv.status).toBe("paid");
+        const bv = await data.getOrder(order.id, buyer.id);
+        expect(bv.cancelRequest?.status).toBe("expired");
+        expect(bv.actions).not.toContain("request_cancel");
+        expect(bv.actions).not.toContain("withdraw_cancel");
+        expect(code(await rejects(data.acceptCancellation(order.id, seller.id)))).toBe("CANCEL_REQUEST_EXPIRED");
+        expect(code(await rejects(data.declineCancellation(order.id, seller.id)))).toBe("CANCEL_REQUEST_EXPIRED");
+        expect(code(await rejects(data.withdrawCancellation(order.id, buyer.id)))).toBe("CANCEL_REQUEST_EXPIRED");
+        expect(code(await rejects(data.requestCancellation(order.id, buyer.id)))).toBe("CANCEL_REQUEST_REFUSED");
+        expect(await account("order_escrow")).toBe(-order.totalMinor);
+        expect(env.refunds()).toBe(0);
+        // le litige reste ouvert à l'acheteur
+        expect((await data.openDispute(order.id, buyer.id, { reason: "other", description: "Demande restée sans réponse." })).status).toBe("open");
+      });
+      it("remise par code pendant une demande : le code vaut acceptation, la demande est close et l'argent va au vendeur", async () => {
+        const { order, buyer, seller } = await paidOrder("Acheteur C7", "+243821700107", 10_000);
+        await data.requestCancellation(order.id, buyer.id);
+        const v = await data.confirmDelivery(order.id, seller.id, deriveHandoverCode(order.id));
+        expect(v.status).toBe("completed");
+        expect(v.cancelRequest).toBeNull();
+        expect((await data.getOrder(order.id, buyer.id)).cancelRequest).toBeNull();
+        expect(await account("order_escrow")).toBe(0);
+        expect(await account("seller_available")).toBe(-order.itemsMinor);
+        expect(await ledgerSum("USD")).toBe(0);
+        expect(code(await rejects(data.acceptCancellation(order.id, seller.id)))).toBe("INVALID_STATE");
+        expect(code(await rejects(data.withdrawCancellation(order.id, buyer.id)))).toBe("INVALID_STATE");
+      });
+      it("le vendeur peut toujours annuler seul pendant une demande : remboursement intégral, demande close", async () => {
+        const { order, buyer, seller, item } = await paidOrder("Acheteur C8", "+243821700108");
+        await data.requestCancellation(order.id, buyer.id);
+        const v = await data.cancelOrder(order.id, seller.id);
+        expect(v.status).toBe("cancelled");
+        expect(v.cancelRequest).toBeNull();
+        expect(await account("order_escrow")).toBe(0);
+        expect(await ledgerSum("USD")).toBe(0);
+        expect((await data.getItem(item.id))!.status).toBe("active");
+        expect(env.refunds()).toBe(1);
+      });
+      it("droits : l'acheteur ne répond pas à sa propre demande, le vendeur n'en fait pas, un tiers n'obtient que des 404", async () => {
+        const { order, buyer, seller } = await paidOrder("Acheteur C9", "+243821700109");
+        const tiers = await signup("0831111188", "Tiers C");
+        expect(code(await rejects(data.requestCancellation(order.id, seller.id)))).toBe("NOT_FOUND");
+        await data.requestCancellation(order.id, buyer.id);
+        expect(code(await rejects(data.acceptCancellation(order.id, buyer.id)))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.declineCancellation(order.id, buyer.id)))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.withdrawCancellation(order.id, seller.id)))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.requestCancellation(order.id, tiers.id)))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.withdrawCancellation(order.id, tiers.id)))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.acceptCancellation(order.id, tiers.id)))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.declineCancellation(order.id, tiers.id)))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.acceptCancellation("00000000-0000-4000-8000-000000000000", seller.id)))).toBe("NOT_FOUND");
+        expect((await data.getOrder(order.id, seller.id)).cancelRequest?.status).toBe("pending");
+        expect(await account("order_escrow")).toBe(-order.totalMinor);
+      });
+      it("états incompatibles : pas de demande avant paiement, après remise, ni pendant un litige", async () => {
+        const seller = (await data.getUser(S("user-marie")))!;
+        const buyer = await signup("+243821700110", "Acheteur C10");
+        const unpaid = await data.createOrder(buyer.id, { itemIds: [(await listing(seller.id)).id], deliveryMethod: "hand_delivery" });
+        expect(code(await rejects(data.requestCancellation(unpaid.id, buyer.id)))).toBe("INVALID_STATE");
+        const d = await paidOrder("Acheteur C11", "+243821700111");
+        await data.openDispute(d.order.id, d.buyer.id, { reason: "other", description: "Litige ouvert avant toute demande." });
+        expect(code(await rejects(data.requestCancellation(d.order.id, d.buyer.id)))).toBe("INVALID_STATE");
+        const e = await paidOrder("Acheteur C12", "+243821700112");
+        await data.confirmDelivery(e.order.id, e.seller.id, deriveHandoverCode(e.order.id));
+        expect(code(await rejects(data.requestCancellation(e.order.id, e.buyer.id)))).toBe("INVALID_STATE");
+        expect((await data.getOrder(e.order.id, e.buyer.id)).actions).not.toContain("request_cancel");
+      });
+      it("commande jamais remise au-delà du délai général : remboursement automatique malgré une demande en attente", async () => {
+        const { order, buyer } = await paidOrder("Acheteur C13", "+243821700113", 10_000);
+        await data.requestCancellation(order.id, buyer.id);
+        env.advance(FEES.unhandedOrderMs + 1000);
+        expect(await data.expireStalePaidOrders()).toBe(1);
+        const v = await data.getOrder(order.id, buyer.id);
+        expect(v.status).toBe("cancelled");
+        expect(v.cancelRequest).toBeNull();
+        expect(await ledgerSum("USD")).toBe(0);
+      });
+    });
+    // ---- fin agent A
   });
 }

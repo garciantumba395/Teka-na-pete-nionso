@@ -89,7 +89,18 @@ export interface DataLayer {
   getHandoverCode(orderId: string, buyerId: string): Promise<string>;
   confirmDelivery(orderId: string, sellerId: string, code: string): Promise<OrderView>;
   acceptOrder(orderId: string, buyerId: string): Promise<OrderView>;
+  /** Avant paiement : libre pour les deux. Après paiement, avant remise : le VENDEUR seul (409 CANCEL_REQUEST_REQUIRED pour l'acheteur, qui doit demander l'annulation). */
   cancelOrder(orderId: string, actorId: string): Promise<OrderView>;
+  // ---- agent A : annulation encadrée
+  /** Acheteur : demande l'annulation d'une commande payée non remise. Le vendeur accepte (remboursement intégral) ou refuse ; sans réponse sous cancelRequestTtlMs, vaut refus. */
+  requestCancellation(orderId: string, buyerId: string): Promise<OrderView>;
+  /** Acheteur : retire sa demande en attente. */
+  withdrawCancellation(orderId: string, buyerId: string): Promise<OrderView>;
+  /** Vendeur : accepte la demande => commande annulée, acheteur remboursé en totalité, articles remis en vente. */
+  acceptCancellation(orderId: string, sellerId: string): Promise<OrderView>;
+  /** Vendeur : refuse la demande (l'acheteur peut alors ouvrir un litige). */
+  declineCancellation(orderId: string, sellerId: string): Promise<OrderView>;
+  // ---- fin agent A
   /**
    * Traite un événement du PSP, de façon idempotente. `matched: false` = référence inconnue : l'événement n'est PAS
    * enregistré (le PSP peut arriver avant que notre référence soit écrite, il doit pouvoir le rejouer).

@@ -12,7 +12,7 @@ import { normalizeDrcPhone } from "../phone";
 import { FakeMobileMoneyProvider } from "../payments/fake-provider";
 import {
   AppError, type Area, type Category, type ChatMessage, type ConversationSummary, type Currency, type DisputeNote, type DisputeOutcome, type DisputeReason, type DisputeStatus, type DisputeSummary, type DisputeView, type ReportAction, type ReportReason, type ReportStatus, type ReportTarget, type ReportView, type Review, type UserRole, type Item, type ItemCard, type ItemDetail, type ItemQuery,
-  type LedgerEntry, type Order, type OrderAction, type OrderView, type Payment, type PaymentMethod, type Payout,
+  type LedgerEntry, type Order, type OrderAction, type OrderView, type CancelRequestStatus, type Payment, type PaymentMethod, type Payout,
   type ProviderEvent, type PublicProfile, type User, type Wallet,
 } from "../types";
 import { CONDITIONS, validateListing, type ListingInput } from "../validation";
@@ -78,6 +78,10 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
   interface NoteRec { id: string; disputeId: string; authorId: string; staff: boolean; note: string; createdAt: number }
   interface ReviewRec { id: string; orderId: string; authorId: string; targetId: string; rating: number; comment: string; createdAt: number }
   interface ReportRec { id: string; reporterId: string; targetType: ReportTarget; targetId: string; reason: ReportReason; details: string; status: ReportStatus; createdAt: number }
+  // ---- agent A : annulation encadrée
+  interface CancelReqRec { id: string; orderId: string; requestedBy: string; status: "pending" | "accepted" | "declined" | "withdrawn" | "closed"; requestedAt: number; resolvedAt: number | null }
+  const cancelReqs: CancelReqRec[] = [];
+  // ---- fin agent A
   const disputes = new Map<string, DisputeRec>();
   const disputeNotes: NoteRec[] = [];
   const reviews: ReviewRec[] = [];
@@ -165,11 +169,18 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
     const live = order.status === "paid" || order.status === "in_delivery";
     if (role === "buyer") {
       if (order.status === "pending_payment") actions.push("pay", "cancel");
-      if (live) actions.push("reveal_code", "cancel", "issue");
+      if (live) {
+        actions.push("reveal_code", "issue");
+        if (livePending(order.id)) actions.push("withdraw_cancel");
+        else if (!cancelReqs.some((r) => r.orderId === order.id && (r.status === "declined" || reqExpired(r)))) actions.push("request_cancel");
+      }
       if (order.status === "delivered") actions.push("accept", "issue");
     } else {
       if (order.status === "pending_payment") actions.push("cancel");
-      if (live) actions.push("confirm_delivery", "cancel", "issue");
+      if (live) {
+        actions.push("confirm_delivery", "cancel", "issue");
+        if (livePending(order.id)) actions.push("accept_cancel", "decline_cancel");
+      }
     }
     if (order.status === "completed" && !reviews.some((r) => r.orderId === order.id && r.authorId === viewerId)) actions.push("review");
     const dsp = [...disputes.values()].filter((d) => d.orderId === order.id).sort((a, b) => b.openedAt - a.openedAt)[0];
@@ -186,6 +197,7 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
         : null,
       actions,
       dispute: dsp ? { id: dsp.id, status: dsp.status } : null,
+      cancelRequest: cancelRequestView(order),
     };
   }
 
@@ -210,6 +222,37 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
   const chatMessage = (m: MsgRec, viewerId: string): ChatMessage => ({
     id: m.id, mine: m.senderId === viewerId, kind: m.kind, body: m.body, flagged: m.flagged, createdAt: m.createdAt,
   });
+
+  // ---- agent A : annulation encadrée
+  const reqsOf = (orderId: string) => cancelReqs.filter((r) => r.orderId === orderId).sort((a, b) => b.requestedAt - a.requestedAt);
+  const reqExpired = (r: CancelReqRec) => r.status === "pending" && now() - r.requestedAt >= FEES.cancelRequestTtlMs;
+  /** Demande en attente ET dans le délai (une demande trop ancienne vaut refus). */
+  const livePending = (orderId: string) => cancelReqs.find((r) => r.orderId === orderId && r.status === "pending" && !reqExpired(r));
+  /** Clôt toute demande en attente devenue sans objet (remise par code, annulation du vendeur, remboursement automatique). */
+  const closePending = (orderId: string) => {
+    for (const r of cancelReqs) if (r.orderId === orderId && r.status === "pending") { r.status = "closed"; r.resolvedAt = now(); }
+  };
+  function cancelRequestView(order: Order): OrderView["cancelRequest"] {
+    const r = reqsOf(order.id).find((x) => x.status !== "withdrawn" && x.status !== "closed");
+    if (!r) return null;
+    const live = order.status === "paid" || order.status === "in_delivery";
+    if (r.status === "pending" && !live) return null;
+    const status: CancelRequestStatus = reqExpired(r) ? "expired" : (r.status as CancelRequestStatus);
+    return { status, requestedAt: r.requestedAt, expiresAt: r.requestedAt + FEES.cancelRequestTtlMs };
+  }
+  function cancelCtx(orderId: string, userId: string, role: "buyer" | "seller") {
+    const order = loadOrder(orderId);
+    if (order.buyerId !== userId && order.sellerId !== userId) throw notFound("Commande");
+    // Un participant qui n'a pas ce rôle n'a pas cette action : même convention que confirmDelivery (404).
+    if ((role === "buyer" ? order.buyerId : order.sellerId) !== userId) throw notFound("Commande");
+    if (order.status !== "paid" && order.status !== "in_delivery") throw new AppError("INVALID_STATE", "L'annulation ne concerne qu'une commande payée et pas encore remise.", 409);
+    return order;
+  }
+  const noOrExpired = (orderId: string) =>
+    cancelReqs.some((x) => x.orderId === orderId && reqExpired(x))
+      ? new AppError("CANCEL_REQUEST_EXPIRED", "Cette demande d'annulation est restée sans réponse trop longtemps : elle est close. L'acheteur peut ouvrir un litige.", 409)
+      : new AppError("CANCEL_REQUEST_NONE", "Aucune demande d'annulation en attente sur cette commande.", 409);
+  // ---- fin agent A
 
   /** Rembourse intégralement l'acheteur depuis le séquestre (grand livre + fournisseur de paiement). */
   async function refundEscrow(order: Order) {
@@ -614,6 +657,7 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
       setOrderStatus(order, "completed");
       order.completedAt = now();
       release(order);
+      closePending(orderId); // agent A : le code vaut acceptation, la demande d'annulation est close
       return view(order, sellerId);
     },
 
@@ -634,15 +678,61 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
         setOrderStatus(order, "cancelled");
         order.cancelledAt = now();
       } else if (order.status === "paid" || order.status === "in_delivery") {
-        // Non remis : remboursement intégral de l'acheteur.
+        // Après paiement, l'acheteur ne peut plus annuler seul (il pourrait avoir reçu l'article sans donner le code).
+        if (actorId === order.buyerId) {
+          throw new AppError("CANCEL_REQUEST_REQUIRED", "Après paiement, tu ne peux plus annuler seul : demande l'annulation au vendeur. S'il refuse, tu peux ouvrir un litige.", 409);
+        }
+        // Vendeur, non remis : remboursement intégral de l'acheteur.
         await refundEscrow(order);
         setOrderStatus(order, "cancelled");
         order.cancelledAt = now();
+        closePending(orderId);
       } else {
         throw new AppError("INVALID_STATE", "Cette commande ne peut plus être annulée.", 409);
       }
       return view(order, actorId);
     },
+
+    // ---- agent A : annulation encadrée
+    async requestCancellation(orderId, buyerId) {
+      const order = cancelCtx(orderId, buyerId, "buyer");
+      if (livePending(orderId)) throw new AppError("CANCEL_REQUEST_EXISTS", "Ta demande d'annulation est déjà envoyée au vendeur.", 409);
+      if (cancelReqs.some((r) => r.orderId === orderId && (r.status === "declined" || reqExpired(r))))
+        throw new AppError("CANCEL_REQUEST_REFUSED", "Le vendeur n'a pas accepté l'annulation. Si tu as un problème avec cette commande, ouvre un litige.", 409);
+      cancelReqs.push({ id: randomUUID(), orderId, requestedBy: buyerId, status: "pending", requestedAt: now(), resolvedAt: null });
+      return view(order, buyerId);
+    },
+
+    async withdrawCancellation(orderId, buyerId) {
+      const order = cancelCtx(orderId, buyerId, "buyer");
+      const r = livePending(orderId);
+      if (!r) throw noOrExpired(orderId);
+      r.status = "withdrawn";
+      r.resolvedAt = now();
+      return view(order, buyerId);
+    },
+
+    async acceptCancellation(orderId, sellerId) {
+      const order = cancelCtx(orderId, sellerId, "seller");
+      const r = livePending(orderId);
+      if (!r) throw noOrExpired(orderId);
+      await refundEscrow(order);
+      setOrderStatus(order, "cancelled");
+      order.cancelledAt = now();
+      r.status = "accepted";
+      r.resolvedAt = now();
+      return view(order, sellerId);
+    },
+
+    async declineCancellation(orderId, sellerId) {
+      const order = cancelCtx(orderId, sellerId, "seller");
+      const r = livePending(orderId);
+      if (!r) throw noOrExpired(orderId);
+      r.status = "declined";
+      r.resolvedAt = now();
+      return view(order, sellerId);
+    },
+    // ---- fin agent A
 
     async handleProviderEvent(ev) {
       const key = `${provider.name}:${ev.eventId}`;
@@ -818,6 +908,7 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
           await refundEscrow(o);
           setOrderStatus(o, "cancelled");
           o.cancelledAt = now();
+          closePending(o.id);
           n++;
         }
       }
