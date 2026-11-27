@@ -1,7 +1,9 @@
 import AxeBuilder from "@axe-core/playwright";
 import { test as base, expect, type APIRequestContext, type Browser, type BrowserContext, type Page } from "@playwright/test";
+import { randomUUID } from "node:crypto";
 import { Pool } from "pg";
 import { seedId } from "../src/lib/data/ids";
+import { STAFF_DEMO_PHONES } from "../src/lib/data/seed";
 
 export { expect };
 
@@ -30,7 +32,7 @@ export const uniquePhone = () => `082${String(Date.now() % 1e3).padStart(3, "0")
 export const uniqueTitle = (base = "Robe") => `${base} ${Date.now().toString(36)}${++seq}`;
 
 /** Numéros des comptes d'assistance de démonstration (voir src/lib/data/seed.ts), utilisés à tour de rôle. */
-const STAFF_PHONES = ["0899999991", "0899999992", "0899999993", "0899999994"];
+const STAFF_PHONES = STAFF_DEMO_PHONES;
 let staffTurn = Math.floor(Math.random() * STAFF_PHONES.length);
 export const staffPhone = () => STAFF_PHONES[staffTurn++ % STAFF_PHONES.length];
 
@@ -130,7 +132,7 @@ export async function apiOrder(request: APIRequestContext, itemId: string): Prom
   return (await r.json()).order.id;
 }
 
-export async function apiPay(request: APIRequestContext, orderId: string, msisdn: string, key = `key-${Date.now()}-${++seq}`) {
+export async function apiPay(request: APIRequestContext, orderId: string, msisdn: string, key = `key-${randomUUID()}`) {
   return request.post(`/api/v1/orders/${orderId}/pay`, { data: { method: "mpesa", msisdn, idempotencyKey: key } });
 }
 

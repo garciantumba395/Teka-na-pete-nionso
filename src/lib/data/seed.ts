@@ -77,7 +77,10 @@ const slug = (s: string) => s.toLowerCase().normalize("NFD").replace(/\p{M}/gu, 
 
 export const SEED_PHONES = { marie: "+243810000001", patrick: "+243820000002", jp: "+243990000003", support: "+243899999991" };
 /** Comptes de l'équipe d'assistance de DÉMONSTRATION (4 numéros : la limite de codes par numéro empêche de réutiliser un seul compte dans toute une suite de tests). */
-export const STAFF_DEMO_PHONES = ["0899999991", "0899999992", "0899999993", "0899999994"];
+export const STAFF_DEMO_PHONES = [
+  "0899999991", "0899999992", "0899999993", "0899999994",
+  ...Array.from({ length: 16 }, (_, i) => `08999998${String(10 + i)}`),
+];
 
 export function seedUsers(now: number): User[] {
   const base = { areaId: seedId("area-com-gombe"), verificationLevel: "phone" as const, createdAt: now - 90 * 86400_000 };

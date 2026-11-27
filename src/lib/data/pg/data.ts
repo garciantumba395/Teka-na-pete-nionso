@@ -911,11 +911,18 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
         if (!msisdn) throw new AppError("PHONE_INVALID", "Numéro de téléphone invalide.", 422);
         const active = (await c.query(`select 1 from payments where order_id = $1 and status in ('initiated','pending_user') limit 1`, [orderId])).rowCount;
         if (active) throw new AppError("PAYMENT_IN_PROGRESS", "Un paiement est déjà en attente de validation sur ton téléphone.", 409);
-        const p = (await c.query(
-          `insert into payments (order_id, provider, method, msisdn, amount_minor, currency, status, idempotency_key, created_at)
-           values ($1,$2,$3,$4,$5,$6,'initiated',$7,$8) returning *`,
-          [orderId, provider.name, input.method, msisdn, order.totalMinor, order.currency, input.idempotencyKey, ts(now())],
-        )).rows[0];
+        let p;
+        try {
+          p = (await c.query(
+            `insert into payments (order_id, provider, method, msisdn, amount_minor, currency, status, idempotency_key, created_at)
+             values ($1,$2,$3,$4,$5,$6,'initiated',$7,$8) returning *`,
+            [orderId, provider.name, input.method, msisdn, order.totalMinor, order.currency, input.idempotencyKey, ts(now())],
+          )).rows[0];
+        } catch (e) {
+          // Deux commandes différentes ont pris la même clé au même instant : le SELECT ci-dessus ne peut pas le voir (verrous de lignes différents).
+          if (pgCode(e) === "23505") throw new AppError("IDEMPOTENCY_CONFLICT", "Clé d'idempotence déjà utilisée.", 409);
+          throw e;
+        }
         return { pay: paymentOf(p), created: true, order };
       });
       if (!started.created) return started.pay;
