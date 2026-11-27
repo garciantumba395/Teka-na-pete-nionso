@@ -178,6 +178,15 @@ Relations : User 1-n Item, Item 1-n Photo, Item n-1 Category, Conversation n-1 I
 
 Voir `features.csv`. Préfixes dans `notes` : `[SRC]` sourcé, `[INF]` déduit, `[AFR]` ajout propre à l'adaptation Afrique (original = no, exclu du score).
 
+## Addendum : preuves visuelles (captures de référence)
+
+Sept captures ont été fournies après la première version de cette carte (détail et fiabilité dans `replica/design/measurements.md`).
+- **`[IMG]`** : confirmé par une capture de présentation d'application ou de fiche de store.
+- **`[IMG?]`** : vu sur une planche ou une maquette dont la fidélité à la version actuelle est incertaine.
+- Ces captures ont fait passer plusieurs lignes de `[INF]` à `[IMG]` dans `features.csv` et en ont ajouté 9 : retrait en personne, recherche par rayon avec carte, fil personnalisé, marques récentes, recherche enregistrée, taille de colis, couleurs, échange, connexion sociale (marquée `skip`, remplacée par le téléphone).
+- Écrans confirmés visuellement : S01 (fil), S03 (catalogue, filtres), S04 (fiche, bandeau « Vendu »), S05 (prise de photo puis formulaire en lignes), S02 (feuille d'inscription).
+- Toujours **non vu** : S08 (paiement), S09 (suivi), S10 à S13, S16 (solde), S18. Ils restent `[SRC]` ou `[INF]`.
+
 ## Out of scope (cannot or should not be cloned)
 
 - **Le réseau et les utilisateurs** : les dizaines de millions de membres et l'offre existante (liquidité). Aucun clone ne les hérite.
