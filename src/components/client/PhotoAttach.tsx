@@ -38,7 +38,7 @@ export function PhotoAttach({
   return (
     <div className="attach">
       <input
-        id={id} ref={inputRef} type="file" accept="image/*" hidden aria-label="Choisir une photo"
+        id={id} ref={inputRef} type="file" accept="image/*" className="sr-only" tabIndex={-1} aria-label="Choisir une photo"
         onChange={(e) => void pick(e.target.files)}
       />
       {value ? (
