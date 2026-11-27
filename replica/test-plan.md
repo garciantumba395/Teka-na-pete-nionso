@@ -72,18 +72,74 @@ Deux exécutions : **couche factice** (`npm run test:e2e`) et **PostgreSQL** (`n
 | F02-N2 | N | le vendeur ouvre /orders/…/pay | redirigé vers la commande | e2e |
 | F02-N3 | N | numéro de paiement invalide | message clair, rien débité | e2e |
 
-## F03 à F08 : flux non construits (écart connu)
+## F03 : litige guidé et arbitrage
 
 | cas | type | étapes | attendu | auto |
 | --- | --- | --- | --- | --- |
-| F03-G1 | G | « J'ai un problème » sur une commande payée | arrive sur un écran qui dit honnêtement « Bientôt disponible » | e2e |
-| F03-G2 | G | /orders/…/dispute directement | 200 et message, pas de 404 ni de 5xx | e2e |
+| F03-H1 | H | l'acheteur ouvre un litige, le vendeur répond, l'assistance rembourse | séquestre gelé puis acheteur remboursé, article remis en vente | e2e |
+| F03-E1 | E | l'assistance paie le vendeur | argent au portefeuille, vente terminée | e2e |
+| F03-E2 | E | formulaire vide, description trop courte | erreurs claires, rien créé | e2e |
+| F03-E3 | E | pendant le litige : annuler, remettre, second litige | 409 partout, plus de bouton Annuler | e2e |
+| F03-E4 | E | double-clic sur Ouvrir le litige | un seul litige | e2e |
+| F03-E5 | E | HTML et script dans le texte | affiché tel quel | e2e |
+| F03-E6 | E | tâche de remboursement des commandes jamais remises | 401 sans secret, 200 avec | e2e |
+| F03-N1 | N | tiers, membre ordinaire, sans session, sur l'espace et l'API d'assistance | 404 / 307 / 401 | e2e |
+| (contrat) | E | gel du séquestre, remboursement, paiement, droits, validations, remboursement automatique après 7 jours, litige ouvert protégé | grand livre toujours équilibré | contrat ×2 couches |
+
+## F04 : lots d'articles
+
+| cas | type | étapes | attendu | auto |
+| --- | --- | --- | --- | --- |
 | F04-G1 | G | acheter plusieurs articles du même vendeur | **aucune interface** (le serveur sait le faire) | — |
-| F05-G1 | G | /inbox | écran « Bientôt disponible » | e2e |
-| F06-G1 | G | /orders/…/review | écran « Bientôt disponible » | e2e |
+
+## F05 : messagerie
+
+| cas | type | étapes | attendu | auto |
+| --- | --- | --- | --- | --- |
+| F05-H1 | H | poser une question, recevoir la réponse, non lus puis lus | messages reçus sans recharger | e2e |
+| F05-E1 | E | message vide ou d'espaces | bouton inactif, 422 | e2e |
+| F05-E2 | E | numéro ou lien dans un message | remis avec rappel de sécurité | e2e |
+| F05-E3 | E | 2 001 caractères | champ limité, 422 | e2e |
+| F05-E4 | E | double-clic sur Écrire | une seule conversation | e2e |
+| F05-E5 | E | sa propre annonce | pas de bouton, 409 | e2e |
+| F05-E6 | E | HTML et script | affiché tel quel | e2e |
+| F05-E7 | E | 44 messages en 10 minutes | 429 au-delà de 40 | e2e |
+| F05-E8 | E | liste et conversation vides | invitation claire | e2e |
+| F05-N1 | N | tiers, sans session, identifiant invalide | 404 / 307 / 401 | e2e |
+
+## F06 : avis
+
+| cas | type | étapes | attendu | auto |
+| --- | --- | --- | --- | --- |
+| F06-H1 | H | l'acheteur note, l'avis apparaît sur le profil, la note suit | « Avis (1) » et moyenne mise à jour | e2e |
+| F06-E1 | E | sans note ; le vendeur note à son tour | message clair ; 201 | e2e |
+| F06-E2 | E | second avis, notes et textes invalides | 409 / 422 | e2e |
+| F06-E3 | E | avant la fin de la vente | 409, la page renvoie à la commande | e2e |
+| F06-E4 | E | avis hostile | texte inerte | e2e |
+| F06-N1 | N | tiers | 404 | e2e |
+
+## F07 : compte Pro
+
+| cas | type | étapes | attendu | auto |
+| --- | --- | --- | --- | --- |
 | F07-G1 | G | /pro | écran « Bientôt disponible » | e2e |
-| F08-G1 | G | /report | écran « Bientôt disponible » | e2e |
-| F08-G2 | G | modération, sanctions, annonce masquée | **non construit** | — |
+
+## F08 : signalement et modération
+
+| cas | type | étapes | attendu | auto |
+| --- | --- | --- | --- | --- |
+| F08-H1 | H | signaler une annonce, la modération la masque | annonce introuvable ensuite | e2e |
+| F08-E1 | E | sans motif, doublon, sa propre annonce, cible invalide | message clair, 200 idempotent, 409, 422 | e2e |
+| F08-E2 | E | suspension de 7 jours | sessions coupées, reconnexion possible, actions refusées (403) | e2e |
+| F08-E3 | E | signaler un membre | possible, pas sur son propre profil | e2e |
+| F08-N1 | N | membre ordinaire sur l'espace de modération | 404 | e2e |
+| F08-G2 | G | blocage permanent, délai de 24 h pour corriger | **non construit** | — |
+
+## R-H2 : filtres de recherche
+
+| cas | type | étapes | attendu | auto |
+| --- | --- | --- | --- | --- |
+| R-H2 | H | marque (sans accent), taille exacte, états multiples, puces retirables, jokers | résultats exacts, texte traité comme du texte | e2e |
 
 ## A : connexion et compte
 
@@ -173,16 +229,16 @@ Deux exécutions : **couche factice** (`npm run test:e2e`) et **PostgreSQL** (`n
 
 ## Couverture
 
-Exécution du 2026-11-27 sur le build `a00bebe` (95 tests Playwright : projet mobile 390 px + projet bureau 1440 px).
+Exécution du 2026-11-27 sur la branche `claude/upbeat-noether-vq7x7j` après `/replica-build` (tranches 1 et 2) : 120 tests Playwright (projet mobile 390 px + projet bureau 1440 px).
 
 | Cible | Réussis | Échoués | Ignorés |
 | --- | --- | --- | --- |
-| Couche factice (`npm run test:e2e`) | 92 | 0 | 3 |
-| PostgreSQL (`npm run test:e2e:pg`) | 93 | 0 | 2 |
-| Unitaires + contrat des deux couches (`npm run test:pg`) | 133 | 0 | 0 |
+| Couche factice (`npm run test:e2e`) | 117 | 0 | 3 |
+| PostgreSQL (`npm run test:e2e:pg`) | 118 | 0 | 2 |
+| Unitaires + contrat des deux couches (`npm run test:pg`) | 172 | 0 | 0 |
 
 - **Ignorés** : par construction (contrôle fait une seule fois, sur mobile ; vérifications de base de données seulement sur PostgreSQL), pas des échecs masqués.
-- **Défauts** : 10 trouvés, 10 corrigés, aucun S1 (voir `bugs.md`). Avant corrections : 14 échecs sur la couche factice, 3 de plus sur PostgreSQL.
-- **Non construits** : F03 à F08 (messagerie, litiges, avis, signalement, retours, favoris) : seuls les écrans « Bientôt disponible » sont testés (`unbuilt.spec.ts`). Ils ne comptent **pas** comme réussis.
-- **Manuels** : les 6 points de la liste ci-dessus, non exécutés.
-- **Pas couvert** : parcours de la messagerie et du coursier (pas construits), paiement réel, performance sur appareil.
+- **Défauts** : voir `bugs.md` (10 trouvés par la phase de test précédente, tous corrigés). La tranche de construction n'a pas ouvert de défaut de gravité S1 ou S2 ; deux écarts propres à PostgreSQL (ordre des messages, arrondi de la note moyenne) ont été trouvés par les tests de contrat et corrigés avant livraison.
+- **Non construits** : F04 (lots, pas d'interface), F07 (compte Pro), retours et livraison par coursier, favoris, notifications. Seul `/pro` est testé comme écran en attente.
+- **Manuels** : les 6 points de la liste ci-dessus, non exécutés ; en plus, **l'espace d'assistance n'a pas été testé sur un vrai téléphone**.
+- **Pas couvert** : photos en preuve de litige, décision partielle, paiement réel, performance sur appareil, abus de l'annulation unilatérale (voir `build-log.md`).

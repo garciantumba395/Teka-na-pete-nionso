@@ -91,3 +91,20 @@ Voir `replica/features.csv`. Parité : **39,9 / 100**, **10 des 24 must-haves fa
 - Limites : 30 ouvertures par heure et 40 messages par 10 minutes et par membre.
 - Heure des messages affichée dans un fuseau fixe (Africa/Kinshasa), sinon le serveur et le navigateur ne s'accordent pas (erreur d'hydratation).
 - Tests : 6 scénarios de contrat sur les deux couches, 3 tests unitaires de détection, 10 cas e2e (`f05-messages.spec.ts`), 3 écrans dans l'audit d'accessibilité.
+
+## Mise à jour : `/replica-build`, tranche 2 (2026-11-27)
+
+| ID | Écran | État | Ce qui manque | Plus dur que prévu |
+| --- | --- | --- | --- | --- |
+| S11 | Litige | **fait** | Photos en preuve, décision partielle, délai de réponse automatique, notification | Le code de remise libère l'argent tout de suite : le litige ne peut donc exister qu'AVANT la remise (voir ci-dessous) |
+| S13 | Avis | **fait** | Réponse à un avis, signalement d'un avis, moyenne pondérée | Rien |
+| S19 | Signalement | **fait** | Notification de l'auteur, blocage permanent, délai de 24 h pour corriger une annonce masquée | La suspension doit couper les sessions ET refuser les actions à la reconnexion |
+| S03 | Recherche | **fait** (sauf tri, matière, couleur, carte) | Tri, carte | Comparaison sans accent ni casse identique entre les deux couches |
+| `/staff` | Espace assistance | **fait** (minimal) | Historique, recherche, statistiques | Rôles : un membre ordinaire reçoit 404, pas 403, pour ne pas révéler l'existence de l'écran |
+
+**Décisions à relire**
+- **« Libération après 48 h » n'existe pas telle quelle.** Chez l'original, l'argent est libéré 2 jours après la livraison d'un colis. Ici la remise se fait en main propre avec un code : le code vaut acceptation et libère l'argent immédiatement. La fenêtre de 48 h n'a donc rien à protéger. À la place : (1) litige possible tant que la commande n'est pas remise, (2) **remboursement automatique** d'une commande payée jamais remise au bout de 7 jours (PLACEHOLDER, `settings.unhanded_order_days`), via la tâche `refund_unhanded_orders`.
+- **Risque ouvert** : un acheteur peut recevoir l'article, ne pas donner le code et annuler pour être remboursé (l'annulation avant remise reste unilatérale). Le vendeur peut ouvrir un litige et l'assistance tranche, mais rien n'empêche l'annulation avant. À arbitrer : retirer l'annulation unilatérale de l'acheteur après paiement au profit du litige ?
+- **Comptes d'assistance de démonstration** : 4 numéros (`089 999 9991` à `…994`, code `123456`), créés seulement par le seed de démonstration, interdit en production. En production, l'attribution d'un rôle se fait en base (`update profiles set role = 'support' where id = …`) : aucun écran ni route ne le permet.
+- **Migration 0004** : colonne `seq` sur les messages et les échanges de litige. Deux écritures dans la même milliseconde avaient un ordre d'affichage aléatoire (UUID).
+- Tests : 24 scénarios de contrat de plus (sur les deux couches), 31 tests e2e, 4 écrans de plus dans l'audit d'accessibilité.

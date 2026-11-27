@@ -26,6 +26,8 @@ Comptes de démonstration (le code SMS affiché à l'écran est `123456`) :
 
 Un numéro de paiement finissant par `00` simule un refus ; tout autre est accepté après ~3 s.
 
+Compte d'assistance de démonstration (litiges et signalements, écran `/staff`) : `089 999 9991` (aussi `…992` à `…994`), même code. Seul le seed de démonstration les crée ; en production, un rôle se donne en base.
+
 ### Avec PostgreSQL
 
 ```bash
