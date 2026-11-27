@@ -9,3 +9,6 @@ next-env.d.ts
 test-results/
 .env*.local
 playwright-report/
+
+# images de diff : elles reprennent des captures de l'original
+replica/diffs/*.png
