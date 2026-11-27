@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { BuyButton } from "@/components/client/BuyButton";
+import { DeliveryPicker } from "@/components/client/DeliveryChoice";
 import { StartChatButton } from "@/components/client/StartChatButton";
 import { Icon } from "@/components/icons";
 import { AppBar, Avatar, Banner, PriceTag, Stars } from "@/components/ui";
@@ -86,9 +87,13 @@ export default async function ItemPage({ params }: Props) {
             </Link>
 
             {!own && <Link href={`/report?type=item&id=${item.id}`} className="btn btn-ghost" style={{ justifySelf: "start" }}>Signaler cette annonce</Link>}
-            <Banner kind="info" title="Remise en main propre">
-              Tu paies sur l&apos;appli, tu vérifies l&apos;article, puis tu donnes un code au vendeur. Il ne reçoit l&apos;argent qu&apos;à ce moment-là.
-            </Banner>
+            {available && !own ? (
+              <DeliveryPicker itemId={item.id} currency={item.currency} protectedPriceMinor={item.protectedPriceMinor} />
+            ) : (
+              <Banner kind="info" title="Remise en main propre">
+                Tu paies sur l&apos;appli, tu vérifies l&apos;article, puis tu donnes un code au vendeur. Il ne reçoit l&apos;argent qu&apos;à ce moment-là.
+              </Banner>
+            )}
           </div>
         </div>
       </div>

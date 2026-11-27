@@ -1,9 +1,12 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound, redirect } from "next/navigation";
+import { AcceptButton, InTransitButton, LostButton, ReceivedButton, ShipForm } from "@/components/client/CourierPanels";
 import { CancelOrder, ConfirmCodeForm, HandoverCodeCard, OrderLive } from "@/components/client/OrderPanels";
-import { Avatar, AppBar, Banner, OrderStepper } from "@/components/ui";
+import { Avatar, AppBar, Banner, OrderStepper, ShipmentTimeline } from "@/components/ui";
 import { ORDER_STATUS_LABEL } from "@/lib/copy";
+import { COURIER_ORDER_STATUS_LABEL, SHIPMENT_STATUS_LABEL } from "@/lib/copy-courier";
+import { formatDateTime } from "@/lib/datetime";
 import { getData } from "@/lib/data";
 import { formatMoney } from "@/lib/money";
 import { currentUser } from "@/lib/session";
@@ -24,17 +27,22 @@ export default async function OrderPage({ params }: { params: Promise<{ id: stri
   }
   const buyer = order.viewerRole === "buyer";
   const a = (x: string) => order.actions.includes(x as never);
+  // ---- agent D : livraison par coursier
+  const courier = order.deliveryMethod === "courier";
+  const ship = order.shipment;
+  const deliveryArea = courier && order.deliveryAreaId ? (await getData().listAreas()).find((x) => x.id === order.deliveryAreaId)?.name ?? null : null;
+  const statusLabel = (courier && COURIER_ORDER_STATUS_LABEL[order.status]) || ORDER_STATUS_LABEL[order.status] || order.status;
 
   return (
     <div className="narrow">
       <AppBar title="Commande" back="/me" />
-      <OrderLive orderId={id} status={order.status} />
+      <OrderLive orderId={id} status={order.status} shipmentStatus={ship?.status ?? null} />
       <div className="pad stack-lg">
         <div className="stack">
           <span className="chip" style={{ justifySelf: "start", cursor: "default" }}>
-            {ORDER_STATUS_LABEL[order.status] ?? order.status}
+            {statusLabel}
           </span>
-          <OrderStepper status={order.status} />
+          <OrderStepper status={order.status} method={order.deliveryMethod} shipment={ship} />
         </div>
 
         {order.status === "pending_payment" && buyer && (
@@ -63,6 +71,52 @@ export default async function OrderPage({ params }: { params: Promise<{ id: stri
             <ConfirmCodeForm orderId={id} attemptsLeft={order.handover?.attemptsLeft ?? 5} lockedUntil={order.handover?.lockedUntil ?? null} />
             <CancelOrder orderId={id} intro="L'acheteur sera remboursé en totalité et l'article remis en vente." confirmLabel="Oui, annuler la vente" />
             <Link className="btn btn-ghost" href={`/orders/${id}/dispute`}>J&apos;ai un problème</Link>
+          </>
+        )}
+
+        {courier && order.status === "paid" && (
+          <>
+            <Banner kind="ok" title="Paiement reçu">
+              {buyer ? `Ton argent est bloqué en sécurité. ${order.counterpart.displayName} va confier le colis à un coursier.` : "L'argent est bloqué en sécurité. Confie le colis à un coursier, puis renseigne-le ci-dessous."}
+            </Banner>
+            {!buyer && a("ship") && <ShipForm orderId={id} />}
+            {a("cancel") && <CancelOrder orderId={id} intro={buyer ? "Tu seras remboursé en totalité, frais de protection et de livraison compris." : "L'acheteur sera remboursé en totalité et l'article remis en vente."} confirmLabel={buyer ? "Oui, annuler et me faire rembourser" : "Oui, annuler la vente"} />}
+            {a("issue") && <Link className="btn btn-ghost" href={`/orders/${id}/dispute`}>J&apos;ai un problème</Link>}
+          </>
+        )}
+        {courier && order.status === "in_delivery" && ship && (
+          <>
+            <Banner kind="info" title={ship.status === "in_transit" ? "Colis en route" : "Colis remis au coursier"}>
+              {buyer ? "Quand tu reçois le colis, confirme-le ici. Tu auras ensuite un délai pour vérifier l'article et signaler un problème." : "L'acheteur confirmera la réception du colis."}
+            </Banner>
+            <section className="stack" aria-labelledby="courier-title" style={{ background: "var(--color-surface)", borderRadius: "var(--radius-md)", padding: "var(--space-16)" }}>
+              <h2 id="courier-title" className="h2">Coursier</h2>
+              <dl className="kv">
+                <dt>Nom</dt><dd>{ship.courierName}</dd>
+                <dt>Téléphone</dt><dd>{ship.courierPhone ? <a href={`tel:${ship.courierPhone}`}>{ship.courierPhone}</a> : "Non renseigné"}</dd>
+                <dt>Référence de suivi</dt><dd>{ship.trackingRef ?? "Aucune"}</dd>
+                <dt>État du colis</dt><dd>{SHIPMENT_STATUS_LABEL[ship.status] ?? ship.status}</dd>
+              </dl>
+            </section>
+            {buyer && a("confirm_received") && <ReceivedButton orderId={id} />}
+            {!buyer && a("mark_in_transit") && <InTransitButton orderId={id} />}
+            {a("report_lost") && <LostButton orderId={id} role={order.viewerRole} />}
+            {a("issue") && <Link className="btn btn-ghost" href={`/orders/${id}/dispute`}>J&apos;ai un problème</Link>}
+          </>
+        )}
+        {courier && order.status === "delivered" && (
+          <>
+            {buyer ? (
+              <Banner kind="ok" title="Colis reçu">
+                Vérifie l&apos;article. Tu peux signaler un problème jusqu&apos;au {order.autoReleaseAt ? formatDateTime(order.autoReleaseAt) : "terme du délai"}. Sans litige de ta part, l&apos;argent est libéré automatiquement au vendeur à cette date.
+              </Banner>
+            ) : (
+              <Banner kind="info" title="Colis reçu par l'acheteur">
+                L&apos;argent te sera versé dès que l&apos;acheteur accepte, ou automatiquement le {order.autoReleaseAt ? formatDateTime(order.autoReleaseAt) : "à la fin du délai"} s&apos;il n&apos;ouvre pas de litige.
+              </Banner>
+            )}
+            {buyer && a("accept") && <AcceptButton orderId={id} />}
+            {buyer && a("issue") && <Link className="btn btn-ghost" href={`/orders/${id}/dispute`}>J&apos;ai un problème</Link>}
           </>
         )}
 
@@ -106,11 +160,23 @@ export default async function OrderPage({ params }: { params: Promise<{ id: stri
           </ul>
           <dl className="kv">
             <dt>Articles</dt><dd className="tnum">{formatMoney(order.itemsMinor, order.currency)}</dd>
+            {buyer && order.shippingMinor > 0 && <><dt>Livraison</dt><dd className="tnum">{formatMoney(order.shippingMinor, order.currency)}</dd></>}
             {buyer && <><dt>Protection acheteur</dt><dd className="tnum">{formatMoney(order.protectionFeeMinor, order.currency)}</dd></>}
             <dt className="total">{buyer ? "Total payé" : "Tu reçois"}</dt>
             <dd className="total tnum">{formatMoney(buyer ? order.totalMinor : order.itemsMinor, order.currency)}</dd>
           </dl>
         </section>
+
+        {courier && (
+          <section className="stack" aria-labelledby="address-title">
+            <h2 id="address-title" className="h2">Livraison par coursier</h2>
+            <dl className="kv">
+              <dt>Commune</dt><dd>{deliveryArea ?? "Non précisée"}</dd>
+              <dt>Repère</dt><dd style={{ overflowWrap: "anywhere" }}>{order.deliveryLandmark ?? "Non précisé"}</dd>
+            </dl>
+          </section>
+        )}
+        {courier && ship && <ShipmentTimeline shipment={ship} />}
 
         <Link href={`/members/${order.counterpart.id}`} className="seller row-link" style={{ padding: 0, color: "inherit", textDecoration: "none" }}>
           <Avatar name={order.counterpart.displayName} />

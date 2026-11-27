@@ -1,7 +1,9 @@
 import Link from "next/link";
 import type { ReactNode } from "react";
 import { formatMoney } from "@/lib/money";
-import type { ItemCard, OrderStatus } from "@/lib/types";
+import { SHIPMENT_EVENT_LABEL } from "@/lib/copy-courier";
+import { formatDateTimeShort } from "@/lib/datetime";
+import type { DeliveryMethod, ItemCard, OrderStatus, ShipmentView } from "@/lib/types";
 import { Icon, type IconName } from "./icons";
 
 // Primitives présentationnelles (sans état). Mêmes classes que replica/design/primitives.css.
@@ -131,12 +133,35 @@ const STEPS: { key: string; title: string; hint: string }[] = [
   { key: "released", title: "Argent libéré au vendeur", hint: "Dès que le code de remise est validé." },
 ];
 
-export function OrderStepper({ status }: { status: OrderStatus }) {
-  const doneCount = status === "completed" ? 3 : status === "paid" || status === "in_delivery" || status === "delivered" ? 1 : 0;
+// ---- agent D : frise de la livraison par coursier
+const COURIER_STEPS: { key: string; title: string; hint: string }[] = [
+  { key: "paid", title: "Payé", hint: "L'argent est mis de côté, le vendeur ne le reçoit pas encore." },
+  { key: "handed", title: "Remis au coursier", hint: "Le vendeur confie le colis à un coursier." },
+  { key: "transit", title: "En route", hint: "Le coursier apporte le colis à l'adresse indiquée." },
+  { key: "received", title: "Reçu", hint: "L'acheteur confirme avoir reçu le colis." },
+  { key: "released", title: "Argent libéré au vendeur", hint: "Quand l'acheteur accepte, ou automatiquement à la fin du délai de réclamation sans litige." },
+];
+
+/** Nombre d'étapes terminées de la frise « coursier », déduit du statut de la commande et de l'historique du colis. */
+function courierDoneCount(status: OrderStatus, shipment: ShipmentView | null | undefined): number {
+  if (status === "completed") return COURIER_STEPS.length;
+  if (status === "delivered") return 4;
+  const seen = (k: string) => !!shipment?.events.some((e) => e.kind === k);
+  if (status === "disputed") return seen("received") ? 4 : seen("in_transit") ? 3 : seen("handed_to_courier") ? 2 : 1;
+  if (status === "in_delivery") return shipment?.status === "in_transit" ? 3 : 2;
+  return status === "paid" ? 1 : 0;
+}
+
+export function OrderStepper({ status, method, shipment }: { status: OrderStatus; method?: DeliveryMethod; shipment?: ShipmentView | null }) {
+  const courier = method === "courier";
+  const steps = courier ? COURIER_STEPS : STEPS;
+  const doneCount = courier
+    ? courierDoneCount(status, shipment)
+    : status === "completed" ? 3 : status === "paid" || status === "in_delivery" || status === "delivered" ? 1 : 0;
   const terminalBad = status === "cancelled" || status === "expired" || status === "refunded";
   return (
     <ol className="steps" aria-label="Suivi de la commande">
-      {STEPS.map((s, i) => {
+      {steps.map((s, i) => {
         const state = terminalBad ? "todo" : i < doneCount ? "done" : i === doneCount ? "current" : "todo";
         return (
           <li key={s.key} data-state={state} aria-current={state === "current" ? "step" : undefined}>
@@ -150,6 +175,24 @@ export function OrderStepper({ status }: { status: OrderStatus }) {
         );
       })}
     </ol>
+  );
+}
+
+/** Historique horodaté d'une livraison par coursier (heures de Kinshasa). */
+export function ShipmentTimeline({ shipment }: { shipment: ShipmentView }) {
+  if (shipment.events.length === 0) return null;
+  return (
+    <section className="stack" aria-labelledby="history">
+      <h2 id="history" className="h2">Historique</h2>
+      <ol style={{ listStyle: "none", padding: 0, margin: 0, display: "grid", gap: "var(--space-8)" }}>
+        {shipment.events.map((e) => (
+          <li key={e.id} style={{ display: "flex", gap: "var(--space-12)", justifyContent: "space-between", alignItems: "baseline" }}>
+            <span>{SHIPMENT_EVENT_LABEL[e.kind] ?? e.kind}</span>
+            <span className="hint tnum" style={{ whiteSpace: "nowrap" }}>{formatDateTimeShort(e.at)}</span>
+          </li>
+        ))}
+      </ol>
+    </section>
   );
 }
 

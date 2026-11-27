@@ -50,7 +50,10 @@ export default async function PayPage({ params }: { params: Promise<{ id: string
             <dt className="total">Total</dt><dd className="total tnum">{formatMoney(order.totalMinor, order.currency)}</dd>
           </dl>
           <p className="hint" style={{ margin: 0 }}>
-            Vendeur : <strong>{order.counterpart.displayName}</strong>. Remise en main propre : l&apos;argent reste bloqué jusqu&apos;à la remise de l&apos;article.
+            Vendeur : <strong>{order.counterpart.displayName}</strong>.{" "}
+            {order.deliveryMethod === "courier"
+              ? "Livraison par coursier : l'argent reste bloqué jusqu'à ta confirmation de réception, ou jusqu'à la fin du délai de réclamation sans litige."
+              : "Remise en main propre : l'argent reste bloqué jusqu'à la remise de l'article."}
           </p>
         </section>
 

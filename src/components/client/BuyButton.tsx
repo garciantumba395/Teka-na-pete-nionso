@@ -3,18 +3,28 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { api, ApiError } from "./api";
+import { courierProblem, useDelivery } from "./DeliveryChoice";
 
 export function BuyButton({ itemId, label }: { itemId: string; label: string }) {
   const router = useRouter();
+  const delivery = useDelivery();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   async function buy() {
     if (busy) return;
+    const problem = courierProblem(delivery);
+    if (problem) {
+      setError(problem);
+      return;
+    }
     setBusy(true);
     setError(null);
     try {
-      const r = await api<{ order: { id: string } }>("/orders", { body: { itemIds: [itemId], deliveryMethod: "hand_delivery" } });
+      const body = delivery.method === "courier"
+        ? { itemIds: [itemId], deliveryMethod: "courier", deliveryAreaId: delivery.areaId, deliveryLandmark: delivery.landmark.trim() }
+        : { itemIds: [itemId], deliveryMethod: "hand_delivery" };
+      const r = await api<{ order: { id: string } }>("/orders", { body });
       router.push(`/orders/${r.order.id}/pay`);
     } catch (e) {
       if (e instanceof ApiError && e.code === "UNAUTHENTICATED") {

@@ -7,21 +7,21 @@ import { OtpInput } from "./OtpInput";
 import { Icon } from "../icons";
 
 /** Rafraîchit la page quand le statut de la commande change côté serveur (paiement reçu, remise validée…). */
-export function OrderLive({ orderId, status }: { orderId: string; status: string }) {
+export function OrderLive({ orderId, status, shipmentStatus = null }: { orderId: string; status: string; shipmentStatus?: string | null }) {
   const router = useRouter();
   useEffect(() => {
     if (["completed", "cancelled", "expired", "refunded"].includes(status)) return;
     const t = setInterval(async () => {
       if (document.visibilityState !== "visible") return;
       try {
-        const r = await api<{ order: { status: string } }>(`/orders/${orderId}`);
-        if (r.order.status !== status) router.refresh();
+        const r = await api<{ order: { status: string; shipment?: { status: string } | null } }>(`/orders/${orderId}`);
+        if (r.order.status !== status || (r.order.shipment?.status ?? null) !== shipmentStatus) router.refresh();
       } catch {
         /* on réessaie */
       }
     }, 4000);
     return () => clearInterval(t);
-  }, [orderId, status, router]);
+  }, [orderId, status, shipmentStatus, router]);
   return null;
 }
 
