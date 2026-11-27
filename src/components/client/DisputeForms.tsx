@@ -3,9 +3,12 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { api, ApiError } from "./api";
+import { PhotoAttach } from "./PhotoAttach";
+import { ViewablePhoto } from "./PhotoView";
 import { useHydrated } from "./useHydrated";
 import { DISPUTE_REASONS } from "@/lib/copy";
-import type { DisputeNote } from "@/lib/types";
+import { MAX_EVIDENCE_PER_MEMBER } from "@/lib/photos";
+import type { DisputeEvidence, DisputeNote } from "@/lib/types";
 
 const fmt = new Intl.DateTimeFormat("fr-FR", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", timeZone: "Africa/Kinshasa" });
 
@@ -156,6 +159,72 @@ export function ResolveDispute({ disputeId }: { disputeId: string }) {
           </div>
         </div>
       )}
+    </section>
+  );
+}
+
+// ---- agent B : photos de preuve et de messagerie
+/** Section « Preuves » : grille de photos des deux parties et de l'assistance, et ajout d'une photo avec une note. */
+export function DisputeEvidencePanel({ disputeId, evidence, open }: { disputeId: string; evidence: DisputeEvidence[]; open: boolean }) {
+  const router = useRouter();
+  const hydrated = useHydrated();
+  const [photo, setPhoto] = useState<string | null>(null);
+  const [note, setNote] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const mineCount = evidence.filter((e) => e.mine).length;
+  const full = mineCount >= MAX_EVIDENCE_PER_MEMBER;
+
+  async function add(e: React.FormEvent) {
+    e.preventDefault();
+    if (busy || !photo) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await api(`/disputes/${disputeId}/evidence`, { body: { photo, note } });
+      setPhoto(null);
+      setNote("");
+      router.refresh();
+    } catch (err) {
+      setError(err instanceof ApiError ? (err.details?.photo ?? err.message) : "Erreur inattendue.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="stack" aria-labelledby="evidence">
+      <h2 id="evidence" className="h2">Preuves</h2>
+      {evidence.length === 0 ? <p className="hint" style={{ margin: 0 }}>Aucune photo pour l&apos;instant.</p> : (
+        <ul className="evidence-grid">
+          {evidence.map((e) => (
+            <li key={e.id}>
+              <figure>
+                <ViewablePhoto src={e.photoUrl} alt={`Photo de preuve ajoutée par ${e.authorName}`} />
+                <figcaption>
+                  <strong>{e.mine ? "Toi" : e.authorName}</strong>{" "}
+                  <time className="tnum" dateTime={new Date(e.createdAt).toISOString()}>{fmt.format(e.createdAt)}</time>
+                  {e.note && <span style={{ display: "block", whiteSpace: "pre-wrap" }}>{e.note}</span>}
+                </figcaption>
+              </figure>
+            </li>
+          ))}
+        </ul>
+      )}
+      {open && (full ? (
+        <p className="hint" style={{ margin: 0 }}>Tu as ajouté {MAX_EVIDENCE_PER_MEMBER} photos : c&apos;est le maximum pour ce litige.</p>
+      ) : (
+        <form className="stack" onSubmit={add}>
+          <PhotoAttach value={photo} onChange={setPhoto} disabled={busy} label="Ajouter une photo de preuve" />
+          <div className="field">
+            <label htmlFor="evidence-note">Note sur cette photo (facultatif)</label>
+            <textarea id="evidence-note" className="input" rows={2} maxLength={500} value={note} onChange={(e) => setNote(e.target.value)} aria-describedby="evidence-hint" />
+            <span id="evidence-hint" className="hint">{mineCount}/{MAX_EVIDENCE_PER_MEMBER} photos. Seules les deux parties et l&apos;assistance les voient.</span>
+          </div>
+          {error && <span className="error" role="alert">{error}</span>}
+          <button className="btn btn-secondary" type="submit" disabled={busy || !hydrated || !photo} aria-busy={busy || undefined}>Ajouter la preuve</button>
+        </form>
+      ))}
     </section>
   );
 }

@@ -2,6 +2,8 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, ApiError } from "./api";
+import { PhotoAttach } from "./PhotoAttach";
+import { ViewablePhoto } from "./PhotoView";
 import { useHydrated } from "./useHydrated";
 import type { ChatMessage } from "@/lib/types";
 
@@ -20,6 +22,7 @@ export function ChatThread({ conversationId, initial, canWrite = true }: { conve
   const hydrated = useHydrated();
   const [messages, setMessages] = useState<ChatMessage[]>(initial);
   const [text, setText] = useState("");
+  const [photo, setPhoto] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const endRef = useRef<HTMLDivElement>(null);
@@ -50,13 +53,14 @@ export function ChatThread({ conversationId, initial, canWrite = true }: { conve
   async function send(e?: React.FormEvent) {
     e?.preventDefault();
     const body = text.trim();
-    if (busy || !body) return;
+    if (busy || (!body && !photo)) return;
     setBusy(true);
     setError(null);
     try {
-      const r = await api<{ message: ChatMessage }>(`/conversations/${conversationId}/messages`, { body: { body } });
+      const r = await api<{ message: ChatMessage }>(`/conversations/${conversationId}/messages`, { body: photo ? { body, photo } : { body } });
       setMessages((cur) => merge(cur, [r.message]));
       setText("");
+      setPhoto(null);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Le message n'est pas parti. Réessaie.");
     } finally {
@@ -78,7 +82,8 @@ export function ChatThread({ conversationId, initial, canWrite = true }: { conve
               {showDay && <div className="chat-day">{day}</div>}
               <div className={`bubble ${m.kind === "system" ? "system" : m.mine ? "mine" : "theirs"}`}>
                 <span className="sr-only">{m.mine ? "Toi : " : "Lui ou elle : "}</span>
-                <span style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{m.body}</span>
+                {m.photoUrl && <ViewablePhoto src={m.photoUrl} alt={`Photo envoyée par ${m.senderName ?? "un membre"}`} />}
+                {m.body && <span style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{m.body}</span>}
                 <time className="bubble-time tnum" dateTime={new Date(m.createdAt).toISOString()}>{timeFmt.format(m.createdAt)}</time>
                 {m.flagged && (
                   <span className="bubble-warn">Garde tes échanges et ton paiement dans l&apos;appli : c&apos;est ce qui te protège. Ne paie jamais en dehors.</span>
@@ -101,9 +106,10 @@ export function ChatThread({ conversationId, initial, canWrite = true }: { conve
               aria-describedby={error ? "msg-err" : "msg-hint"}
             />
             <span id="msg-hint" className="hint">Entrée envoie, Maj+Entrée va à la ligne.</span>
+            <PhotoAttach value={photo} onChange={setPhoto} disabled={busy} />
             {error && <span id="msg-err" className="error" role="alert">{error}</span>}
           </div>
-          <button className="btn btn-primary" type="submit" disabled={busy || !hydrated || text.trim().length === 0} aria-busy={busy || undefined}>Envoyer</button>
+          <button className="btn btn-primary" type="submit" disabled={busy || !hydrated || (text.trim().length === 0 && !photo)} aria-busy={busy || undefined}>Envoyer</button>
         </form>
       ) : (
         <p className="hint" style={{ textAlign: "center" }}>Ce membre a supprimé son compte : tu ne peux plus lui écrire.</p>

@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import { notFound, redirect } from "next/navigation";
-import { DisputeThread, ResolveDispute } from "@/components/client/DisputeForms";
+import { DisputeEvidencePanel, DisputeThread, ResolveDispute } from "@/components/client/DisputeForms";
 import { AppBar, Banner } from "@/components/ui";
 import { DISPUTE_REASONS } from "@/lib/copy";
 import { getData } from "@/lib/data";
@@ -37,6 +37,7 @@ export default async function StaffDisputePage({ params }: { params: Promise<{ i
           <dt>Ouvert par</dt><dd>{d.openedByName}</dd>
         </dl>
         <p style={{ margin: 0, whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{d.description}</p>
+        <DisputeEvidencePanel disputeId={d.id} evidence={d.evidence} open={d.status === "open"} />
         <DisputeThread disputeId={d.id} notes={d.notes} open={d.status === "open"} />
         {d.status === "open" && <ResolveDispute disputeId={d.id} />}
       </div>
