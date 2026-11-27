@@ -723,5 +723,75 @@ export function defineContract(label: string, factory: () => Promise<ContractEnv
         expect(await ids({ brand: "100%_" })).toEqual([]);
       });
     });
+
+    // ---- agent E : articles interdits
+    describe("articles interdits à la publication", () => {
+      const draftOf = (sellerId: string, over: Record<string, unknown>) =>
+        data.createDraft(sellerId, { title: "Robe test", description: "", categoryId: S("cat-robes"), condition: "good", priceMinor: 2500, currency: "USD", areaId: S("area-com-gombe"), photos: [PHOTO], ...over });
+
+      it("une annonce interdite est refusée en 422 avec le champ et le message de la règle ; elle reste en brouillon", async () => {
+        const seller = await signup("0811000141", "Vendeur Interdit");
+        const d = await draftOf(seller.id, { title: "Vends pistolet 9mm" });
+        const e = await rejects(data.publishItem(seller.id, d.id));
+        expect(code(e)).toBe("PROHIBITED_ITEM");
+        expect(e.status).toBe(422);
+        expect(Object.keys(e.details ?? {})).toEqual(["title"]);
+        expect(e.message).toBe(e.details!.title);
+        // brouillon intact : visible de son vendeur seulement, pas dans les résultats de recherche
+        const mine = await data.getItem(d.id, seller.id);
+        expect(mine?.title).toBe("Vends pistolet 9mm");
+        expect(mine?.status).toBe("draft");
+        expect(await data.getItem(d.id, null)).toBeNull();
+        expect((await data.listItems({ q: "pistolet" })).some((x) => x.id === d.id)).toBe(false);
+        // un second essai donne le même refus (pas d'état à moitié publié)
+        expect(code(await rejects(data.publishItem(seller.id, d.id)))).toBe("PROHIBITED_ITEM");
+      });
+      it("la description et la marque sont contrôlées ; le refus ne divulgue ni le mot trouvé ni la liste", async () => {
+        const seller = await signup("0811000142", "Vendeur Interdit Deux");
+        const d = await draftOf(seller.id, { description: "Je vends aussi de la Cocaïne" });
+        const e = await rejects(data.publishItem(seller.id, d.id));
+        expect(Object.keys(e.details ?? {})).toEqual(["description"]);
+        expect(JSON.stringify([e.message, e.details]).toLowerCase()).not.toMatch(/coca/);
+        const d2 = await draftOf(seller.id, { brand: "Kalachnikov" });
+        expect(Object.keys((await rejects(data.publishItem(seller.id, d2.id))).details ?? {})).toEqual(["brand"]);
+      });
+      it("contournements par casse, accents, espaces et lettres espacées : refusés", async () => {
+        const seller = await signup("0811000143", "Vendeur Contourne");
+        for (const title of ["ARME à FEU", "a  r  m  e   a   feu", "C O C A Ï N E", "t.r.a.m.a.d.o.l"]) {
+          const d = await draftOf(seller.id, { title });
+          expect(code(await rejects(data.publishItem(seller.id, d.id))), title).toBe("PROHIBITED_ITEM");
+        }
+      });
+      it("les mots proches mais légitimes sont acceptés (limites de mots, exceptions)", async () => {
+        const seller = await signup("0811000144", "Vendeur Légitime");
+        for (const title of ["Alarme maison", "Bracelet charme", "Pistolet à colle", "Robe ivoire", "Téléphone non volé"]) {
+          const a = await listing(seller.id, { title });
+          expect(a.status).toBe("active");
+        }
+        const withDesc = await listing(seller.id, { title: "Veste", description: "Couleur ivoire, achetée en Côte d'Ivoire, très bon état." });
+        expect(withDesc.status).toBe("active");
+      });
+      it("aucun contournement pour le personnel : un modérateur ou le support ne publie pas non plus pour un vendeur, et la règle vaut pour tous", async () => {
+        const staff = S("user-support-2");
+        const d = await draftOf(staff, { title: "Munitions calibre 12" });
+        expect(code(await rejects(data.publishItem(staff, d.id)))).toBe("PROHIBITED_ITEM");
+      });
+      it("les annonces déjà publiées ne sont pas rétro-analysées", async () => {
+        const seller = await signup("0811000145", "Vendeur Ancien");
+        const ok = await listing(seller.id, { title: "Montre ordinaire" });
+        expect((await data.getItem(ok.id, null))?.status).toBe("active");
+        expect((await data.listItems({ q: "montre ordinaire" })).some((x) => x.id === ok.id)).toBe(true);
+      });
+      it("la liste publique des règles ne contient jamais de mots-clés", async () => {
+        const rules = await data.listProhibitedRules();
+        expect(rules.length).toBeGreaterThanOrEqual(10);
+        for (const r of rules) {
+          expect(Object.keys(r).sort()).toEqual(["id", "label", "message"]);
+          expect(r.label.length).toBeGreaterThan(0);
+        }
+        expect(JSON.stringify(rules).toLowerCase()).not.toMatch(/kalachnikov|cocaine|tramadol/);
+      });
+    });
+    // ---- fin agent E
   });
 }

@@ -1,5 +1,6 @@
 import { FEES } from "../../fees";
 import { seedAreas, seedCategories, seedItems, seedUsers } from "../seed";
+import { seedProhibitedRules } from "./prohibited";
 import type { Pool } from "./pool";
 
 // Fuseaux : ouest de la RDC (dont Kinshasa) UTC+1, est UTC+2, pas d'heure d'été. À VÉRIFIER (zones IANA).
@@ -37,6 +38,7 @@ export async function seedReference(pool: Pool): Promise<void> {
   for (const [key, value] of Object.entries(settings)) {
     await pool.query(`insert into settings (key, value) values ($1, $2) on conflict (key) do nothing`, [key, JSON.stringify(value)]);
   }
+  await seedProhibitedRules(pool); // agent E : articles interdits
 }
 
 /** Données de DÉMONSTRATION (faux membres, fausses annonces). Jamais en production. */

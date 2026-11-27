@@ -30,6 +30,7 @@ import type {
   Currency,
   DeliveryMethod,
 } from "../types";
+import type { PublicProhibitedRule } from "../prohibited";
 import type { ListingInput } from "../validation";
 
 /**
@@ -132,4 +133,9 @@ export interface DataLayer {
     input: { amountMinor: number; currency: Currency; method: PaymentMethod; msisdn: string; idempotencyKey: string },
   ): Promise<Payout>;
   listPayouts(userId: string): Promise<Payout[]>;
+
+  // ---- agent E : articles interdits
+  /** Règles d'articles interdits en vigueur, SANS les mots-clés (page publique et administration). */
+  listProhibitedRules(): Promise<PublicProhibitedRule[]>;
+  // ---- fin agent E
 }

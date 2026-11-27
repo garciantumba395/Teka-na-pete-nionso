@@ -15,6 +15,7 @@ import {
   type LedgerEntry, type Order, type OrderAction, type OrderView, type Payment, type PaymentMethod, type Payout,
   type ProviderEvent, type PublicProfile, type User, type Wallet,
 } from "../types";
+import { checkListingText, defaultCompiledRules, DEFAULT_RULES, publicRule } from "../prohibited";
 import { CONDITIONS, validateListing, type ListingInput } from "../validation";
 import type { DataLayer } from "./types";
 import { seedAreas, seedCategories, seedItems, seedUsers } from "./seed";
@@ -483,6 +484,10 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
         categories,
       );
       if (Object.keys(errors).length) throw new AppError("VALIDATION", "Corrige les champs signalés.", 422, errors as Record<string, string>);
+      // ---- agent E : articles interdits (aucun contournement, pour personne ; l'annonce reste en brouillon)
+      const banned = checkListingText(it, defaultCompiledRules());
+      if (banned) throw new AppError("PROHIBITED_ITEM", banned.hit.message, 422, { [banned.field]: banned.hit.message });
+      // ---- fin agent E
       it.status = "active";
       it.publishedAt = now();
       return it;
@@ -953,6 +958,12 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
     async listPayouts(userId) {
       return [...payouts.values()].filter((p) => p.userId === userId).sort((a, b) => b.requestedAt - a.requestedAt);
     },
+
+    // ---- agent E : articles interdits
+    async listProhibitedRules() {
+      return DEFAULT_RULES.map(publicRule);
+    },
+    // ---- fin agent E
   };
 
   return api;
