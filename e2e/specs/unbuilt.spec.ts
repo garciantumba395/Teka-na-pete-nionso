@@ -22,7 +22,7 @@ test.describe("F03 à F08 : écrans en attente", () => {
     });
   }
 
-  for (const [id, path] of [["F05-G1", "/inbox"], ["F07-G1", "/pro"], ["F08-G1", "/report"]] as const) {
+  for (const [id, path] of [["F07-G1", "/pro"], ["F08-G1", "/report"]] as const) {
     test(`${id} ${path} répond 200 avec « Bientôt disponible »`, async ({ page }) => {
       const res = await open(page, path);
       expect(res?.status()).toBe(200);

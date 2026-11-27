@@ -57,3 +57,16 @@ textarea.input { padding: var(--space-8) var(--space-12); min-height: 96px; resi
 .kv dt { color: var(--color-text-muted); padding-right: var(--space-12); } .kv dd { margin: 0; font-weight: 600; text-align: right; }
 .kv .total { font-size: var(--text-base-size); border-top: 1px solid var(--color-border); padding-top: var(--space-8); margin-top: var(--space-4); }
 a.chip { text-decoration: none; }
+
+/* Messagerie */
+.chat { display: grid; grid-template-rows: minmax(0, 1fr) auto; gap: var(--space-12); min-height: 0; }
+.chat-log { display: flex; flex-direction: column; gap: var(--space-8); min-height: 240px; max-height: 60dvh; overflow-y: auto; padding: var(--space-8) 0; }
+.chat-day { align-self: center; font-size: var(--text-sm-size); color: var(--color-text-muted); margin: var(--space-8) 0 var(--space-4); }
+.bubble { max-width: 82%; padding: var(--space-8) var(--space-12); border-radius: var(--radius-md); display: grid; gap: var(--space-4); }
+.bubble.mine { align-self: flex-end; background: var(--color-accent); color: var(--color-on-accent); }
+.bubble.theirs { align-self: flex-start; background: var(--color-surface); color: var(--color-text); }
+.bubble.system { align-self: center; background: var(--color-accent-subtle); color: var(--color-text); font-size: var(--text-sm-size); }
+.bubble-time { font-size: var(--text-sm-size); justify-self: end; }
+.bubble-warn { font-size: var(--text-sm-size); border-top: 1px solid currentColor; padding-top: var(--space-4); }
+.chat-form { display: flex; gap: var(--space-8); align-items: flex-start; }
+.chat-form .btn { margin-top: 0; flex: none; }

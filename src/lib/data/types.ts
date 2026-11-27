@@ -1,6 +1,9 @@
 import type {
   Area,
   Category,
+  ChatMessage,
+  ConversationSummary,
+  ConversationView,
   Item,
   ItemCard,
   ItemDetail,
@@ -83,6 +86,14 @@ export interface DataLayer {
    */
   handleProviderEvent(event: ProviderEvent): Promise<{ duplicate: boolean; matched?: boolean }>;
   expireUnpaidOrders(): Promise<number>;
+
+  // Messagerie acheteur-vendeur, rattachée à une annonce. Un tiers n'y a jamais accès (404).
+  /** Ouvre (ou retrouve) la conversation de cet acheteur sur cette annonce. */
+  startConversation(buyerId: string, itemId: string): Promise<{ id: string; created: boolean }>;
+  listConversations(userId: string): Promise<ConversationSummary[]>;
+  /** Lit la conversation et marque comme lus les messages de l'interlocuteur. */
+  getConversation(conversationId: string, viewerId: string): Promise<ConversationView>;
+  sendMessage(conversationId: string, senderId: string, body: string): Promise<ChatMessage>;
 
   // Portefeuille
   getWallet(userId: string): Promise<Wallet>;

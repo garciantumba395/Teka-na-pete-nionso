@@ -43,6 +43,10 @@ export const orderCreate = z.object({
   deliveryAreaId: uuid.nullish(),
   deliveryLandmark: line(200).nullish(),
 });
+export const conversationCreate = z.object({ itemId: uuid });
+export const messageCreate = z.object({
+  body: z.string().transform(cleanText).pipe(z.string().trim().min(1, "Écris un message.").max(2000, "Un message est limité à 2 000 caractères.")),
+});
 export const payOrder = z.object({ method, msisdn: phone, idempotencyKey });
 export const confirmDelivery = z.object({ code: z.string().trim().regex(/^\d{6}$/, "Le code a 6 chiffres.") });
 export const payoutCreate = z.object({
@@ -71,6 +75,9 @@ export function parse<T>(schema: ZodType<T>, input: unknown): T {
   }
   throw new AppError("VALIDATION", Object.values(details)[0] ?? "Requête invalide.", 422, details);
 }
+
+/** Identifiant valide ou null (pour décider un 404 sans lever d'erreur). */
+export const parseIdOrNull = (raw: string): string | null => { const r = idParam.safeParse(raw); return r.success ? r.data : null; };
 
 /** Identifiant d'URL invalide = ressource introuvable (jamais une erreur serveur). */
 export function parseId(raw: string, what = "Ressource"): string {

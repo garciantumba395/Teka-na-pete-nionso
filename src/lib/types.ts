@@ -240,3 +240,31 @@ export class AppError extends Error {
     this.name = "AppError";
   }
 }
+
+// ------------------------------------------------------------------------------------------------ messagerie
+export interface ChatMessage {
+  id: string;
+  /** true si le message vient du membre qui consulte. */
+  mine: boolean;
+  /** « system » : message de la plateforme (pas d'expéditeur). */
+  kind: "text" | "system";
+  body: string;
+  /** Contient un numéro ou un lien : l'écran affiche un rappel de sécurité. Le message est quand même remis. */
+  flagged: boolean;
+  createdAt: number;
+}
+
+export interface ConversationSummary {
+  id: string;
+  itemId: string;
+  itemTitle: string;
+  itemPhoto: string | null;
+  counterpart: PublicProfile;
+  lastMessage: string | null;
+  lastMessageAt: number | null;
+  unread: number;
+}
+
+export interface ConversationView extends ConversationSummary {
+  messages: ChatMessage[];
+}

@@ -10,10 +10,11 @@ import {
 import { USD_CDF_PLACEHOLDER } from "../../money";
 import { FakeMobileMoneyProvider } from "../../payments/fake-provider";
 import type { PaymentProvider } from "../../payments/provider";
+import { detectOffPlatform, MESSAGE_MAX } from "../../messaging";
 import { normalizeDrcPhone } from "../../phone";
 import { ConsoleSmsProvider, type SmsProvider } from "../../sms/provider";
 import {
-  AppError, type Area, type Category, type Condition, type Currency, type Item, type ItemCard, type ItemDetail,
+  AppError, type Area, type Category, type ChatMessage, type Condition, type ConversationSummary, type Currency, type Item, type ItemCard, type ItemDetail,
   type LedgerEntry, type Order, type OrderAction, type OrderView, type Payment, type PaymentMethod,
   type PaymentStatus, type Payout, type PayoutStatus, type ProviderEvent, type PublicProfile, type User, type Wallet,
 } from "../../types";
@@ -787,6 +788,82 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
     },
 
     // ================================================================ portefeuille
+    async startConversation(buyerId, itemId) {
+      if (!isUuid(buyerId) || !isUuid(itemId)) throw notFound("Annonce");
+      const me = (await pool.query(`select 1 from profiles where id = $1 and deleted_at is null`, [buyerId])).rows[0];
+      if (!me) throw notFound("Compte");
+      const it = (await pool.query(`select i.seller_id, i.status, p.deleted_at from items i join profiles p on p.id = i.seller_id where i.id = $1`, [itemId])).rows[0];
+      if (!it || !["active", "reserved", "sold"].includes(it.status)) throw notFound("Annonce");
+      if (it.seller_id === buyerId) throw new AppError("OWN_ITEM", "C'est ton annonce : tu ne peux pas t'écrire à toi-même.", 409);
+      if (it.deleted_at) throw new AppError("MEMBER_DELETED", "Ce membre a supprimé son compte.", 409);
+      // Une seule conversation par (annonce, acheteur) : l'insertion concurrente retombe sur la ligne existante.
+      const ins = await pool.query(
+        `insert into conversations (item_id, buyer_id, seller_id, created_at) values ($1, $2, $3, $4)
+         on conflict (item_id, buyer_id) do nothing returning id`, [itemId, buyerId, it.seller_id, ts(now())]);
+      if (ins.rows[0]) return { id: ins.rows[0].id as string, created: true };
+      const ex = (await pool.query(`select id from conversations where item_id = $1 and buyer_id = $2`, [itemId, buyerId])).rows[0];
+      return { id: ex.id as string, created: false };
+    },
+
+    async listConversations(userId) {
+      if (!isUuid(userId)) return [];
+      const r = await pool.query(
+        `select c.id, c.item_id, c.last_message_at, c.buyer_id, c.seller_id, i.title,
+           (select storage_path from item_photos where item_id = i.id order by position limit 1) as first_photo,
+           p.id as p_id, p.display_name, p.bio, p.area_id as p_area, p.verification_level, p.rating_avg, p.rating_count, p.deleted_at,
+           (select body from messages where conversation_id = c.id order by created_at desc, id desc limit 1) as last_body,
+           (select count(*)::int from messages where conversation_id = c.id and read_at is null and sender_id is distinct from $1) as unread
+         from conversations c join items i on i.id = c.item_id
+         join profiles p on p.id = case when c.buyer_id = $1 then c.seller_id else c.buyer_id end
+         where c.buyer_id = $1 or c.seller_id = $1
+         order by c.last_message_at desc nulls last, c.created_at desc limit 100`, [userId]);
+      return r.rows.map((x): ConversationSummary => ({
+        id: x.id, itemId: x.item_id, itemTitle: x.title, itemPhoto: x.first_photo ? photoUrl(x.first_photo) : null,
+        counterpart: x.deleted_at
+          ? DELETED_PROFILE(x.p_id)
+          : profileOf({ id: x.p_id, display_name: x.display_name, bio: x.bio, area_id: x.p_area, verification_level: x.verification_level, rating_avg: x.rating_avg, rating_count: x.rating_count }),
+        lastMessage: x.last_body ? String(x.last_body).slice(0, 140) : null,
+        lastMessageAt: x.last_message_at ? x.last_message_at.getTime() : null, unread: x.unread,
+      }));
+    },
+
+    async getConversation(conversationId, viewerId) {
+      if (!isUuid(conversationId) || !isUuid(viewerId)) throw notFound("Conversation");
+      const c = (await pool.query(`select id from conversations where id = $1 and (buyer_id = $2 or seller_id = $2)`, [conversationId, viewerId])).rows[0];
+      if (!c) throw notFound("Conversation");
+      await pool.query(`update messages set read_at = $3 where conversation_id = $1 and read_at is null and sender_id is distinct from $2`, [conversationId, viewerId, ts(now())]);
+      const summary = (await api.listConversations(viewerId)).find((s) => s.id === conversationId);
+      if (!summary) throw notFound("Conversation");
+      const msgs = await pool.query(`select id, sender_id, kind, body, flagged, created_at from messages where conversation_id = $1 order by created_at, id`, [conversationId]);
+      return {
+        ...summary,
+        messages: msgs.rows.map((m): ChatMessage => ({ id: m.id, mine: m.sender_id === viewerId, kind: m.kind === "system" ? "system" : "text", body: m.body, flagged: m.flagged, createdAt: m.created_at.getTime() })),
+      };
+    },
+
+    async sendMessage(conversationId, senderId, body) {
+      if (!isUuid(conversationId) || !isUuid(senderId)) throw notFound("Conversation");
+      const text = body.trim();
+      if (text.length < 1) throw new AppError("VALIDATION", "Écris un message.", 422, { body: "Écris un message." });
+      if (text.length > MESSAGE_MAX) throw new AppError("VALIDATION", "Un message est limité à 2 000 caractères.", 422, { body: "Un message est limité à 2 000 caractères." });
+      const c = (await pool.query(
+        `select c.buyer_id, c.seller_id, p.deleted_at from conversations c
+         join profiles p on p.id = case when c.buyer_id = $2 then c.seller_id else c.buyer_id end
+         where c.id = $1 and (c.buyer_id = $2 or c.seller_id = $2)`, [conversationId, senderId])).rows[0];
+      if (!c) throw notFound("Conversation");
+      if (c.deleted_at) throw new AppError("MEMBER_DELETED", "Ce membre a supprimé son compte.", 409);
+      const flagged = detectOffPlatform(text);
+      const at = ts(now());
+      const row = await withTx(pool, async (tx) => {
+        const m = (await tx.query(
+          `insert into messages (conversation_id, sender_id, kind, body, flagged, flag_reason, created_at) values ($1, $2, 'text', $3, $4, $5, $6) returning id`,
+          [conversationId, senderId, text, flagged !== null, flagged, at])).rows[0];
+        await tx.query(`update conversations set last_message_at = $2 where id = $1`, [conversationId, at]);
+        return m;
+      });
+      return { id: row.id as string, mine: true, kind: "text" as const, body: text, flagged: flagged !== null, createdAt: at.getTime() };
+    },
+
     async getWallet(userId) {
       const r = await pool.query(
         `select account, currency, coalesce(sum(amount_minor), 0) as s from ledger_entries where user_id = $1 and account in ('seller_available','payout_pending') group by account, currency`, [userId]);

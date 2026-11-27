@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { BuyButton } from "@/components/client/BuyButton";
+import { StartChatButton } from "@/components/client/StartChatButton";
 import { Icon } from "@/components/icons";
 import { AppBar, Avatar, Banner, PriceTag, Stars } from "@/components/ui";
 import { getData } from "@/lib/data";
@@ -91,8 +92,12 @@ export default async function ItemPage({ params }: Props) {
         </div>
       </div>
 
+      {!own && (item.status === "active" || item.status === "reserved") && !available && (
+        <div className="cta-bar"><StartChatButton itemId={item.id} className="btn btn-secondary btn-lg" /></div>
+      )}
       {available && !own && (
         <div className="cta-bar">
+          <StartChatButton itemId={item.id} label="Écrire" />
           <BuyButton itemId={item.id} label={`Acheter · ${formatMoney(item.protectedPriceMinor, item.currency)}`} />
         </div>
       )}

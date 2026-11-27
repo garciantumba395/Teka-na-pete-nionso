@@ -80,3 +80,14 @@ Voir `replica/features.csv`. Parité : **39,9 / 100**, **10 des 24 must-haves fa
 
 - Suite Playwright de **95 tests** (`e2e/`), plan dans `replica/test-plan.md`, défauts dans `replica/bugs.md` : **10 trouvés et corrigés, aucun S1 ouvert**. Réussie à 100 % sur la couche factice (92 + 3 ignorés) et sur PostgreSQL (93 + 2 ignorés).
 - Les plus utiles : horloge du téléphone fausse (impossible de payer), texte invalide stocké (erreur d'hydratation pour tous les visiteurs, 500 sur PostgreSQL), POST en `text/plain` accepté, lien d'évitement sans effet, débordement à 320 px.
+
+## Mise à jour : `/replica-build`, tranche 1 (2026-11-27)
+
+| ID | Écran | État | Ce qui manque | Plus dur que prévu |
+| --- | --- | --- | --- | --- |
+| S07 | Messagerie | **fait** (texte) | Photos dans les messages, offres de prix, notification de nouveau message, temps réel (interrogation toutes les 4 s) | Rien de technique ; la détection de numéros sans bloquer demande des règles prudentes (une date ou un prix ne doivent pas être signalés) |
+
+- Conversation rattachée à une annonce, une par couple (annonce, acheteur) ; ouverture idempotente (index unique en base), 404 pour tout tiers, 409 si c'est sa propre annonce ou si l'interlocuteur a supprimé son compte.
+- Limites : 30 ouvertures par heure et 40 messages par 10 minutes et par membre.
+- Heure des messages affichée dans un fuseau fixe (Africa/Kinshasa), sinon le serveur et le navigateur ne s'accordent pas (erreur d'hydratation).
+- Tests : 6 scénarios de contrat sur les deux couches, 3 tests unitaires de détection, 10 cas e2e (`f05-messages.spec.ts`), 3 écrans dans l'audit d'accessibilité.

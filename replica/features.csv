@@ -14,8 +14,8 @@ Favoris,découverte,should,yes,no,[IMG] captures 1 à 5 : cœur et compteur sur 
 Inscription et connexion,compte,must,yes,yes,"[IMG] captures 4 et 6 : réseaux sociaux + e-mail. Clone : téléphone + code SMS | M0 : téléphone + code SMS (factice en développement) | [BACKEND] Persistant en PostgreSQL, sessions révocables, limites de débit. SMS réel non branché"
 Vérification de compte,compte,should,yes,partial,[SRC] safety (existence confirmée) | Numéro vérifié seulement ; pièce d'identité non construite
 Profil public avec badge vérifié,compte,should,yes,yes,"[SRC] safety | M0 : profil public, mention « numéro vérifié »"
-Messagerie acheteur-vendeur,messagerie,must,yes,no,[SRC] safety
-Filtre anti-spam dans les messages,messagerie,should,yes,no,[SRC] safety
+Messagerie acheteur-vendeur,messagerie,must,yes,yes,"[SRC] safety | M1 : messages texte, non lus, interrogation toutes les 4 s (pas de temps réel), rappel de sécurité sur numéro ou lien. Pas de photos dans les messages"
+Filtre anti-spam dans les messages,messagerie,should,yes,partial,[SRC] safety | Détection de numéro et de lien : message remis avec un rappel (pas de blocage ni de modération)
 Offres de prix / négociation,messagerie,should,yes,no,[INF] à confirmer
 Achat via bouton « Acheter » (paiement protégé),paiement,must,yes,yes,"[SRC] how_it_works / refund policy | M0 : réservation atomique, paiement mobile money (factice)"
 Frais de protection ajoutés à l'acheteur,paiement,must,yes,yes,"[SRC] montant non lu. [IMG] captures 4 et 5 : prix « incl. » avec bouclier dès la liste | M0 : 5 % avec minimum, valeurs PLACEHOLDER"

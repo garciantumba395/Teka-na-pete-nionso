@@ -468,5 +468,83 @@ export function defineContract(label: string, factory: () => Promise<ContractEnv
         expect(code(await rejects(data.requestPayout(autre.id, input)))).toBe("IDEMPOTENCY_CONFLICT");
       });
     });
+
+    describe("messagerie", () => {
+      async function duo() {
+        const seller = await signup("0811000091", "Vendeuse Chat");
+        const buyer = await signup("0821000092", "Acheteur Chat");
+        const item = await listing(seller.id);
+        return { seller, buyer, item };
+      }
+      it("ouvrir une conversation est idempotent, écrire est réservé aux deux parties", async () => {
+        const { seller, buyer, item } = await duo();
+        const a = await data.startConversation(buyer.id, item.id);
+        const b = await data.startConversation(buyer.id, item.id);
+        expect(a.created).toBe(true);
+        expect(b).toEqual({ id: a.id, created: false });
+        await data.sendMessage(a.id, buyer.id, "Bonjour, il est encore disponible ?");
+        const reply = await data.sendMessage(a.id, seller.id, "Oui, à Gombe.");
+        expect(reply.mine).toBe(true);
+        const asBuyer = await data.getConversation(a.id, buyer.id);
+        expect(asBuyer.messages.map((m) => [m.mine, m.body])).toEqual([[true, "Bonjour, il est encore disponible ?"], [false, "Oui, à Gombe."]]);
+        expect(asBuyer.counterpart.id).toBe(seller.id);
+      });
+      it("on ne s'écrit pas à soi-même ; une annonce inconnue ou en brouillon est introuvable", async () => {
+        const { seller, buyer, item } = await duo();
+        expect(code(await rejects(data.startConversation(seller.id, item.id)))).toBe("OWN_ITEM");
+        expect(code(await rejects(data.startConversation(buyer.id, S("item-inconnu"))))).toBe("NOT_FOUND");
+        const draft = await data.createDraft(seller.id, { title: "Brouillon", description: "", categoryId: S("cat-robes"), condition: "good", priceMinor: 1000, currency: "USD", areaId: S("area-com-gombe"), photos: [PHOTO] });
+        expect(code(await rejects(data.startConversation(buyer.id, draft.id)))).toBe("NOT_FOUND");
+      });
+      it("un tiers ne lit ni n'écrit dans la conversation (404 partout)", async () => {
+        const { buyer, item } = await duo();
+        const tiers = await signup("0831000093", "Tiers Curieux");
+        const c = await data.startConversation(buyer.id, item.id);
+        await data.sendMessage(c.id, buyer.id, "Message privé");
+        expect(code(await rejects(data.getConversation(c.id, tiers.id)))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.sendMessage(c.id, tiers.id, "Intrus")))).toBe("NOT_FOUND");
+        expect(await data.listConversations(tiers.id)).toEqual([]);
+        expect((await data.getConversation(c.id, buyer.id)).messages.length).toBe(1);
+      });
+      it("messages vides ou trop longs refusés ; numéro et lien signalés mais remis", async () => {
+        const { buyer, item } = await duo();
+        const c = await data.startConversation(buyer.id, item.id);
+        expect(code(await rejects(data.sendMessage(c.id, buyer.id, "   ")))).toBe("VALIDATION");
+        expect(code(await rejects(data.sendMessage(c.id, buyer.id, "x".repeat(2001))))).toBe("VALIDATION");
+        const ok = await data.sendMessage(c.id, buyer.id, "x".repeat(2000));
+        expect(ok.flagged).toBe(false);
+        const num = await data.sendMessage(c.id, buyer.id, "Appelle-moi au 082 123 45 67");
+        const lien = await data.sendMessage(c.id, buyer.id, "Paie ici https://exemple.com/pay");
+        expect(num.flagged).toBe(true);
+        expect(lien.flagged).toBe(true);
+        expect((await data.getConversation(c.id, buyer.id)).messages.length).toBe(3);
+      });
+      it("non lus : comptés pour le destinataire, remis à zéro à la lecture ; liste triée par dernier message", async () => {
+        const { seller, buyer, item } = await duo();
+        const item2 = await listing(seller.id, { title: "Sac test" });
+        const c1 = await data.startConversation(buyer.id, item.id);
+        const c2 = await data.startConversation(buyer.id, item2.id);
+        await data.sendMessage(c1.id, buyer.id, "Premier");
+        env.advance(1000);
+        await data.sendMessage(c2.id, buyer.id, "Second");
+        env.advance(1000);
+        await data.sendMessage(c2.id, buyer.id, "Troisième");
+        const inbox = await data.listConversations(seller.id);
+        expect(inbox.map((x) => [x.id, x.unread])).toEqual([[c2.id, 2], [c1.id, 1]]);
+        expect(inbox[0].lastMessage).toBe("Troisième");
+        await data.getConversation(c2.id, seller.id);
+        expect((await data.listConversations(seller.id)).map((x) => x.unread)).toEqual([0, 1]);
+        expect((await data.listConversations(buyer.id)).every((x) => x.unread === 0)).toBe(true);
+      });
+      it("le compte supprimé de l'interlocuteur : conversation lisible, écriture refusée", async () => {
+        const { seller, buyer, item } = await duo();
+        const c = await data.startConversation(buyer.id, item.id);
+        await data.sendMessage(c.id, buyer.id, "Avant la suppression");
+        await data.deleteAccount(buyer.id);
+        const view = await data.getConversation(c.id, seller.id);
+        expect(view.counterpart.displayName).toBe("Membre supprimé");
+        expect(code(await rejects(data.sendMessage(c.id, seller.id, "Tu es là ?")))).toBe("MEMBER_DELETED");
+      });
+    });
   });
 }

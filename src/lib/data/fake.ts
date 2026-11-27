@@ -7,10 +7,11 @@ import {
   assertBalanced, holdEntries, payoutFailedEntries, payoutPaidEntries, payoutRequestEntries, refundEntries,
   releaseEntries, sellerAvailable, sellerPending, type NewEntry,
 } from "../ledger";
+import { detectOffPlatform, MESSAGE_MAX } from "../messaging";
 import { normalizeDrcPhone } from "../phone";
 import { FakeMobileMoneyProvider } from "../payments/fake-provider";
 import {
-  AppError, type Area, type Category, type Currency, type Item, type ItemCard, type ItemDetail, type ItemQuery,
+  AppError, type Area, type Category, type ChatMessage, type ConversationSummary, type Currency, type Item, type ItemCard, type ItemDetail, type ItemQuery,
   type LedgerEntry, type Order, type OrderAction, type OrderView, type Payment, type PaymentMethod, type Payout,
   type ProviderEvent, type PublicProfile, type User, type Wallet,
 } from "../types";
@@ -71,6 +72,10 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
   const sessions = new Map<string, { userId: string; expiresAt: number }>();
   const limits = new Map<string, { start: number; count: number }>();
   const deleted = new Set<string>();
+  interface ConvRec { id: string; itemId: string; buyerId: string; sellerId: string; lastMessageAt: number | null; createdAt: number }
+  interface MsgRec { id: string; convId: string; senderId: string | null; kind: "text" | "system"; body: string; flagged: boolean; readAt: number | null; createdAt: number }
+  const convs = new Map<string, ConvRec>();
+  const messages: MsgRec[] = [];
 
   if (opts.seed !== false) {
     const t = now();
@@ -171,6 +176,28 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
       actions,
     };
   }
+
+  function loadConv(convId: string, viewerId: string): ConvRec {
+    const c = convs.get(convId);
+    if (!c || (c.buyerId !== viewerId && c.sellerId !== viewerId)) throw notFound("Conversation");
+    return c;
+  }
+
+  function convSummary(c: ConvRec, viewerId: string): ConversationSummary {
+    const it = items.get(c.itemId)!;
+    const mine = messages.filter((m) => m.convId === c.id);
+    const last = mine[mine.length - 1];
+    return {
+      id: c.id, itemId: c.itemId, itemTitle: it.title, itemPhoto: it.photos[0] ?? null,
+      counterpart: profileOf(viewerId === c.buyerId ? c.sellerId : c.buyerId),
+      lastMessage: last ? last.body.slice(0, 140) : null, lastMessageAt: c.lastMessageAt,
+      unread: mine.filter((m) => m.senderId !== viewerId && m.readAt === null).length,
+    };
+  }
+
+  const chatMessage = (m: MsgRec, viewerId: string): ChatMessage => ({
+    id: m.id, mine: m.senderId === viewerId, kind: m.kind, body: m.body, flagged: m.flagged, createdAt: m.createdAt,
+  });
 
   function loadOrder(orderId: string): Order {
     const o = orders.get(orderId);
@@ -620,6 +647,47 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
     },
 
     // ---- portefeuille
+    async startConversation(buyerId, itemId) {
+      const u = users.get(buyerId);
+      if (!u || deleted.has(buyerId)) throw notFound("Compte");
+      const it = items.get(itemId);
+      if (!it || !["active", "reserved", "sold"].includes(it.status)) throw notFound("Annonce");
+      if (it.sellerId === buyerId) throw new AppError("OWN_ITEM", "C'est ton annonce : tu ne peux pas t'écrire à toi-même.", 409);
+      if (deleted.has(it.sellerId)) throw new AppError("MEMBER_DELETED", "Ce membre a supprimé son compte.", 409);
+      const existing = [...convs.values()].find((c) => c.itemId === itemId && c.buyerId === buyerId);
+      if (existing) return { id: existing.id, created: false };
+      const c: ConvRec = { id: randomUUID(), itemId, buyerId, sellerId: it.sellerId, lastMessageAt: null, createdAt: now() };
+      convs.set(c.id, c);
+      return { id: c.id, created: true };
+    },
+
+    async listConversations(userId) {
+      return [...convs.values()]
+        .filter((c) => c.buyerId === userId || c.sellerId === userId)
+        .map((c) => convSummary(c, userId))
+        .sort((a, b) => (b.lastMessageAt ?? 0) - (a.lastMessageAt ?? 0));
+    },
+
+    async getConversation(conversationId, viewerId) {
+      const c = loadConv(conversationId, viewerId);
+      const mine = messages.filter((m) => m.convId === c.id);
+      for (const m of mine) if (m.senderId !== viewerId && m.readAt === null) m.readAt = now();
+      return { ...convSummary(c, viewerId), messages: mine.map((m) => chatMessage(m, viewerId)) };
+    },
+
+    async sendMessage(conversationId, senderId, body) {
+      const c = loadConv(conversationId, senderId);
+      const text = body.trim();
+      if (text.length < 1) throw new AppError("VALIDATION", "Écris un message.", 422, { body: "Écris un message." });
+      if (text.length > MESSAGE_MAX) throw new AppError("VALIDATION", "Un message est limité à 2 000 caractères.", 422, { body: "Un message est limité à 2 000 caractères." });
+      const other = senderId === c.buyerId ? c.sellerId : c.buyerId;
+      if (deleted.has(other)) throw new AppError("MEMBER_DELETED", "Ce membre a supprimé son compte.", 409);
+      const m: MsgRec = { id: randomUUID(), convId: c.id, senderId, kind: "text", body: text, flagged: detectOffPlatform(text) !== null, readAt: null, createdAt: now() };
+      messages.push(m);
+      c.lastMessageAt = m.createdAt;
+      return chatMessage(m, senderId);
+    },
+
     async getWallet(userId) {
       const mine = ledger.filter((e) => e.userId === userId && e.account === "seller_available");
       const balances = (["USD", "CDF"] as Currency[])

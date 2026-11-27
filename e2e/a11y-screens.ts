@@ -32,7 +32,6 @@ export function defineA11y(label: string) {
         await page.keyboard.press("Enter");
         await page.getByText("Code reçu par SMS").waitFor();
       });
-      await check("S07 écran en attente", page, "/inbox");
       await check("404", page, "/items/inexistant");
       // acheteur connecté
       const bp = buyer.page;
@@ -44,6 +43,11 @@ export function defineA11y(label: string) {
       await check("S15 mon profil", bp, "/me");
       await check("S16 portefeuille vide", bp, "/wallet");
       await check("S14 profil public", bp, `/members/${seller.userId}`);
+      await check("S07 messages (vide)", bp, "/inbox");
+      const conv = (await (await buyer.request.post("/api/v1/conversations", { data: { itemId: item.id } })).json()).conversation.id;
+      await buyer.request.post(`/api/v1/conversations/${conv}/messages`, { data: { body: "Bonjour, 0821234567 pour discuter" } });
+      await check("S07 messages (liste)", bp, "/inbox");
+      await check("S07 conversation (avec rappel de sécurité)", bp, `/inbox/${conv}`);
       // vendeur
       const sp = seller.page;
       await check("S09 commande payée (vendeur, saisie du code)", sp, `/orders/${paidId}`);
