@@ -56,6 +56,7 @@ export default async function StaffPage() {
             </ul>
           )}
         </section>
+        <p><Link href="/staff/rules">Règles d&apos;articles interdits</Link></p>
       </div>
     </div>
   );
