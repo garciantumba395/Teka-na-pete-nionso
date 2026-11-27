@@ -34,6 +34,9 @@ export async function seedReference(pool: Pool): Promise<void> {
     handover_max_attempts: FEES.handoverMaxAttempts,
     handover_lock_minutes: FEES.handoverLockMs / 60_000,
     max_photos: FEES.maxPhotos,
+    claim_window_hours: FEES.claimWindowMs / 3_600_000,
+    courier_stale_days: FEES.courierStaleMs / 86_400_000,
+    shipping_grid: { ...FEES.shippingGrid, _placeholder: true },
   };
   for (const [key, value] of Object.entries(settings)) {
     await pool.query(`insert into settings (key, value) values ($1, $2) on conflict (key) do nothing`, [key, JSON.stringify(value)]);

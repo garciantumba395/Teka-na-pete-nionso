@@ -1,6 +1,6 @@
 import { createHash, createHmac, randomBytes, randomInt, randomUUID, timingSafeEqual } from "node:crypto";
 import { APP_NAME } from "../../copy";
-import { payoutFee, protectionFee } from "../../fees";
+import { payoutFee, protectionFee, shippingFee, shippingZone, type ShippingZone } from "../../fees";
 import { coarsen } from "../../geo";
 import { checkAttempt, codesEqual, deriveHandoverCode, hashCode } from "../../handover";
 import {
@@ -17,6 +17,7 @@ import { ConsoleSmsProvider, type SmsProvider } from "../../sms/provider";
 import {
   AppError, type Area, type Category, type ChatMessage, type Condition, type ConversationSummary, type DisputeNote, type DisputeOutcome, type DisputeSummary, type DisputeView, type ReportAction, type ReportView, type Review, type UserRole, type Currency, type Item, type ItemCard, type ItemDetail, type LedgerEntry, type Order, type OrderAction, type OrderView, type CancelRequestStatus, type Payment, type PaymentMethod, type DisputeEvidence,
   type PaymentStatus, type Payout, type PayoutStatus, type ProviderEvent, type PublicProfile, type User, type Wallet,
+  type ShipmentEventKind, type ShipmentView, type ShippingQuote,
 } from "../../types";
 import { CONDITIONS, validateListing } from "../../validation";
 import type { DataLayer } from "../types";
@@ -50,6 +51,7 @@ export interface PgData extends DataLayer {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Row = Record<string, any>;
 
+const LOST_DEFAULT_TEXT = "Colis signalé perdu : il n'est pas arrivé à destination.";
 const METHODS: PaymentMethod[] = ["mpesa", "orange_money", "airtel_money", "africell_money"];
 const ONE_DAY = 86_400_000;
 const sha256 = (v: string) => createHash("sha256").update(v).digest("hex");
@@ -84,7 +86,7 @@ const orderOf = (r: Row): Order => ({
   deliveryMethod: r.delivery_method, deliveryAreaId: r.delivery_area_id, deliveryLandmark: r.delivery_landmark,
   itemIds: r.item_ids ?? [], paymentExpiresAt: r.payment_expires_at?.getTime() ?? null, paidAt: r.paid_at?.getTime() ?? null,
   deliveredAt: r.delivered_at?.getTime() ?? null, completedAt: r.completed_at?.getTime() ?? null,
-  cancelledAt: r.cancelled_at?.getTime() ?? null, createdAt: r.created_at.getTime(),
+  cancelledAt: r.cancelled_at?.getTime() ?? null, createdAt: r.created_at.getTime(), autoReleaseAt: r.auto_release_at?.getTime() ?? null,
 });
 const paymentOf = (r: Row): Payment => ({
   id: r.id, orderId: r.order_id, provider: r.provider, method: r.method, msisdn: r.msisdn ?? "", amountMinor: r.amount_minor,
@@ -189,6 +191,27 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
     return r.rowCount ?? 0;
   }
 
+  // ---- agent D : livraison par coursier
+  async function logShipment(q: Queryable, shipmentId: string, orderId: string, kind: ShipmentEventKind, actorId: string | null, note: string | null = null) {
+    await q.query(`insert into shipment_events (shipment_id, order_id, kind, actor_id, note, created_at) values ($1,$2,$3,$4,$5,$6)`, [shipmentId, orderId, kind, actorId, note, ts(now())]);
+  }
+  /** Zone de tarification entre la commune d'origine de l'article et celle de l'acheteur (communes sans parent connu : même ville). */
+  async function zoneFor(q: Queryable, originAreaId: string | null, destAreaId: string): Promise<ShippingZone> {
+    if (!isUuid(destAreaId)) throw new AppError("VALIDATION", "Choisis ta commune pour la livraison.", 422, { areaId: "Choisis ta commune pour la livraison." });
+    const dest = (await q.query(`select id, parent_id from areas where id = $1 and kind = 'commune'`, [destAreaId])).rows[0];
+    if (!dest) throw new AppError("VALIDATION", "Choisis ta commune pour la livraison.", 422, { areaId: "Choisis ta commune pour la livraison." });
+    const origin = originAreaId ? (await q.query(`select id, parent_id from areas where id = $1`, [originAreaId])).rows[0] : null;
+    return shippingZone(origin?.id ?? null, dest.id, [origin, dest].filter(Boolean).map((a) => ({ id: a.id, parentId: a.parent_id })));
+  }
+  async function shipmentViewOf(q: Queryable, order: Order, ship: Row | undefined): Promise<ShipmentView | null> {
+    if (order.deliveryMethod !== "courier" || !ship) return null;
+    const ev = await q.query(`select id, kind, note, created_at from shipment_events where shipment_id = $1 order by seq`, [ship.id]);
+    return {
+      status: ship.status, courierName: ship.courier_name, courierPhone: ship.courier_phone, trackingRef: ship.tracking_ref,
+      events: ev.rows.map((e) => ({ id: e.id, kind: e.kind, at: e.created_at.getTime(), note: e.note })),
+    };
+  }
+
   async function buildView(q: Queryable, order: Order, viewerId: string): Promise<OrderView> {
     if (viewerId !== order.buyerId && viewerId !== order.sellerId) throw notFound("Commande");
     const role = viewerId === order.buyerId ? "buyer" : "seller";
@@ -198,27 +221,48 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
         `select i.id, i.title, i.price_minor, i.currency, (select storage_path from item_photos where item_id = i.id order by position limit 1) as path
          from order_items oi join items i on i.id = oi.item_id where oi.order_id = $1 order by i.id`, [order.id]),
       q.query(`select * from payments where order_id = $1 order by created_at desc limit 1`, [order.id]),
-      q.query(`select handover_attempts, handover_locked_until from shipments where order_id = $1`, [order.id]),
+      q.query(`select * from shipments where order_id = $1`, [order.id]),
       q.query(`select * from profiles where id = $1`, [role === "buyer" ? order.sellerId : order.buyerId]),
     ]);
     const pay = payR.rows[0];
     const ship = shipR.rows[0];
     const live = order.status === "paid" || order.status === "in_delivery";
     const actions: OrderAction[] = [];
+    const courier = order.deliveryMethod === "courier";
     const cr = await cancelRequestsOf(q, order.id); // agent A : les actions dépendent de l'état des demandes d'annulation
     if (role === "buyer") {
       if (order.status === "pending_payment") actions.push("pay", "cancel");
-      if (live) {
+      if (live && !courier) {
         actions.push("reveal_code", "issue");
         if (cr.livePending) actions.push("withdraw_cancel");
         else if (!cr.refused) actions.push("request_cancel");
       }
-      if (order.status === "delivered") actions.push("accept", "issue");
+      // ---- agent D : livraison par coursier (pas de code ; une fois le colis remis, l'acheteur ne peut plus annuler seul)
+      if (live && courier) {
+        if (order.status === "paid") {
+          actions.push("issue");
+          if (cr.livePending) actions.push("withdraw_cancel");
+          else if (!cr.refused) actions.push("request_cancel");
+        } else actions.push("confirm_received", "report_lost", "issue");
+      }
+      if (order.status === "delivered") {
+        actions.push("accept");
+        if (order.autoReleaseAt == null || now() < order.autoReleaseAt) actions.push("issue");
+      }
     } else {
       if (order.status === "pending_payment") actions.push("cancel");
-      if (live) {
+      if (live && !courier) {
         actions.push("confirm_delivery", "cancel", "issue");
         if (cr.livePending) actions.push("accept_cancel", "decline_cancel");
+      }
+      if (live && courier) {
+        if (order.status === "paid") {
+          actions.push("ship", "cancel", "issue");
+          if (cr.livePending) actions.push("accept_cancel", "decline_cancel");
+        } else {
+          if (ship?.status === "handed_to_courier") actions.push("mark_in_transit");
+          actions.push("report_lost", "issue");
+        }
       }
     }
     const dspR = await q.query(`select id, status from disputes where order_id = $1 order by opened_at desc limit 1`, [order.id]);
@@ -233,7 +277,8 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
       items: itemsR.rows.map((i) => ({ id: i.id, title: i.title, photo: i.path ? photoUrl(i.path) : null, priceMinor: i.price_minor, currency: i.currency })),
       counterpart: cp && !cp.deleted_at ? profileOf(cp) : DELETED_PROFILE(role === "buyer" ? order.sellerId : order.buyerId),
       payment: pay ? { id: pay.id, status: pay.status, method: pay.method, failureCode: pay.failure_code } : null,
-      handover: role === "seller" && live && ship ? { attemptsLeft: Math.max(0, fees.handoverMaxAttempts - ship.handover_attempts), lockedUntil: locked } : null,
+      shipment: await shipmentViewOf(q, order, ship),
+      handover: role === "seller" && live && ship && !courier ? { attemptsLeft: Math.max(0, fees.handoverMaxAttempts - ship.handover_attempts), lockedUntil: locked } : null,
       actions,
       dispute: dspR.rows[0] ? { id: dspR.rows[0].id, status: dspR.rows[0].status } : null,
       cancelRequest: (() => {
@@ -681,7 +726,7 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
 
     async createOrder(buyerId, input) {
       await expireUnpaid(pool);
-      if (input.deliveryMethod !== "hand_delivery") throw new AppError("NOT_SUPPORTED", "Seule la remise en main propre est disponible pour l'instant.", 400);
+      if (input.deliveryMethod === "relay_point") throw new AppError("NOT_SUPPORTED", "La livraison en point relais n'est pas encore disponible.", 400);
       const ids = [...new Set(input.itemIds)];
       if (!ids.length) throw new AppError("VALIDATION", "Choisis au moins un article.", 422);
       if (ids.some((i) => !isUuid(i))) throw notFound("Article");
@@ -700,13 +745,26 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
           const currency = rows[0].currency as Currency;
           const itemsMinor = rows.reduce((s, i) => s + i.price_minor, 0);
           const fee = protectionFee(itemsMinor, currency, fees);
+          // ---- agent D : livraison par coursier (commune de l'acheteur + repère obligatoires, frais selon la grille)
+          let shippingMinor = 0;
+          if (input.deliveryMethod === "courier") {
+            if (!input.deliveryAreaId || !isUuid(input.deliveryAreaId)) throw new AppError("VALIDATION", "Choisis ta commune pour la livraison.", 422, { deliveryAreaId: "Choisis ta commune pour la livraison." });
+            if ((input.deliveryLandmark?.trim().length ?? 0) < 3) throw new AppError("VALIDATION", "Décris un repère pour le coursier (3 caractères au moins).", 422, { deliveryLandmark: "Décris un repère pour le coursier (3 caractères au moins)." });
+            const sellerArea = (await c.query(`select area_id from profiles where id = $1`, [rows[0].seller_id])).rows[0]?.area_id ?? null;
+            let zone: ShippingZone;
+            try { zone = await zoneFor(c, rows[0].area_id ?? sellerArea, input.deliveryAreaId); } catch (e) {
+              if (e instanceof AppError) throw new AppError("VALIDATION", e.message, 422, { deliveryAreaId: e.message });
+              throw e;
+            }
+            shippingMinor = shippingFee(zone, currency, fees);
+          }
           const o = (await c.query(
             `insert into orders (buyer_id, seller_id, status, currency, items_minor, shipping_minor, protection_fee_minor, total_minor, delivery_method,
                delivery_area_id, delivery_landmark, payment_expires_at, created_at)
-             values ($1,$2,'pending_payment',$3,$4,0,$5,$6,$7,$8,$9,$10,$11) returning *`,
-            [buyerId, rows[0].seller_id, currency, itemsMinor, fee, itemsMinor + fee, input.deliveryMethod,
+             values ($1,$2,'pending_payment',$3,$4,$12,$5,$6,$7,$8,$9,$10,$11) returning *`,
+            [buyerId, rows[0].seller_id, currency, itemsMinor, fee, itemsMinor + shippingMinor + fee, input.deliveryMethod,
               input.deliveryAreaId && isUuid(input.deliveryAreaId) ? input.deliveryAreaId : null,
-              input.deliveryLandmark?.trim().slice(0, 200) || null, ts(now() + fees.orderPaymentTtlMs), ts(now())],
+              input.deliveryLandmark?.trim().slice(0, 200) || null, ts(now() + fees.orderPaymentTtlMs), ts(now()), shippingMinor],
           )).rows[0];
           for (const i of rows) {
             await c.query(`insert into order_items (order_id, item_id, price_minor, currency) values ($1,$2,$3,$4)`, [o.id, i.id, i.price_minor, i.currency]);
@@ -790,6 +848,7 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
     async getHandoverCode(orderId, buyerId) {
       const order = await loadOrder(pool, orderId);
       if (order.buyerId !== buyerId) throw notFound("Commande");
+      if (order.deliveryMethod === "courier") throw new AppError("INVALID_STATE", "La livraison par coursier n'utilise pas de code de remise.", 409);
       if (!["paid", "in_delivery", "delivered"].includes(order.status)) throw new AppError("INVALID_STATE", "Le code est disponible une fois la commande payée.", 409);
       return deriveHandoverCode(orderId);
     },
@@ -802,6 +861,7 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
         const order = await loadOrder(c, orderId, true);
         if (order.sellerId !== sellerId) throw notFound("Commande");
         if (order.status !== "paid" && order.status !== "in_delivery") throw new AppError("INVALID_STATE", "Cette commande n'attend pas de remise.", 409);
+        if (order.deliveryMethod === "courier") throw new AppError("INVALID_STATE", "Cette commande est livrée par coursier : l'acheteur confirme la réception.", 409);
         const ship = (await c.query(`select * from shipments where order_id = $1 for update`, [orderId])).rows[0];
         if (!ship) throw new AppError("INVALID_STATE", "Aucune remise en cours pour cette commande.", 409);
         const ok = codesEqual(deriveHandoverCode(orderId), (code ?? "").trim());
@@ -844,6 +904,9 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
         if (order.status === "pending_payment") {
           await c.query(`update orders set status = 'cancelled', cancelled_at = $2 where id = $1`, [orderId, ts(now())]);
         } else if (order.status === "paid" || order.status === "in_delivery") {
+          // ---- agent D : colis remis au coursier, l'acheteur ne peut plus annuler seul (colis perdu ou litige à la place)
+          if (order.status === "in_delivery" && order.deliveryMethod === "courier" && actorId === order.buyerId)
+            throw new AppError("INVALID_STATE", "Le colis est parti : signale-le comme non reçu ou ouvre un litige.", 409);
           // Après paiement, l'acheteur ne peut plus annuler seul (il pourrait avoir reçu l'article sans donner le code).
           if (actorId === order.buyerId) {
             throw new AppError("CANCEL_REQUEST_REQUIRED", "Après paiement, tu ne peux plus annuler seul : demande l'annulation au vendeur. S'il refuse, tu peux ouvrir un litige.", 409);
@@ -933,7 +996,9 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
             await c.query(`update payments set status = 'succeeded' where id = $1`, [pay.id]);
             await c.query(`update orders set status = 'paid', paid_at = $2 where id = $1`, [order.id, ts(now())]);
             await post(c, holdEntries(ctx("payment", pay.id, order.currency), order.totalMinor));
-            await c.query(`insert into shipments (order_id, method, status, handover_code_hash) values ($1,$2,'pending',$3)`, [order.id, order.deliveryMethod, hashCode(deriveHandoverCode(order.id))]);
+            const sh = (await c.query(`insert into shipments (order_id, method, status, handover_code_hash) values ($1,$2,'pending',$3) returning id`,
+              [order.id, order.deliveryMethod, order.deliveryMethod === "courier" ? null : hashCode(deriveHandoverCode(order.id))])).rows[0];
+            if (order.deliveryMethod === "courier") await logShipment(c, sh.id, order.id, "paid", null);
           } else {
             // Paiement arrivé APRÈS expiration ou annulation : on ne garde jamais l'argent, remboursement automatique.
             await post(c, holdEntries(ctx("payment", pay.id, order.currency), pay.amount_minor));
@@ -1121,7 +1186,11 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
         const order = await loadOrder(c, orderId, true);
         if (order.buyerId !== userId && order.sellerId !== userId) throw notFound("Commande");
         if (order.status === "disputed") throw new AppError("DISPUTE_EXISTS", "Un litige est déjà ouvert sur cette commande.", 409);
-        if (order.status !== "paid" && order.status !== "in_delivery") throw new AppError("INVALID_STATE", "Un litige ne peut être ouvert que sur une commande payée et pas encore remise.", 409);
+        if (order.status === "delivered") {
+          // ---- agent D : après « reçu » (livraison par coursier), litige possible pour l'acheteur seul, pendant la fenêtre de réclamation
+          if (order.buyerId !== userId) throw new AppError("INVALID_STATE", "Après la livraison, seul l'acheteur peut ouvrir un litige.", 409);
+          if (order.autoReleaseAt == null || now() >= order.autoReleaseAt) throw new AppError("INVALID_STATE", "La fenêtre de réclamation est terminée.", 409);
+        } else if (order.status !== "paid" && order.status !== "in_delivery") throw new AppError("INVALID_STATE", "Un litige ne peut être ouvert que sur une commande payée et pas encore remise.", 409);
         if (text.length < 10) throw new AppError("VALIDATION", "Décris le problème en quelques mots (10 caractères au moins).", 422, { description: "Décris le problème en quelques mots (10 caractères au moins)." });
         if (text.length > 2000) throw new AppError("VALIDATION", "La description est limitée à 2 000 caractères.", 422, { description: "La description est limitée à 2 000 caractères." });
         if (!["not_received", "damaged", "not_as_described", "other"].includes(input.reason)) throw new AppError("VALIDATION", "Choisis le motif du problème.", 422, { reason: "Choisis le motif du problème." });
@@ -1195,7 +1264,7 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
     async expireStalePaidOrders() {
       const fees = await getFees();
       const cutoff = ts(now() - fees.unhandedOrderMs);
-      const ids = (await pool.query(`select id from orders where status in ('paid','in_delivery') and paid_at <= $1 order by paid_at limit 200`, [cutoff])).rows.map((r) => r.id as string);
+      const ids = (await pool.query(`select id from orders where status in ('paid','in_delivery') and not (status = 'in_delivery' and delivery_method = 'courier') and paid_at <= $1 order by paid_at limit 200`, [cutoff])).rows.map((r) => r.id as string);
       let n = 0;
       for (const id of ids) {
         let refund: { providerRef: string; amountMinor: number } | null = null;
@@ -1392,6 +1461,133 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
       return (await prohibited.list()).map(publicRule);
     },
     // ---- fin agent E
+    // ---- agent D : livraison par coursier
+    async quoteShipping(itemId, destAreaId): Promise<ShippingQuote> {
+      if (!isUuid(itemId)) throw notFound("Annonce");
+      const it = (await pool.query(
+        `select i.currency, coalesce(i.area_id, p.area_id) as origin from items i join profiles p on p.id = i.seller_id where i.id = $1 and i.status in ('active','reserved')`, [itemId])).rows[0];
+      if (!it) throw notFound("Annonce");
+      const fees = await getFees();
+      const zone = await zoneFor(pool, it.origin, destAreaId);
+      return { shippingMinor: shippingFee(zone, it.currency, fees), currency: it.currency, zone };
+    },
+
+    async shipOrder(orderId, sellerId, input) {
+      if (!isUuid(orderId)) throw notFound("Commande");
+      const name = input.courierName.trim();
+      const phone = normalizeDrcPhone(input.courierPhone);
+      await withTx(pool, async (c) => {
+        const order = await loadOrder(c, orderId, true);
+        if (order.sellerId !== sellerId) throw notFound("Commande");
+        if (order.deliveryMethod !== "courier") throw new AppError("INVALID_STATE", "Cette commande est en remise en main propre.", 409);
+        if (order.status !== "paid") throw new AppError("INVALID_STATE", "Tu pourras remettre le colis au coursier une fois la commande payée.", 409);
+        if (name.length < 2 || name.length > 80) throw new AppError("VALIDATION", "Indique le nom du coursier.", 422, { courierName: "Indique le nom du coursier." });
+        if (!phone) throw new AppError("VALIDATION", "Numéro du coursier invalide.", 422, { courierPhone: "Numéro du coursier invalide." });
+        const ship = (await c.query(`select id from shipments where order_id = $1 for update`, [orderId])).rows[0];
+        if (!ship) throw new AppError("INVALID_STATE", "Aucune expédition pour cette commande.", 409);
+        await c.query(
+          `update shipments set courier_name = $2, courier_phone = $3, tracking_ref = $4, status = 'handed_to_courier' where id = $1`,
+          [ship.id, name, phone, input.trackingRef?.trim().slice(0, 60) || null]);
+        await c.query(`update orders set status = 'in_delivery', in_delivery_at = $2 where id = $1`, [orderId, ts(now())]);
+        await logShipment(c, ship.id, orderId, "handed_to_courier", sellerId);
+      });
+      return buildView(pool, await loadOrder(pool, orderId), sellerId);
+    },
+
+    async markInTransit(orderId, sellerId) {
+      if (!isUuid(orderId)) throw notFound("Commande");
+      await withTx(pool, async (c) => {
+        const order = await loadOrder(c, orderId, true);
+        if (order.sellerId !== sellerId) throw notFound("Commande");
+        const ship = (await c.query(`select id, status from shipments where order_id = $1 for update`, [orderId])).rows[0];
+        if (order.deliveryMethod !== "courier" || !ship || order.status !== "in_delivery" || ship.status !== "handed_to_courier")
+          throw new AppError("INVALID_STATE", "Le colis doit d'abord être remis au coursier.", 409);
+        await c.query(`update shipments set status = 'in_transit' where id = $1`, [ship.id]);
+        await logShipment(c, ship.id, orderId, "in_transit", sellerId);
+      });
+      return buildView(pool, await loadOrder(pool, orderId), sellerId);
+    },
+
+    async confirmReceived(orderId, buyerId) {
+      if (!isUuid(orderId)) throw notFound("Commande");
+      const fees = await getFees();
+      await withTx(pool, async (c) => {
+        const order = await loadOrder(c, orderId, true);
+        if (order.buyerId !== buyerId) throw notFound("Commande");
+        const ship = (await c.query(`select id from shipments where order_id = $1 for update`, [orderId])).rows[0];
+        if (order.deliveryMethod !== "courier" || !ship) throw new AppError("INVALID_STATE", "Cette commande n'est pas livrée par coursier.", 409);
+        if (order.status !== "in_delivery") throw new AppError("INVALID_STATE", "Le colis n'est pas encore parti : tu pourras confirmer la réception ensuite.", 409);
+        await c.query(`update shipments set status = 'delivered', delivered_confirmed_by = 'buyer' where id = $1`, [ship.id]);
+        await c.query(`update orders set status = 'delivered', delivered_at = $2, auto_release_at = $3 where id = $1`, [orderId, ts(now()), ts(now() + fees.claimWindowMs)]);
+        await logShipment(c, ship.id, orderId, "received", buyerId);
+      });
+      return buildView(pool, await loadOrder(pool, orderId), buyerId);
+    },
+
+    async reportParcelLost(orderId, userId, input) {
+      if (!isUuid(orderId) || !isUuid(userId)) throw notFound("Commande");
+      const text = (input?.description ?? "").trim() || LOST_DEFAULT_TEXT;
+      const id = await withTx(pool, async (c) => {
+        const order = await loadOrder(c, orderId, true);
+        if (order.buyerId !== userId && order.sellerId !== userId) throw notFound("Commande");
+        const ship = (await c.query(`select id from shipments where order_id = $1 for update`, [orderId])).rows[0];
+        if (order.deliveryMethod !== "courier" || !ship) throw new AppError("INVALID_STATE", "Cette commande n'est pas livrée par coursier.", 409);
+        if (order.status !== "in_delivery") throw new AppError("INVALID_STATE", "Le colis ne peut être signalé perdu qu'une fois remis au coursier et tant qu'il n'est pas reçu.", 409);
+        if (text.length < 10) throw new AppError("VALIDATION", "Décris le problème en quelques mots (10 caractères au moins).", 422, { description: "Décris le problème en quelques mots (10 caractères au moins)." });
+        if (text.length > 2000) throw new AppError("VALIDATION", "La description est limitée à 2 000 caractères.", 422, { description: "La description est limitée à 2 000 caractères." });
+        await c.query(`update orders set status = 'disputed' where id = $1`, [orderId]);
+        const d = (await c.query(
+          `insert into disputes (order_id, opened_by, reason, description, status, opened_at, updated_at) values ($1,$2,'not_received',$3,'open',$4,$4) returning id`,
+          [orderId, userId, text, ts(now())])).rows[0];
+        await c.query(`update shipments set status = 'lost_suspected' where id = $1`, [ship.id]);
+        await logShipment(c, ship.id, orderId, "lost_reported", userId);
+        return d.id as string;
+      });
+      return disputeViewOf(pool, id, userId);
+    },
+
+    async releaseDeliveredOrders(o) {
+      const at = o?.at ?? now();
+      const ids = (await pool.query(
+        `select id from orders where status = 'delivered' and delivery_method = 'courier' and auto_release_at <= $1 order by auto_release_at limit 200`, [ts(at)])).rows.map((r) => r.id as string);
+      let n = 0;
+      for (const id of ids) {
+        const done = await withTx(pool, async (c) => {
+          // Verrou de ligne puis revérification : deux exécutions simultanées, un litige ou une acceptation entre-temps ne libèrent jamais deux fois.
+          const order = await loadOrder(c, id, true);
+          if (order.status !== "delivered" || order.autoReleaseAt == null || order.autoReleaseAt > at) return false;
+          await c.query(`update orders set status = 'completed', completed_at = $2 where id = $1`, [id, ts(now())]);
+          await post(c, releaseEntries(ctx("order", id, order.currency), { sellerId: order.sellerId, itemsMinor: order.itemsMinor, shippingMinor: order.shippingMinor, feeMinor: order.protectionFeeMinor }));
+          const ship = (await c.query(`select id from shipments where order_id = $1`, [id])).rows[0];
+          if (ship) await logShipment(c, ship.id, id, "auto_released", null);
+          return true;
+        });
+        if (done) n++;
+      }
+      return n;
+    },
+
+    async refundStaleCourierOrders(o) {
+      const fees = await getFees();
+      const at = o?.at ?? now();
+      const ids = (await pool.query(
+        `select id from orders where status = 'in_delivery' and delivery_method = 'courier' and in_delivery_at <= $1 order by in_delivery_at limit 200`, [ts(at - fees.courierStaleMs)])).rows.map((r) => r.id as string);
+      let n = 0;
+      for (const id of ids) {
+        let refund: { providerRef: string; amountMinor: number } | null = null;
+        const done = await withTx(pool, async (c) => {
+          const order = await loadOrder(c, id, true);
+          if (order.status !== "in_delivery") return false; // reçu, signalé perdu ou annulé entre-temps
+          refund = await refundEscrowTx(c, order);
+          await c.query(`update orders set status = 'cancelled', cancelled_at = $2 where id = $1`, [id, ts(now())]);
+          const ship = (await c.query(`update shipments set status = 'lost_suspected' where order_id = $1 returning id`, [id])).rows[0];
+          if (ship) await logShipment(c, ship.id, id, "auto_refunded", null);
+          return true;
+        });
+        if (done) { n++; if (refund) await refundAtProvider(refund); }
+      }
+      return n;
+    },
   };
 
   async function refundAtProvider(r: { providerRef: string; amountMinor: number }) {

@@ -44,6 +44,13 @@ export const orderCreate = z.object({
   deliveryAreaId: uuid.nullish(),
   deliveryLandmark: line(200).nullish(),
 });
+export const shipOrder = z.object({
+  courierName: line(80).pipe(z.string().trim().min(2, "Indique le nom du coursier.")),
+  courierPhone: phone,
+  trackingRef: line(60).nullish(),
+});
+export const reportLost = z.object({ description: multiline(1000).optional() });
+export const shippingQuote = z.object({ itemId: uuid, areaId: uuid });
 export const conversationCreate = z.object({ itemId: uuid });
 // ---- agent B : photos de preuve et de messagerie
 /** Photo envoyée en data URL ; le type réel et la taille sont revérifiés par la couche de données (src/lib/photos.ts). */

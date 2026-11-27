@@ -29,6 +29,7 @@ import type {
   Wallet,
   Currency,
   DeliveryMethod,
+  ShippingQuote,
 } from "../types";
 import type { PublicProhibitedRule } from "../prohibited";
 import type { ListingInput } from "../validation";
@@ -166,4 +167,20 @@ export interface DataLayer {
   /** Règles d'articles interdits en vigueur, SANS les mots-clés (page publique et administration). */
   listProhibitedRules(): Promise<PublicProhibitedRule[]>;
   // ---- fin agent E
+
+  // ---- agent D : livraison par coursier
+  /** Frais de livraison par coursier d'un article vers une commune (grille de frais, voir fees.ts). Sans effet de bord. */
+  quoteShipping(itemId: string, destAreaId: string): Promise<ShippingQuote>;
+  /** Vendeur : renseigne le coursier et marque le colis « remis au coursier » (commande payée -> en cours de livraison). */
+  shipOrder(orderId: string, sellerId: string, input: { courierName: string; courierPhone: string; trackingRef?: string | null }): Promise<OrderView>;
+  /** Vendeur (pour le compte du coursier) : le colis est « en route ». */
+  markInTransit(orderId: string, sellerId: string): Promise<OrderView>;
+  /** Acheteur : « j'ai reçu le colis ». Commande livrée ; la fenêtre de réclamation démarre. */
+  confirmReceived(orderId: string, buyerId: string): Promise<OrderView>;
+  /** Acheteur ou vendeur : « colis perdu ». Ouvre un litige (motif : non reçu) et gèle l'argent. */
+  reportParcelLost(orderId: string, userId: string, input?: { description?: string }): Promise<DisputeView>;
+  /** Tâche planifiée : libère au vendeur les commandes livrées dont la fenêtre de réclamation est close et sans litige. `at` : horloge simulée (tests, jamais en production). */
+  releaseDeliveredOrders(opts?: { at?: number }): Promise<number>;
+  /** Tâche planifiée : rembourse les colis restés « remis au coursier » trop longtemps sans livraison. */
+  refundStaleCourierOrders(opts?: { at?: number }): Promise<number>;
 }

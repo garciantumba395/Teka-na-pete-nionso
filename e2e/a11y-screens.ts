@@ -1,5 +1,5 @@
 import { writeFileSync } from "node:fs";
-import { PHOTO, apiBuyAndPay, apiCode, apiListing, apiOrder, expect, noHorizontalScroll, open, scan, staffPhone, test, uniquePhone, type A11yIssue } from "./support";
+import { ID, PHOTO, apiBuyAndPay, apiCode, apiListing, apiOrder, apiPay, expect, noHorizontalScroll, open, scan, staffPhone, test, uniquePhone, waitForStatus, type A11yIssue } from "./support";
 
 /** Écrans à analyser : un parcours complet crée les données nécessaires. */
 export function defineA11y(label: string) {
@@ -146,6 +146,65 @@ export function defineA11y(label: string) {
       await open(page, "/");
       const names = await page.locator(".skeleton").evaluateAll((els) => els.map((e) => getComputedStyle(e).animationName));
       expect(names.every((n) => n === "none")).toBe(true);
+    });
+
+    // ---- agent D : écrans de la livraison par coursier (choix à l'achat, expédition, suivi, réception, litige après livraison)
+    test(`X-5 analyse axe des écrans de livraison par coursier (${label})`, async ({ makeActor }) => {
+      test.setTimeout(180_000);
+      const seller = await makeActor("Vendeur coursier access");
+      const buyer = await makeActor("Acheteur coursier access");
+      const found: { screen: string; issues: A11yIssue[] }[] = [];
+      const check = async (screen: string, p: typeof buyer.page, url: string, prep?: () => Promise<void>) => {
+        await open(p, url);
+        if (prep) await prep();
+        found.push({ screen, issues: await scan(p) });
+      };
+      const order = async (itemId: string) => {
+        const r = await buyer.request.post("/api/v1/orders", { data: { itemIds: [itemId], deliveryMethod: "courier", deliveryAreaId: ID.areaLimete, deliveryLandmark: "Avenue de la Paix, portail bleu" } });
+        expect(r.status()).toBe(201);
+        return (await r.json()).order.id as string;
+      };
+      const pay = async (id: string) => { expect((await apiPay(buyer.request, id, "0821111111")).status()).toBe(202); await waitForStatus(buyer.request, id, "paid"); };
+      const act = async (a: typeof seller, id: string, path: string, data: unknown = {}) => expect((await a.request.post(`/api/v1/orders/${id}/${path}`, { data })).status()).toBe(200);
+
+      const item1 = await apiListing(seller.request);
+      await check("S04 fiche article : choix de livraison par coursier", buyer.page, `/items/${item1.id}`, async () => {
+        await buyer.page.getByRole("radio", { name: /Livraison par coursier/ }).check();
+        await buyer.page.getByLabel("Ta commune").selectOption(ID.areaLimete);
+        await buyer.page.getByLabel("Repère pour le coursier").fill("Avenue de la Paix");
+        await buyer.page.getByRole("status").filter({ hasText: "Livraison :" }).waitFor();
+      });
+      await check("S04 fiche article : coursier sans commune (erreur)", buyer.page, `/items/${item1.id}`, async () => {
+        await buyer.page.getByRole("radio", { name: /Livraison par coursier/ }).check();
+        await buyer.page.getByRole("button", { name: /^Acheter/ }).click();
+        await buyer.page.locator("#buy-err").waitFor();
+      });
+      const id1 = await order(item1.id);
+      await check("S08 paiement (livraison par coursier)", buyer.page, `/orders/${id1}/pay`);
+      await pay(id1);
+      await check("S09 commande payée (acheteur, coursier)", buyer.page, `/orders/${id1}`);
+      await check("S09 commande payée (vendeur) : formulaire Expédier", seller.page, `/orders/${id1}`);
+      await check("S09 formulaire Expédier avec erreurs", seller.page, `/orders/${id1}`, async () => {
+        await seller.page.getByRole("button", { name: "Marquer comme remis au coursier" }).click();
+        await seller.page.locator(".error[role=alert]").first().waitFor();
+      });
+      await act(seller, id1, "ship", { courierName: "Papy Moto", courierPhone: "0899000111", trackingRef: "MOTO-42" });
+      await check("S09 colis remis au coursier (vendeur)", seller.page, `/orders/${id1}`);
+      await check("S09 colis remis au coursier (acheteur) : coursier et historique", buyer.page, `/orders/${id1}`);
+      await check("S09 colis non reçu : confirmation", buyer.page, `/orders/${id1}`, async () => {
+        await buyer.page.getByRole("button", { name: "Colis non reçu" }).click();
+        await buyer.page.getByRole("alertdialog").waitFor();
+      });
+      await act(seller, id1, "in-transit");
+      await act(buyer, id1, "received");
+      await check("S09 colis reçu (acheteur) : accepter ou signaler", buyer.page, `/orders/${id1}`);
+      await check("S09 colis reçu (vendeur) : attente de libération", seller.page, `/orders/${id1}`);
+      await check("S11 litige après livraison : formulaire", buyer.page, `/orders/${id1}/dispute`);
+
+      const flat = found.flatMap((f) => f.issues.map((i) => ({ screen: f.screen, ...i })));
+      const blocking = flat.filter((i) => i.impact === "serious" || i.impact === "critical");
+      console.log(`[a11y courier ${label}] ${found.length} écrans, ${flat.length} violations (${blocking.length} graves ou critiques)`);
+      for (const b of blocking) expect.soft(b, `${b.screen} : ${b.id} (${b.impact}) ${b.help}`).toBeUndefined();
     });
   });
 }

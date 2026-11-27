@@ -13,6 +13,7 @@ export function feesFromSettings(rows: { key: string; value: unknown }[]): FeeCo
   const m = new Map(rows.map((r) => [r.key, r.value] as const));
   const bp = (m.get("buyer_protection") ?? {}) as Record<string, unknown>;
   const pf = (m.get("payout_fee") ?? {}) as Record<string, unknown>;
+  const sg = (m.get("shipping_grid") ?? {}) as Record<string, unknown>;
   const num = (k: string, d: number) => (isNum(m.get(k)) ? (m.get(k) as number) : d);
   return {
     buyerProtection: {
@@ -25,9 +26,15 @@ export function feesFromSettings(rows: { key: string; value: unknown }[]): FeeCo
     handoverMaxAttempts: num("handover_max_attempts", FEES.handoverMaxAttempts),
     handoverLockMs: num("handover_lock_minutes", FEES.handoverLockMs / 60_000) * 60_000,
     maxPhotos: num("max_photos", FEES.maxPhotos),
-    claimWindowMs: FEES.claimWindowMs,
+    claimWindowMs: num("claim_window_hours", FEES.claimWindowMs / 3_600_000) * 3_600_000,
     unhandedOrderMs: num("unhanded_order_days", FEES.unhandedOrderMs / 86_400_000) * 86_400_000,
     cancelRequestTtlMs: num("cancel_request_days", FEES.cancelRequestTtlMs / 86_400_000) * 86_400_000,
+    shippingGrid: {
+      sameCommune: money(sg.sameCommune, FEES.shippingGrid.sameCommune),
+      sameCity: money(sg.sameCity, FEES.shippingGrid.sameCity),
+      otherCity: money(sg.otherCity, FEES.shippingGrid.otherCity),
+    },
+    courierStaleMs: num("courier_stale_days", FEES.courierStaleMs / 86_400_000) * 86_400_000,
   };
 }
 
