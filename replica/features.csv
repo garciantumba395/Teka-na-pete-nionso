@@ -6,7 +6,7 @@ Plafond de valeur par article,vente,should,yes,yes,[SRC] 1000 USD chez Vinted; �
 Interdiction des enchères (prix fixe uniquement),vente,should,yes,yes,"[SRC] catalog-rules | M0 : prix fixe uniquement, pas d'enchères"
 Lots (bundles) avec prix total affiché,vente,should,yes,partial,[SRC] catalog-rules | Serveur seulement (commande multi-articles du même vendeur). Pas d'interface de sélection
 Annonce masquée avec 24 h pour corriger,modération,should,yes,partial,[SRC] catalog-rules | M1 : masquage par la modération ; pas de délai de 24 h pour corriger ni de notification
-Catalogue de catégories autorisées / interdites,catalogue,must,yes,partial,[SRC] catalog-rules; adapter la liste au marché local | M0 : arbre de catégories vendables. Règles des articles interdits et modération : non construites
+Catalogue de catégories autorisées / interdites,catalogue,must,yes,yes,"[SRC] catalog-rules; adapter la liste au marché local | Catalogue de règles d'articles interdits (12 règles par défaut, refus 422 à la publication, page publique, administration). À FAIRE VALIDER par un juriste local ; la détection par mots ne remplace pas le signalement"
 Recherche et filtres (catégorie/taille/marque/prix/état),découverte,must,yes,yes,"[IMG] captures 5 à 7 : tri, catégorie, lieu, prix, taille, marque, état, matière, couleur, retrait en personne | M1 : mot-clé, catégorie, prix max, rayon, marque, taille, état. Pas de tri, matière, couleur"
 Fil d'accueil / catalogue de résultats,découverte,must,yes,yes,"[IMG] captures 1 à 5 : grille à 2 colonnes, prix, cœur et compteur, carrousels | M0 : S01 et S03"
 Détail d'annonce (galerie / vendeur / frais),découverte,must,yes,yes,"[IMG] capture 5 : galerie à points, cœur, bandeau « Vendu », vendeur avec étoiles | M0 : galerie, vendeur, prix avec protection, états Vendu et Réservé"
@@ -21,17 +21,17 @@ Achat via bouton « Acheter » (paiement protégé),paiement,must,yes,yes,"[SRC]
 Frais de protection ajoutés à l'acheteur,paiement,must,yes,yes,"[SRC] montant non lu. [IMG] captures 4 et 5 : prix « incl. » avec bouclier dès la liste | M0 : 5 % avec minimum, valeurs PLACEHOLDER"
 0 frais vendeur,paiement,must,yes,yes,[SRC] how_it_works | M0
 Fonds séquestrés jusqu'à confirmation,paiement,must,yes,yes,"[SRC] safety | M0 : séquestre dans le grand livre en partie double ; le PSP est factice | [BACKEND] Grand livre vérifié sur PostgreSQL (somme nulle, séquestre soldé). Fournisseur de paiement factice"
-Libération du paiement après 2 jours sans signalement,paiement,must,yes,partial,[SRC] refund policy | Libération par le code de remise construite. Libération automatique après 48 h : non construite | Libération par le code de remise (immédiate). Filet : commande payée jamais remise au bout de 7 jours (PLACEHOLDER) = remboursement automatique de l'acheteur
+Libération du paiement après 2 jours sans signalement,paiement,must,yes,yes,"[SRC] refund policy | Libération par le code de remise construite. Libération automatique après 48 h : non construite | Libération par le code de remise (immédiate). Filet : commande payée jamais remise au bout de 7 jours (PLACEHOLDER) = remboursement automatique de l'acheteur | Main propre : libération immédiate par le code. Coursier : libération automatique 48 h après « reçu » sans litige (tâche release_delivered_orders). Filet : remboursement automatique si jamais remis (7 jours) ou colis perdu (10 jours), PLACEHOLDERS"
 Solde vendeur et retrait des gains,paiement,must,yes,yes,"[INF] aucune source lue | M0 : solde, retrait, échec recrédité. Fournisseur factice | [BACKEND] Persistant et testé en concurrence (pas de double dépense). Fournisseur factice"
 Étiquette d'expédition prépayée,livraison,must,yes,no,[SRC] how_it_works; à remplacer par logistique locale
 Dépôt en point relais ou collecte à domicile,livraison,should,yes,no,[SRC] how_it_works
-Suivi de colis en temps réel,livraison,must,yes,no,[SRC] how_it_works
+Suivi de colis en temps réel,livraison,must,yes,partial,[SRC] how_it_works | Frise et historique horodaté renseignés à la main par le vendeur (coursier indépendant) ; pas de suivi en temps réel ni d'intégration à un transporteur
 Bouton « J'ai un problème » et litige guidé,litiges,must,yes,yes,"[SRC] refund policy | M1 : motif guidé puis description, sur commande payée et pas encore remise, par l'acheteur ou le vendeur"
 Motifs : non reçu / endommagé / non conforme,litiges,must,yes,yes,"[SRC] refund policy | M1 : 4 motifs (remise non faite, abîmé, non conforme, autre)"
-Photos obligatoires pour dommage,litiges,should,yes,no,[SRC] refund policy
-Fenêtre de signalement de 2 jours calendaires,litiges,must,yes,partial,[SRC] refund policy | M1 : le litige se tranche AVANT la remise (le code vaut acceptation et libère l'argent) ; pas de fenêtre de 2 jours après remise
+Photos obligatoires pour dommage,litiges,should,yes,partial,"[SRC] refund policy | Photos de preuve privées (6 par membre et par litige), facultatives : pas obligatoires pour le motif « abîmé »"
+Fenêtre de signalement de 2 jours calendaires,litiges,must,yes,yes,[SRC] refund policy | Main propre : litige avant la remise. Coursier : litige tant que la fenêtre de 48 h après « reçu » est ouverte
 Retour sous 5 jours ouvrés (retour payé par l'acheteur),litiges,should,yes,no,[SRC] refund policy
-Colis perdu : enquête après 25 jours ouvrés,litiges,should,yes,no,[SRC] refund policy; adapter aux délais locaux
+Colis perdu : enquête après 25 jours ouvrés,litiges,should,yes,partial,[SRC] refund policy; adapter aux délais locaux | « Colis non reçu » ouvre un litige ; remboursement automatique après 10 jours (PLACEHOLDER) sans livraison. Pas d'enquête transporteur
 Remboursement complet (prix+frais+livraison+taxes),litiges,must,yes,yes,"[SRC] refund policy | Remboursement intégral à l'annulation avant remise, y compris paiement tardif. Pas via litige | Annulation avant remise, litige tranché en faveur de l'acheteur, paiement tardif : toujours intégral"
 Arbitrage par le support si désaccord,litiges,must,yes,yes,"[SRC] refund policy | M1 : rôle support/admin, écran /staff, décision rembourser ou payer, échanges des deux parties. Pas de décision partielle ni de délai de réponse automatique"
 Avis après commande terminée uniquement,confiance,must,yes,yes,"[SRC] safety | M1 : note de 1 à 5 et commentaire, un par membre et par commande terminée, affichés sur le profil"
@@ -41,8 +41,8 @@ Scoring de risque prédictif (fraude),modération,could,yes,skip,[SRC] safety; b
 Compte Pro avec vérification société,pro,could,yes,no,[SRC] vinted.fr/pro
 Retour 14 jours obligatoire pour vendeurs Pro,pro,could,yes,no,[SRC] pro; dépend du droit local
 Mise en avant payante d'annonce (bump),monétisation,should,yes,no,[SRC] catalog-rules (existence); prix et mécanique non lus
-Notifications (push / email),engagement,should,yes,no,[INF]
-Application mobile iOS et Android,plateforme,must,yes,partial,[SRC] /app | Web mobile responsive seulement : ni PWA installable ni application native
+Notifications (push / email),engagement,should,yes,partial,"[INF] | Notifications internes + pastille, SMS pour 3 événements critiques (console factice, aucun fournisseur choisi), préférences, plafond de 5 SMS par jour et par numéro. Pas de push ni d'e-mail"
+Application mobile iOS et Android,plateforme,must,yes,partial,[SRC] /app | Application web installable (PWA) ; aucune application native ni publication sur les boutiques
 Rapports de transparence DSA,conformité,could,yes,skip,[SRC] safety; obligation UE sans équivalent direct
 Vinted Go (casiers automatiques),logistique,could,yes,skip,[SRC] newsroom; matériel et partenariats hors périmètre
 Régie publicitaire B2B,monétisation,could,yes,skip,[SRC] /advertising; hors périmètre initial
@@ -50,9 +50,9 @@ Réseau de membres et catalogue existant,communauté,could,yes,skip,l'audience n
 Paiement mobile money (M-Pesa / MTN MoMo / Orange Money / Airtel / Wave),paiement,must,no,partial,"[AFR] fonction d'adaptation; exclue du score de parité | M0 : 4 opérateurs en bac à sable (fournisseur factice). Aucun PSP réel | [BACKEND] Webhooks idempotents, rattrapage d'un webhook perdu, paiement tardif remboursé : testés sur PostgreSQL. Aucun PSP réel"
 Paiement à la livraison (option),paiement,should,no,no,[AFR]
 Remise en main propre avec code de confirmation,livraison,must,no,yes,"[AFR] | M0 : code à 6 chiffres dérivé (HMAC), 5 essais puis verrouillage"
-Livreurs et coursiers locaux (motos) intégrés,livraison,must,no,no,[AFR]
+Livreurs et coursiers locaux (motos) intégrés,livraison,must,no,partial,"[AFR] | Coursier indépendant : le vendeur saisit nom, téléphone et référence ; frais par grille PLACEHOLDER (commune / ville). Aucun coursier partenaire intégré, personne ne verse les frais au coursier (shipping_payable s'accumule)"
 Localisation par repère / partage de position,livraison,should,no,partial,"[AFR] adressage informel | Commune + position approximative de l'annonce. Champ « repère » de la commande : API prête, pas d'interface"
-Mode léger : PWA et images compressées,plateforme,must,no,partial,"[AFR] connexion mobile inégale | Images compressées, police système, 0 Ko de police. Manifeste PWA et service worker : non construits"
+Mode léger : PWA et images compressées,plateforme,must,no,yes,"[AFR] connexion mobile inégale | Images compressées, police système, 0 Ko de police. Manifeste PWA et service worker : non construits | Application installable (manifeste, icônes originales, page hors-ligne, bandeau d'installation), images compressées côté client, JS initial 463 à 475 Ko brut (138 à 143 Ko gzip). Performance NON mesurée sur un vrai téléphone"
 Multilingue (FR / EN + langues locales),plateforme,must,no,no,[AFR]
 Multi-devises locales et plafonds adaptés,paiement,must,no,partial,"[AFR] | USD et CDF, plafond par devise. Taux de change PLACEHOLDER (2 800)"
 Partage d'annonce et notifications WhatsApp,engagement,should,no,no,[AFR]

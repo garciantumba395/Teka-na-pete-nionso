@@ -227,18 +227,31 @@ Deux exécutions : **couche factice** (`npm run test:e2e`) et **PostgreSQL** (`n
 5. **SMS réels, PSP réel** : impossibles tant qu'aucun fournisseur n'est branché.
 6. **Fuseaux et horloge du téléphone** sur de vrais appareils de la région.
 
+## Cas ajoutés par la tranche 3 (agents A à E)
+
+| cas | type | attendu | auto |
+| --- | --- | --- | --- |
+| F02-C1 à C8 | H/E/N | annulation encadrée : demande, acceptation, refus puis litige, retrait, double-clic, tiers, sans session | e2e |
+| B-H1 à B-N1 | H/E/N | photos privées dans messages et litiges : participants seulement, tiers 404, sans session 401, types et tailles refusés, limites | e2e |
+| N-1 à N-10 (notifications) | H/E/N | centre, pastille sans erreur d'hydratation, SMS, préférences, isolation entre membres | e2e |
+| F10 (coursier) | H/E/N | parcours complet, libération automatique à 48 h (horloge simulée de test), litige pendant la fenêtre, colis perdu, droits | e2e |
+| E-PWA, E-articles interdits | H/E | manifeste et icônes, page hors-ligne, service worker sans cache d'API ; refus à la publication, faux positifs acceptés, contournements refusés | e2e + unitaires |
+| contrat ×2 couches | E | annulation encadrée (12), photos (7), notifications (15), coursier (8), articles interdits (7) | contrat |
+| pg.idempotency | E | course sur la clé d'idempotence : 409, jamais 500 | PostgreSQL |
+
 ## Couverture
 
-Exécution du 2026-11-27 sur la branche `claude/upbeat-noether-vq7x7j` après `/replica-build` (tranches 1 et 2) : 120 tests Playwright (projet mobile 390 px + projet bureau 1440 px).
+Exécution du 2026-11-27 sur la branche `claude/upbeat-noether-vq7x7j` après fusion des cinq agents : 178 tests Playwright (projet mobile 390 px + projet bureau 1440 px).
 
 | Cible | Réussis | Échoués | Ignorés |
 | --- | --- | --- | --- |
-| Couche factice (`npm run test:e2e`) | 117 | 0 | 3 |
-| PostgreSQL (`npm run test:e2e:pg`) | 118 | 0 | 2 |
-| Unitaires + contrat des deux couches (`npm run test:pg`) | 172 | 0 | 0 |
+| Couche factice (`npm run test:e2e`) | 175 | 0 | 3 |
+| PostgreSQL (`npm run test:e2e:pg`) | 176 | 0 | 2 |
+| Unitaires + contrat des deux couches (`npm run test:pg`) | 315 | 0 | 0 |
 
-- **Ignorés** : par construction (contrôle fait une seule fois, sur mobile ; vérifications de base de données seulement sur PostgreSQL), pas des échecs masqués.
-- **Défauts** : voir `bugs.md` (10 trouvés par la phase de test précédente, tous corrigés). La tranche de construction n'a pas ouvert de défaut de gravité S1 ou S2 ; deux écarts propres à PostgreSQL (ordre des messages, arrondi de la note moyenne) ont été trouvés par les tests de contrat et corrigés avant livraison.
-- **Non construits** : F04 (lots, pas d'interface), F07 (compte Pro), retours et livraison par coursier, favoris, notifications. Seul `/pro` est testé comme écran en attente.
-- **Manuels** : les 6 points de la liste ci-dessus, non exécutés ; en plus, **l'espace d'assistance n'a pas été testé sur un vrai téléphone**.
-- **Pas couvert** : photos en preuve de litige, décision partielle, paiement réel, performance sur appareil, abus de l'annulation unilatérale (voir `build-log.md`).
+- **Ignorés** : par construction (contrôle fait une seule fois sur mobile ; vérifications de base seulement sur PostgreSQL), pas des échecs masqués.
+- **Instabilité connue** : sous forte charge, quelques tests e2e ont échoué par intermittence chez les agents (F02-E2, F02-E8, F02-E13, SEC-2). Une cause réelle a été trouvée et corrigée (BUG-011) ; les autres, dont SEC-2 (délai porté à 120 s), n'ont pas de cause application établie. Trois passages complets consécutifs sans échec sur chaque couche après les corrections.
+- **Défauts** : voir `bugs.md` (11 trouvés, tous corrigés, aucun S1).
+- **Non construits** : lots (pas d'interface), compte Pro, retours, favoris, étiquette prépayée, point relais, multilingue.
+- **Manuels, non exécutés** : les 6 points ci-dessus, plus service worker et bandeau d'installation sur un vrai téléphone, SMS réels, coursier réel.
+- **Pas couvert** : photos de preuve obligatoires, décision de litige partielle, paiement du coursier, performance sur appareil.

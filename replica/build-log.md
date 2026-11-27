@@ -108,3 +108,34 @@ Voir `replica/features.csv`. Parité : **39,9 / 100**, **10 des 24 must-haves fa
 - **Comptes d'assistance de démonstration** : 4 numéros (`089 999 9991` à `…994`, code `123456`), créés seulement par le seed de démonstration, interdit en production. En production, l'attribution d'un rôle se fait en base (`update profiles set role = 'support' where id = …`) : aucun écran ni route ne le permet.
 - **Migration 0004** : colonne `seq` sur les messages et les échanges de litige. Deux écritures dans la même milliseconde avaient un ordre d'affichage aléatoire (UUID).
 - Tests : 24 scénarios de contrat de plus (sur les deux couches), 31 tests e2e, 4 écrans de plus dans l'audit d'accessibilité.
+
+## Mise à jour : `/replica-build`, tranche 3 — cinq agents en parallèle (2026-11-27)
+
+Cinq agents ont travaillé dans des copies de travail isolées (une branche, des ports de test et une migration chacun), puis leurs branches ont été fusionnées. Aucun n'a poussé : le chef de projet a fusionné, résolu les conflits et relancé TOUTE la suite sur le résultat.
+
+| Agent | Livré | Migration |
+| --- | --- | --- |
+| A | **Annulation encadrée** : après paiement, l'acheteur ne peut plus annuler seul ; il demande, le vendeur accepte ou refuse (3 jours, PLACEHOLDER), litige en cas de refus. Le vendeur annule toujours seul. Ferme le vecteur « article reçu, code non donné, annulation » | 0005 `order_cancel_requests` |
+| B | **Photos privées** dans les messages (une par message) et en preuve de litige (6 par membre) : table dédiée, route `/api/v1/private-photos/[id]` réservée aux participants (tiers 404, sans session 401, `Cache-Control: private`), type vérifié sur les octets, agrandissement au clavier | 0006 `private_photos` |
+| C | **Notifications** : centre `/notifications`, pastille calculée côté serveur, 10 événements, SMS pour 3 événements critiques (console factice), préférences `/me/notifications`, plafond de 5 SMS par jour et par numéro, purge à 90 jours. Idempotence par clé d'événement, messages regroupés | 0007 `notifications`, `notification_preferences` |
+| D | **Livraison par coursier local** : frais par grille PLACEHOLDER, le vendeur saisit le coursier, frise de 5 étapes, historique horodaté, « j'ai reçu », **libération automatique 48 h après réception** sans litige, litige possible pendant la fenêtre, « colis non reçu », remboursement automatique après 10 jours (PLACEHOLDER) | 0008 `shipment_events` |
+| E | **Application installable** (manifeste, icônes originales, page hors-ligne, service worker prudent : jamais d'API ni de page privée en cache) et **catalogue des articles interdits** (12 règles, refus 422 à la publication sans fuite des mots-clés, page publique, administration `/staff/rules`) | 0009 `prohibited_rules` |
+
+**Fusion** : 5 branches, une quarantaine de zones de conflit, toutes dans des fichiers partagés où chaque agent ajoutait à la fin (`types.ts`, `fake.ts`, `pg/data.ts`, `contract.ts`, `globals.css`, `jobs.ts`, `a11y-screens.ts`). Une seule vraie fusion de logique : les « actions » d'une commande, où la règle d'annulation encadrée (A) et la livraison par coursier (D) se croisent. Règle retenue : pour un colis par coursier, l'acheteur peut demander l'annulation tant que le colis n'est pas remis ; une fois remis, il ne peut plus annuler (colis non reçu ou litige).
+
+**Défauts trouvés par la suite fusionnée, corrigés**
+- **Course sur la clé d'idempotence** : deux commandes de membres différents qui prenaient la même clé en même temps donnaient une erreur interne (23505, HTTP 500) au lieu d'un 409. Test de non-régression qui échoue sans la correction.
+- **Capacité des données de test** : la limite de 3 codes SMS par numéro et par 10 minutes était dépassée par les tests qui se connectent comme assistance. 20 comptes d'assistance de démonstration au lieu de 4.
+- **Clés de paiement de test** non uniques entre deux processus (mêmes `Date.now()` et compteur) : UUID.
+- `auth.spec.ts` et `SEC-2` : port 3100 en dur et délai de 45 s trop court ; `scripts/e2e-server.sh` tuait tous les serveurs de la machine (rendu inoffensif pour les tests parallèles).
+
+**Nouvelles tâches planifiées à programmer** (`/api/internal/jobs/<nom>`, secret `CRON_SECRET`) : `refund_unhanded_orders`, `release_delivered_orders`, `refund_stale_courier_orders`, `purge_old_notifications`. La tâche `all` les exécute toutes.
+
+**Risques et décisions ouvertes**
+- Personne ne verse la livraison au coursier : `shipping_payable` s'accumule dans le grand livre sans flux de paiement.
+- Un acheteur qui reçoit son colis sans cliquer « J'ai reçu » est remboursé au bout de 10 jours alors que le vendeur a expédié (délai PLACEHOLDER).
+- **Trou entre deux agents** : aucune notification n'est envoyée au vendeur quand l'acheteur demande l'annulation (A et C travaillaient en parallèle ; l'événement n'est câblé nulle part). Il ne la voit qu'en ouvrant la commande. Même chose pour la livraison par coursier : « remis au coursier », « reçu » et « libération automatique » ne notifient personne. À câbler : c'est le prochain petit chantier.
+- La liste des articles interdits et les textes de SMS doivent être validés par un juriste local.
+- Photos stockées en base (bytea), cache `private, max-age=3600` : sur un appareil partagé, une photo peut rester lisible après déconnexion.
+- La pastille ne se met pas à jour en direct (à la navigation seulement).
+- Service worker non testé sur un vrai téléphone ; `beforeinstallprompt` n'existe pas sur Safari (explication iOS à la place).

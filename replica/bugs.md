@@ -15,6 +15,8 @@ Build testé : `a00bebe` (corrections) ; défauts constatés sur le build préc�
 | BUG-009 | S3 | Une requête POST en `text/plain` est acceptée (CSRF par formulaire) | SEC-9 | corrigé `a00bebe` |
 | BUG-010 | S4 | Un brouillon au titre trop long est accepté en couche factice, refusé par PostgreSQL | F01-E3 (PG) | corrigé `a00bebe` |
 
+| BUG-011 | S3 | Deux commandes avec la même clé d'idempotence en même temps : erreur interne au lieu d'un 409 | pg.idempotency (PG) | corrigé `f2db72c` |
+
 **Aucun S1 ouvert. Aucun défaut ouvert.**
 
 ---
@@ -71,10 +73,19 @@ Correction : `readJson` exige `application/json` (415 sinon).
 - Gravité : **S4** · F01-E3 (PostgreSQL). Titre de 81 caractères : 201 en couche factice, 422 sur PostgreSQL (contrainte 3 à 80). Les deux couches doivent répondre pareil.
 Correction : même borne dans le schéma zod à la création.
 
+### BUG-011 : collision de clé d'idempotence de paiement
+- Gravité : **S3** · trouvé par la suite fusionnée sur PostgreSQL (échec intermittent « ECONNRESET » en apparence, erreur 500 en réalité).
+Étapes : deux membres paient deux commandes différentes avec la même clé `idempotencyKey`, en même temps.
+Attendu : un paiement accepté, l'autre refusé en 409 `IDEMPOTENCY_CONFLICT`. Réel : le second recevait `23505` (violation de la contrainte unique) en erreur interne 500. La vérification préalable ne peut pas voir une clé prise par une autre commande dans la même milliseconde (verrous de lignes différents).
+Correction : l'INSERT intercepte `23505` et répond 409. Le test répète la course 25 fois et échoue sans la correction (vérifié).
+Origine côté test : `apiPay` fabriquait ses clés avec `Date.now()` et un compteur par processus : deux workers produisaient la même clé. Corrigé (UUID).
+
 ---
 
 ## À vérifier (non reproduit, pas des défauts)
 
 - **Réservation sans paiement** (`build-log.md`) : un acheteur peut bloquer un article 15 min. La limite de 10 commandes par 10 min est testée (SEC-10) ; le plafond de réservations **simultanées** ne l'est pas.
 - **Lecteur d'écran réel**, **appareil bas de gamme en 3G**, **appareil photo natif**, **photos HEIC**, **SMS et PSP réels** : voir « À faire à la main » dans `test-plan.md`.
+- **Notifications manquantes** entre agents : demande d'annulation, colis remis, colis reçu, libération automatique. Le vendeur ne les voit qu'en ouvrant la commande.
+- **Annulation après remise au coursier** : l'acheteur ne peut plus annuler seul ; à valider avec de vrais coursiers.
 - **Hydratation sous charge** : plus aucune erreur sur 3 exécutions consécutives après BUG-002 ; à surveiller en production avec le journal du navigateur.
