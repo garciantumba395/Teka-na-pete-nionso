@@ -1,0 +1,59 @@
+feature,area,priority,original,clone,notes
+Créer une annonce avec photos (jusqu'à 20),vente,must,yes,no,[SRC] catalog-rules
+Titre / description / catégorie / état / prix fixe,vente,must,yes,no,[SRC+INF] champs exacts à confirmer
+Choix des matières (max 3),vente,could,yes,no,[SRC] catalog-rules
+Plafond de valeur par article,vente,should,yes,no,[SRC] 1000 USD chez Vinted; à adapter par devise locale
+Interdiction des enchères (prix fixe uniquement),vente,should,yes,no,[SRC] catalog-rules
+Lots (bundles) avec prix total affiché,vente,should,yes,no,[SRC] catalog-rules
+Annonce masquée avec 24 h pour corriger,modération,should,yes,no,[SRC] catalog-rules
+Catalogue de catégories autorisées / interdites,catalogue,must,yes,no,[SRC] catalog-rules; adapter la liste au marché local
+Recherche et filtres (catégorie/taille/marque/prix/état),découverte,must,yes,no,[INF]
+Fil d'accueil / catalogue de résultats,découverte,must,yes,no,[INF]
+Détail d'annonce (galerie / vendeur / frais),découverte,must,yes,no,[INF]
+Favoris,découverte,should,yes,no,[INF]
+Inscription et connexion,compte,must,yes,no,[INF]
+Vérification de compte,compte,should,yes,no,[SRC] safety (existence confirmée)
+Profil public avec badge vérifié,compte,should,yes,no,[SRC] safety
+Messagerie acheteur-vendeur,messagerie,must,yes,no,[SRC] safety
+Filtre anti-spam dans les messages,messagerie,should,yes,no,[SRC] safety
+Offres de prix / négociation,messagerie,should,yes,no,[INF] à confirmer
+Achat via bouton « Acheter » (paiement protégé),paiement,must,yes,no,[SRC] how_it_works / refund policy
+Frais de protection ajoutés à l'acheteur,paiement,must,yes,no,[SRC] montant non lu
+0 frais vendeur,paiement,must,yes,no,[SRC] how_it_works
+Fonds séquestrés jusqu'à confirmation,paiement,must,yes,no,[SRC] safety
+Libération du paiement après 2 jours sans signalement,paiement,must,yes,no,[SRC] refund policy
+Solde vendeur et retrait des gains,paiement,must,yes,no,[INF] aucune source lue
+Étiquette d'expédition prépayée,livraison,must,yes,no,[SRC] how_it_works; à remplacer par logistique locale
+Dépôt en point relais ou collecte à domicile,livraison,should,yes,no,[SRC] how_it_works
+Suivi de colis en temps réel,livraison,must,yes,no,[SRC] how_it_works
+Bouton « J'ai un problème » et litige guidé,litiges,must,yes,no,[SRC] refund policy
+Motifs : non reçu / endommagé / non conforme,litiges,must,yes,no,[SRC] refund policy
+Photos obligatoires pour dommage,litiges,should,yes,no,[SRC] refund policy
+Fenêtre de signalement de 2 jours calendaires,litiges,must,yes,no,[SRC] refund policy
+Retour sous 5 jours ouvrés (retour payé par l'acheteur),litiges,should,yes,no,[SRC] refund policy
+Colis perdu : enquête après 25 jours ouvrés,litiges,should,yes,no,[SRC] refund policy; adapter aux délais locaux
+Remboursement complet (prix+frais+livraison+taxes),litiges,must,yes,no,[SRC] refund policy
+Arbitrage par le support si désaccord,litiges,must,yes,no,[SRC] refund policy
+Avis après commande terminée uniquement,confiance,must,yes,no,[SRC] safety
+Signalement d'annonces et de membres,modération,must,yes,no,[SRC] safety
+Suspension (ex. 7 jours) ou blocage permanent,modération,should,yes,no,[SRC] catalog-rules
+Scoring de risque prédictif (fraude),modération,could,yes,skip,[SRC] safety; basé sur les données de l'original; version simple à la place
+Compte Pro avec vérification société,pro,could,yes,no,[SRC] vinted.fr/pro
+Retour 14 jours obligatoire pour vendeurs Pro,pro,could,yes,no,[SRC] pro; dépend du droit local
+Mise en avant payante d'annonce (bump),monétisation,should,yes,no,[SRC] catalog-rules (existence); prix et mécanique non lus
+Notifications (push / email),engagement,should,yes,no,[INF]
+Application mobile iOS et Android,plateforme,must,yes,no,[SRC] /app
+Rapports de transparence DSA,conformité,could,yes,skip,[SRC] safety; obligation UE sans équivalent direct
+Vinted Go (casiers automatiques),logistique,could,yes,skip,[SRC] newsroom; matériel et partenariats hors périmètre
+Régie publicitaire B2B,monétisation,could,yes,skip,[SRC] /advertising; hors périmètre initial
+Réseau de membres et catalogue existant,communauté,could,yes,skip,l'audience n'est pas clonable
+Paiement mobile money (M-Pesa / MTN MoMo / Orange Money / Airtel / Wave),paiement,must,no,no,[AFR] fonction d'adaptation; exclue du score de parité
+Paiement à la livraison (option),paiement,should,no,no,[AFR]
+Remise en main propre avec code de confirmation,livraison,must,no,no,[AFR]
+Livreurs et coursiers locaux (motos) intégrés,livraison,must,no,no,[AFR]
+Localisation par repère / partage de position,livraison,should,no,no,[AFR] adressage informel
+Mode léger : PWA et images compressées,plateforme,must,no,no,[AFR] connexion mobile inégale
+Multilingue (FR / EN + langues locales),plateforme,must,no,no,[AFR]
+Multi-devises locales et plafonds adaptés,paiement,must,no,no,[AFR]
+Partage d'annonce et notifications WhatsApp,engagement,should,no,no,[AFR]
+Vérification par numéro de téléphone (puis pièce d'identité),compte,must,no,no,[AFR]
