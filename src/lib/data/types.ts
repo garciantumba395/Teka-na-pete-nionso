@@ -4,6 +4,16 @@ import type {
   ChatMessage,
   ConversationSummary,
   ConversationView,
+  DisputeOutcome,
+  DisputeReason,
+  DisputeSummary,
+  DisputeView,
+  ReportAction,
+  ReportReason,
+  ReportStatus,
+  ReportTarget,
+  ReportView,
+  Review,
   Item,
   ItemCard,
   ItemDetail,
@@ -94,6 +104,26 @@ export interface DataLayer {
   /** Lit la conversation et marque comme lus les messages de l'interlocuteur. */
   getConversation(conversationId: string, viewerId: string): Promise<ConversationView>;
   sendMessage(conversationId: string, senderId: string, body: string): Promise<ChatMessage>;
+
+  // Litiges : gèlent le séquestre ; seule l'équipe d'assistance (rôle support ou admin) tranche.
+  openDispute(orderId: string, userId: string, input: { reason: DisputeReason; description: string }): Promise<DisputeView>;
+  getOrderDispute(orderId: string, viewerId: string): Promise<DisputeView | null>;
+  getDisputeById(disputeId: string, viewerId: string): Promise<DisputeView>;
+  addDisputeNote(disputeId: string, authorId: string, note: string): Promise<DisputeView>;
+  listOpenDisputes(staffId: string): Promise<DisputeSummary[]>;
+  resolveDispute(staffId: string, disputeId: string, outcome: DisputeOutcome, note?: string): Promise<DisputeView>;
+  /** Commandes payées jamais remises depuis trop longtemps (sans litige) : remboursées automatiquement. Retourne leur nombre. */
+  expireStalePaidOrders(): Promise<number>;
+
+  // Avis : une note par membre et par commande terminée.
+  createReview(orderId: string, authorId: string, input: { rating: number; comment: string }): Promise<Review>;
+  getMyReview(orderId: string, authorId: string): Promise<Review | null>;
+  listReviews(userId: string): Promise<Review[]>;
+
+  // Signalement et modération (rôles moderator, support, admin).
+  createReport(reporterId: string, input: { targetType: ReportTarget; targetId: string; reason: ReportReason; details: string }): Promise<{ id: string; created: boolean }>;
+  listReports(staffId: string, status?: ReportStatus): Promise<ReportView[]>;
+  handleReport(staffId: string, reportId: string, action: ReportAction): Promise<ReportView>;
 
   // Portefeuille
   getWallet(userId: string): Promise<Wallet>;

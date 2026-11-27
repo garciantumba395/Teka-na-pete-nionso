@@ -26,6 +26,7 @@ export function feesFromSettings(rows: { key: string; value: unknown }[]): FeeCo
     handoverLockMs: num("handover_lock_minutes", FEES.handoverLockMs / 60_000) * 60_000,
     maxPhotos: num("max_photos", FEES.maxPhotos),
     claimWindowMs: FEES.claimWindowMs,
+    unhandedOrderMs: num("unhanded_order_days", FEES.unhandedOrderMs / 86_400_000) * 86_400_000,
   };
 }
 

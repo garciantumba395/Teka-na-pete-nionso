@@ -56,4 +56,39 @@ test.describe("R Recherche", () => {
     expect(d.every((x) => x !== null)).toBe(true);
     for (let i = 1; i < d.length; i++) expect(d[i]!, `rang ${i}`).toBeGreaterThanOrEqual(d[i - 1]!);
   });
+
+  test("R-H2 marque, taille et état : filtres combinables, puces retirables, URL partageable", async ({ makeActor }) => {
+    const s = await makeActor("Vendeur filtres");
+    const tok = `Filtro${Date.now().toString(36).replace(/\d/g, "k")}`;
+    const a = await apiListing(s.request, { title: `${tok} robe A`, brand: "Zéphyr", sizeLabel: "M", condition: "new" });
+    const b = await apiListing(s.request, { title: `${tok} robe B`, brand: "Autre", sizeLabel: "L", condition: "good" });
+    const v = await makeActor("Chercheur filtres");
+    const p = v.page;
+    await open(p, `/search?q=${tok}`);
+    await expect(p.getByRole("status")).toContainText("2 résultats");
+    // formulaire : marque (sans accent ni casse) + état
+    await p.getByLabel("Marque").fill("zephyr");
+    await p.getByRole("checkbox", { name: "Neuf sans étiquette" }).check();
+    await p.getByRole("button", { name: "Rechercher" }).click();
+    await expect(p.getByRole("status")).toContainText("1 résultat");
+    await expect(p.getByRole("link", { name: new RegExp(a.title) })).toBeVisible();
+    await expect(p.getByRole("link", { name: /Marque : zephyr/ })).toBeVisible();
+    await expect(p.getByRole("link", { name: /État : Neuf sans étiquette/ })).toBeVisible();
+    // retirer la puce d'état garde la marque
+    await p.getByRole("link", { name: /État : Neuf sans étiquette/ }).click();
+    await expect(p.getByRole("link", { name: /Marque : zephyr/ })).toBeVisible();
+    await expect(p.getByRole("link", { name: /État : /})).toHaveCount(0);
+    // taille exacte
+    await open(p, `/search?q=${tok}&size=l`);
+    await expect(p.getByRole("status")).toContainText("1 résultat");
+    await expect(p.getByRole("link", { name: new RegExp(b.title) })).toBeVisible();
+    await open(p, `/search?q=${tok}&brand=zephyr&size=L`);
+    await expect(p.getByRole("status")).toContainText("0 résultat");
+    // API : plusieurs états, valeur inconnue ignorée, jokers SQL traités comme du texte
+    const ids = async (qs: string) => (await (await v.request.get(`/api/v1/items?q=${tok}&${qs}`)).json()).items.map((x: { id: string }) => x.id).sort();
+    expect(await ids("condition=new,good")).toEqual([a.id, b.id].sort());
+    expect(await ids("condition=inconnu")).toEqual([a.id, b.id].sort());
+    expect(await ids("brand=%25")).toEqual([]);
+    expect(await ids("brand=%00zephyr")).toEqual([a.id]);
+  });
 });

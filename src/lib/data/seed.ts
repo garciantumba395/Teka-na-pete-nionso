@@ -75,13 +75,17 @@ export function seedAreas(): Area[] {
 
 const slug = (s: string) => s.toLowerCase().normalize("NFD").replace(/\p{M}/gu, "").replace(/[^a-z0-9]+/g, "-");
 
-export const SEED_PHONES = { marie: "+243810000001", patrick: "+243820000002", jp: "+243990000003" };
+export const SEED_PHONES = { marie: "+243810000001", patrick: "+243820000002", jp: "+243990000003", support: "+243899999991" };
+/** Comptes de l'équipe d'assistance de DÉMONSTRATION (4 numéros : la limite de codes par numéro empêche de réutiliser un seul compte dans toute une suite de tests). */
+export const STAFF_DEMO_PHONES = ["0899999991", "0899999992", "0899999993", "0899999994"];
 
 export function seedUsers(now: number): User[] {
   const base = { areaId: seedId("area-com-gombe"), verificationLevel: "phone" as const, createdAt: now - 90 * 86400_000 };
   return [
     { ...base, id: seedId("user-marie"), phone: SEED_PHONES.marie, displayName: "Marie K.", bio: "Je vends mes vêtements en bon état. Remise à Gombe ou Limete.", ratingAvg: 4.8, ratingCount: 31, areaId: seedId("area-com-gombe") },
     { ...base, id: seedId("user-patrick"), phone: SEED_PHONES.patrick, displayName: "Patrick M.", bio: "", ratingAvg: null, ratingCount: 0, areaId: seedId("area-com-lemba") },
+    // Compte de l'équipe d'assistance, DÉMONSTRATION seulement (le seed de démonstration est interdit en production).
+    ...STAFF_DEMO_PHONES.map((p, i) => ({ ...base, id: seedId(`user-support-${i + 1}`), phone: `+243${p.slice(1)}`, displayName: `Assistance ${i + 1}`, bio: "", ratingAvg: null, ratingCount: 0, role: "support" as const })),
     { ...base, id: seedId("user-jp"), phone: SEED_PHONES.jp, displayName: "Jean-Paul B.", bio: "Électronique et maison.", ratingAvg: 4.5, ratingCount: 12, areaId: seedId("area-com-ngaliema") },
   ];
 }

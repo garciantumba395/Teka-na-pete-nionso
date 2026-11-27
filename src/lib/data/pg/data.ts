@@ -14,7 +14,7 @@ import { detectOffPlatform, MESSAGE_MAX } from "../../messaging";
 import { normalizeDrcPhone } from "../../phone";
 import { ConsoleSmsProvider, type SmsProvider } from "../../sms/provider";
 import {
-  AppError, type Area, type Category, type ChatMessage, type Condition, type ConversationSummary, type Currency, type Item, type ItemCard, type ItemDetail,
+  AppError, type Area, type Category, type ChatMessage, type Condition, type ConversationSummary, type DisputeNote, type DisputeOutcome, type DisputeSummary, type DisputeView, type ReportAction, type ReportView, type Review, type UserRole, type Currency, type Item, type ItemCard, type ItemDetail,
   type LedgerEntry, type Order, type OrderAction, type OrderView, type Payment, type PaymentMethod,
   type PaymentStatus, type Payout, type PayoutStatus, type ProviderEvent, type PublicProfile, type User, type Wallet,
 } from "../../types";
@@ -68,6 +68,7 @@ function detectMime(b: Buffer): "image/jpeg" | "image/png" | "image/webp" | null
 const userOf = (r: Row): User => ({
   id: r.id, phone: r.phone ?? "", displayName: r.display_name, bio: r.bio ?? "", areaId: r.area_id,
   verificationLevel: r.verification_level, ratingAvg: r.rating_avg ?? null, ratingCount: r.rating_count, createdAt: r.created_at.getTime(),
+  role: (r.role ?? "member") as UserRole, suspendedUntil: r.suspended_until ? r.suspended_until.getTime() : null,
 });
 const profileOf = (r: Row): PublicProfile => ({
   id: r.id, displayName: r.display_name, bio: r.bio ?? "", areaId: r.area_id,
@@ -174,7 +175,12 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
       if (order.status === "delivered") actions.push("accept", "issue");
     } else {
       if (order.status === "pending_payment") actions.push("cancel");
-      if (live) actions.push("confirm_delivery", "cancel");
+      if (live) actions.push("confirm_delivery", "cancel", "issue");
+    }
+    const dspR = await q.query(`select id, status from disputes where order_id = $1 order by opened_at desc limit 1`, [order.id]);
+    if (order.status === "completed") {
+      const mine = await q.query(`select 1 from reviews where order_id = $1 and author_id = $2`, [order.id, viewerId]);
+      if (!mine.rowCount) actions.push("review");
     }
     const cp = cpR.rows[0];
     const locked = ship?.handover_locked_until && ship.handover_locked_until.getTime() > now() ? ship.handover_locked_until.getTime() : null;
@@ -185,6 +191,7 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
       payment: pay ? { id: pay.id, status: pay.status, method: pay.method, failureCode: pay.failure_code } : null,
       handover: role === "seller" && live && ship ? { attemptsLeft: Math.max(0, fees.handoverMaxAttempts - ship.handover_attempts), lockedUntil: locked } : null,
       actions,
+      dispute: dspR.rows[0] ? { id: dspR.rows[0].id, status: dspR.rows[0].status } : null,
     };
   }
 
@@ -203,6 +210,61 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
     sizeLabel: r.size_label, brand: r.brand, priceMinor: r.price_minor, currency: r.currency, status: r.status, areaId: r.area_id,
     lat: r.lat ?? null, lng: r.lng ?? null, photos, publishedAt: r.published_at?.getTime() ?? null, createdAt: r.created_at.getTime(),
   });
+
+  async function roleOf(q: Queryable, userId: string): Promise<UserRole | null> {
+    if (!isUuid(userId)) return null;
+    const r = await q.query(`select role from profiles where id = $1 and deleted_at is null`, [userId]);
+    return (r.rows[0]?.role as UserRole | undefined) ?? null;
+  }
+  async function requireRole(q: Queryable, userId: string, allowed: UserRole[]): Promise<void> {
+    const role = await roleOf(q, userId);
+    if (!role || !allowed.includes(role)) throw notFound("Ressource");
+  }
+
+  async function disputeViewOf(q: Queryable, disputeId: string, viewerId: string): Promise<DisputeView> {
+    if (!isUuid(disputeId) || !isUuid(viewerId)) throw notFound("Litige");
+    const r = await q.query(
+      `select d.*, o.buyer_id, o.seller_id, o.total_minor, o.currency, bp.display_name as buyer_name, sp.display_name as seller_name, op.display_name as opener_name,
+         (select i.title from order_items oi join items i on i.id = oi.item_id where oi.order_id = o.id order by i.id limit 1) as item_title,
+         (select role from profiles where id = $2) as viewer_role
+       from disputes d join orders o on o.id = d.order_id
+       join profiles bp on bp.id = o.buyer_id join profiles sp on sp.id = o.seller_id join profiles op on op.id = d.opened_by
+       where d.id = $1`, [disputeId, viewerId]);
+    const x = r.rows[0];
+    if (!x) throw notFound("Litige");
+    const staff = ["support", "admin"].includes(x.viewer_role);
+    const party = viewerId === x.buyer_id || viewerId === x.seller_id;
+    if (!staff && !party) throw notFound("Litige");
+    const notes = await q.query(
+      `select n.id, n.author_id, n.note, n.created_at, p.display_name, p.role from dispute_evidence n join profiles p on p.id = n.author_id
+       where n.dispute_id = $1 and n.note is not null order by n.seq`, [disputeId]);
+    return {
+      id: x.id, orderId: x.order_id, status: x.status, reason: x.reason, description: x.description,
+      openedByName: x.opener_name, openedByMe: x.opened_by === viewerId, openedAt: x.opened_at.getTime(), resolvedAt: x.resolved_at ? x.resolved_at.getTime() : null,
+      notes: notes.rows.map((n): DisputeNote => {
+        const isStaff = ["support", "admin"].includes(n.role);
+        return { id: n.id, authorName: isStaff ? "Assistance" : n.display_name, mine: n.author_id === viewerId, staff: isStaff, note: n.note, createdAt: n.created_at.getTime() };
+      }),
+      order: { itemTitle: x.item_title ?? "Article", totalMinor: Number(x.total_minor), currency: x.currency, buyerName: x.buyer_name, sellerName: x.seller_name },
+      viewerRole: staff && !party ? "staff" : viewerId === x.buyer_id ? "buyer" : "seller",
+    };
+  }
+
+  async function reportViewOf(q: Queryable, id: string): Promise<ReportView> {
+    const r = (await q.query(
+      `select r.*, rp.display_name as reporter_name,
+         case r.target_type when 'item' then (select title from items where id = r.target_id) else (select display_name from profiles where id = r.target_id) end as label
+       from reports r join profiles rp on rp.id = r.reporter_id where r.id = $1`, [id])).rows[0];
+    if (!r) throw notFound("Signalement");
+    return { id: r.id, targetType: r.target_type, targetId: r.target_id, targetLabel: r.label ?? "Supprimé", reason: r.reason, details: r.details ?? "", reporterName: r.reporter_name, status: r.status, createdAt: r.created_at.getTime() };
+  }
+
+  /** Rembourse l'acheteur depuis le séquestre. Retourne la demande à envoyer au fournisseur, à exécuter APRÈS la transaction. */
+  async function refundEscrowTx(c: Client, order: Order): Promise<{ providerRef: string; amountMinor: number } | null> {
+    await post(c, refundEntries(ctx("order", order.id, order.currency), order.totalMinor));
+    const pay = (await c.query(`update payments set status = 'refunded', refunded_minor = amount_minor where order_id = $1 and status = 'succeeded' returning *`, [order.id])).rows[0];
+    return pay?.provider_ref ? { providerRef: pay.provider_ref, amountMinor: pay.amount_minor } : null;
+  }
 
   const api: PgData = {
     __provider: provider,
@@ -268,7 +330,9 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
 
     async getUser(id) {
       if (!isUuid(id)) return null;
-      const r = await pool.query(`select * from profiles where id = $1 and deleted_at is null`, [id]);
+      const r = await pool.query(
+        `select p.*, (select max(ends_at) from sanctions where user_id = p.id and kind = 'suspension' and ends_at > $2) as suspended_until
+         from profiles p where p.id = $1 and p.deleted_at is null`, [id, ts(now())]);
       return r.rows[0] ? userOf(r.rows[0]) : null;
     },
     async getPublicProfile(id) {
@@ -309,7 +373,8 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
     async getSessionUser(token) {
       if (!token || token.length > 200) return null;
       const r = await pool.query(
-        `select p.* from sessions s join profiles p on p.id = s.user_id where s.token_hash = $1 and s.expires_at > $2 and p.deleted_at is null`,
+        `select p.*, (select max(ends_at) from sanctions where user_id = p.id and kind = 'suspension' and ends_at > $2) as suspended_until
+         from sessions s join profiles p on p.id = s.user_id where s.token_hash = $1 and s.expires_at > $2 and p.deleted_at is null`,
         [sha256(token), ts(now())],
       );
       if (!r.rows[0]) return null;
@@ -443,6 +508,9 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
       for (const tok of norm(q.q ?? "").split(/\s+/).filter(Boolean).slice(0, 8)) {
         where.push(`unaccent(lower(i.title || ' ' || coalesce(i.brand, '') || ' ' || i.description)) like ${p(`%${likeEscape(tok)}%`)} escape '\\'`);
       }
+      if (q.brand) where.push(`unaccent(lower(coalesce(i.brand, ''))) like ${p(`%${likeEscape(norm(q.brand))}%`)} escape '\\'`);
+      if (q.sizeLabel) where.push(`unaccent(lower(coalesce(i.size_label, ''))) = ${p(norm(q.sizeLabel))}`);
+      if (q.conditions?.length) where.push(`i.condition = any(${p(q.conditions)}::text[])`);
       const usd = `(case when i.currency = 'USD' then i.price_minor else round(i.price_minor / ${USD_CDF_PLACEHOLDER}.0) end)`;
       if (q.minPriceUsdMinor != null) where.push(`${usd} >= ${p(q.minPriceUsdMinor)}`);
       if (q.maxPriceUsdMinor != null) where.push(`${usd} <= ${p(q.maxPriceUsdMinor)}`);
@@ -811,7 +879,7 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
         `select c.id, c.item_id, c.last_message_at, c.buyer_id, c.seller_id, i.title,
            (select storage_path from item_photos where item_id = i.id order by position limit 1) as first_photo,
            p.id as p_id, p.display_name, p.bio, p.area_id as p_area, p.verification_level, p.rating_avg, p.rating_count, p.deleted_at,
-           (select body from messages where conversation_id = c.id order by created_at desc, id desc limit 1) as last_body,
+           (select body from messages where conversation_id = c.id order by seq desc limit 1) as last_body,
            (select count(*)::int from messages where conversation_id = c.id and read_at is null and sender_id is distinct from $1) as unread
          from conversations c join items i on i.id = c.item_id
          join profiles p on p.id = case when c.buyer_id = $1 then c.seller_id else c.buyer_id end
@@ -834,7 +902,7 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
       await pool.query(`update messages set read_at = $3 where conversation_id = $1 and read_at is null and sender_id is distinct from $2`, [conversationId, viewerId, ts(now())]);
       const summary = (await api.listConversations(viewerId)).find((s) => s.id === conversationId);
       if (!summary) throw notFound("Conversation");
-      const msgs = await pool.query(`select id, sender_id, kind, body, flagged, created_at from messages where conversation_id = $1 order by created_at, id`, [conversationId]);
+      const msgs = await pool.query(`select id, sender_id, kind, body, flagged, created_at from messages where conversation_id = $1 order by seq`, [conversationId]);
       return {
         ...summary,
         messages: msgs.rows.map((m): ChatMessage => ({ id: m.id, mine: m.sender_id === viewerId, kind: m.kind === "system" ? "system" : "text", body: m.body, flagged: m.flagged, createdAt: m.created_at.getTime() })),
@@ -862,6 +930,197 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
         return m;
       });
       return { id: row.id as string, mine: true, kind: "text" as const, body: text, flagged: flagged !== null, createdAt: at.getTime() };
+    },
+
+    async openDispute(orderId, userId, input) {
+      if (!isUuid(orderId) || !isUuid(userId)) throw notFound("Commande");
+      const text = input.description.trim();
+      const id = await withTx(pool, async (c) => {
+        const order = await loadOrder(c, orderId, true);
+        if (order.buyerId !== userId && order.sellerId !== userId) throw notFound("Commande");
+        if (order.status === "disputed") throw new AppError("DISPUTE_EXISTS", "Un litige est déjà ouvert sur cette commande.", 409);
+        if (order.status !== "paid" && order.status !== "in_delivery") throw new AppError("INVALID_STATE", "Un litige ne peut être ouvert que sur une commande payée et pas encore remise.", 409);
+        if (text.length < 10) throw new AppError("VALIDATION", "Décris le problème en quelques mots (10 caractères au moins).", 422, { description: "Décris le problème en quelques mots (10 caractères au moins)." });
+        if (text.length > 2000) throw new AppError("VALIDATION", "La description est limitée à 2 000 caractères.", 422, { description: "La description est limitée à 2 000 caractères." });
+        if (!["not_received", "damaged", "not_as_described", "other"].includes(input.reason)) throw new AppError("VALIDATION", "Choisis le motif du problème.", 422, { reason: "Choisis le motif du problème." });
+        await c.query(`update orders set status = 'disputed' where id = $1`, [orderId]);
+        const d = (await c.query(
+          `insert into disputes (order_id, opened_by, reason, description, status, opened_at, updated_at) values ($1,$2,$3,$4,'open',$5,$5) returning id`,
+          [orderId, userId, input.reason, text, ts(now())])).rows[0];
+        return d.id as string;
+      });
+      return disputeViewOf(pool, id, userId);
+    },
+
+    async getOrderDispute(orderId, viewerId) {
+      if (!isUuid(orderId) || !isUuid(viewerId)) throw notFound("Commande");
+      const o = (await pool.query(`select buyer_id, seller_id from orders where id = $1`, [orderId])).rows[0];
+      if (!o || (o.buyer_id !== viewerId && o.seller_id !== viewerId)) throw notFound("Commande");
+      const d = (await pool.query(`select id from disputes where order_id = $1 order by opened_at desc limit 1`, [orderId])).rows[0];
+      return d ? disputeViewOf(pool, d.id, viewerId) : null;
+    },
+
+    async getDisputeById(disputeId, viewerId) {
+      return disputeViewOf(pool, disputeId, viewerId);
+    },
+
+    async addDisputeNote(disputeId, authorId, note) {
+      const v = await disputeViewOf(pool, disputeId, authorId); // 404 pour un tiers
+      if (v.status !== "open") throw new AppError("INVALID_STATE", "Ce litige est clos.", 409);
+      const text = note.trim();
+      if (text.length < 1 || text.length > 1000) throw new AppError("VALIDATION", "Un message fait entre 1 et 1 000 caractères.", 422, { note: "Un message fait entre 1 et 1 000 caractères." });
+      await pool.query(`insert into dispute_evidence (dispute_id, author_id, note, created_at) values ($1,$2,$3,$4)`, [disputeId, authorId, text, ts(now())]);
+      return disputeViewOf(pool, disputeId, authorId);
+    },
+
+    async listOpenDisputes(staffId) {
+      await requireRole(pool, staffId, ["support", "admin"]);
+      const r = await pool.query(
+        `select d.id, d.order_id, d.reason, d.opened_at, o.total_minor, o.currency,
+           (select i.title from order_items oi join items i on i.id = oi.item_id where oi.order_id = o.id order by i.id limit 1) as item_title
+         from disputes d join orders o on o.id = d.order_id where d.status = 'open' order by d.opened_at limit 200`);
+      return r.rows.map((x): DisputeSummary => ({ id: x.id, orderId: x.order_id, reason: x.reason, openedAt: x.opened_at.getTime(), itemTitle: x.item_title ?? "Article", totalMinor: Number(x.total_minor), currency: x.currency }));
+    },
+
+    async resolveDispute(staffId, disputeId, outcome: DisputeOutcome, note) {
+      await requireRole(pool, staffId, ["support", "admin"]);
+      if (!isUuid(disputeId)) throw notFound("Litige");
+      let refund: { providerRef: string; amountMinor: number } | null = null;
+      await withTx(pool, async (c) => {
+        const d = (await c.query(`select * from disputes where id = $1 for update`, [disputeId])).rows[0];
+        if (!d) throw notFound("Litige");
+        if (d.status !== "open") throw new AppError("INVALID_STATE", "Ce litige est déjà clos.", 409);
+        const order = await loadOrder(c, d.order_id, true);
+        if (order.status !== "disputed") throw new AppError("INVALID_STATE", "La commande n'est plus en litige.", 409);
+        const at = ts(now());
+        if (outcome === "refund_buyer") {
+          refund = await refundEscrowTx(c, order);
+          await c.query(`update orders set status = 'refunded' where id = $1`, [order.id]);
+        } else {
+          await c.query(`update shipments set status = 'delivered', delivered_confirmed_by = 'auto' where order_id = $1`, [order.id]).catch(() => undefined);
+          await c.query(`update orders set status = 'completed', completed_at = $2, delivered_at = coalesce(delivered_at, $2) where id = $1`, [order.id, at]);
+          await post(c, releaseEntries(ctx("order", order.id, order.currency), { sellerId: order.sellerId, itemsMinor: order.itemsMinor, shippingMinor: order.shippingMinor, feeMinor: order.protectionFeeMinor }));
+        }
+        await c.query(`update disputes set status = $2, resolved_by = $3, resolved_at = $4, updated_at = $4 where id = $1`,
+          [disputeId, outcome === "refund_buyer" ? "resolved_refund" : "resolved_release", staffId, at]);
+        const text = (note ?? "").trim();
+        if (text) await c.query(`insert into dispute_evidence (dispute_id, author_id, note, created_at) values ($1,$2,$3,$4)`, [disputeId, staffId, text.slice(0, 1000), at]);
+      });
+      if (refund) await refundAtProvider(refund);
+      return disputeViewOf(pool, disputeId, staffId);
+    },
+
+    async expireStalePaidOrders() {
+      const fees = await getFees();
+      const cutoff = ts(now() - fees.unhandedOrderMs);
+      const ids = (await pool.query(`select id from orders where status in ('paid','in_delivery') and paid_at <= $1 order by paid_at limit 200`, [cutoff])).rows.map((r) => r.id as string);
+      let n = 0;
+      for (const id of ids) {
+        let refund: { providerRef: string; amountMinor: number } | null = null;
+        const done = await withTx(pool, async (c) => {
+          const order = await loadOrder(c, id, true);
+          if (order.status !== "paid" && order.status !== "in_delivery") return false; // changé entre-temps (litige, remise)
+          refund = await refundEscrowTx(c, order);
+          await c.query(`update orders set status = 'cancelled', cancelled_at = $2 where id = $1`, [id, ts(now())]);
+          return true;
+        });
+        if (done) { n++; if (refund) await refundAtProvider(refund); }
+      }
+      return n;
+    },
+
+    async createReview(orderId, authorId, input) {
+      if (!isUuid(orderId) || !isUuid(authorId)) throw notFound("Commande");
+      const comment = input.comment.trim();
+      return withTx(pool, async (c) => {
+        const order = await loadOrder(c, orderId, true);
+        if (order.buyerId !== authorId && order.sellerId !== authorId) throw notFound("Commande");
+        if (order.status !== "completed") throw new AppError("INVALID_STATE", "Tu pourras donner ton avis une fois la vente terminée.", 409);
+        if (!Number.isInteger(input.rating) || input.rating < 1 || input.rating > 5) throw new AppError("VALIDATION", "Choisis une note de 1 à 5.", 422, { rating: "Choisis une note de 1 à 5." });
+        if (comment.length > 500) throw new AppError("VALIDATION", "Un avis est limité à 500 caractères.", 422, { comment: "Un avis est limité à 500 caractères." });
+        const targetId = authorId === order.buyerId ? order.sellerId : order.buyerId;
+        const at = ts(now());
+        let row;
+        try {
+          row = (await c.query(`insert into reviews (order_id, author_id, target_id, rating, comment, created_at) values ($1,$2,$3,$4,$5,$6) returning id`,
+            [orderId, authorId, targetId, input.rating, comment || null, at])).rows[0];
+        } catch (e) {
+          if (pgCode(e) === "23505") throw new AppError("REVIEW_EXISTS", "Tu as déjà donné ton avis sur cette commande.", 409);
+          throw e;
+        }
+        await c.query(
+          `update profiles set rating_avg = round(((coalesce(rating_avg, 0) * rating_count + $2) / (rating_count + 1))::numeric, 2), rating_count = rating_count + 1 where id = $1`,
+          [targetId, input.rating]);
+        const me = (await c.query(`select display_name from profiles where id = $1`, [authorId])).rows[0];
+        return { id: row.id as string, orderId, authorName: me.display_name as string, rating: input.rating, comment, createdAt: at.getTime() } as Review;
+      });
+    },
+
+    async getMyReview(orderId, authorId) {
+      if (!isUuid(orderId) || !isUuid(authorId)) throw notFound("Commande");
+      const o = (await pool.query(`select buyer_id, seller_id from orders where id = $1`, [orderId])).rows[0];
+      if (!o || (o.buyer_id !== authorId && o.seller_id !== authorId)) throw notFound("Commande");
+      const r = (await pool.query(`select r.*, p.display_name from reviews r join profiles p on p.id = r.author_id where r.order_id = $1 and r.author_id = $2`, [orderId, authorId])).rows[0];
+      return r ? { id: r.id, orderId, authorName: r.display_name, rating: r.rating, comment: r.comment ?? "", createdAt: r.created_at.getTime() } : null;
+    },
+
+    async listReviews(userId) {
+      if (!isUuid(userId)) return [];
+      const r = await pool.query(
+        `select r.*, p.display_name from reviews r join profiles p on p.id = r.author_id where r.target_id = $1 order by r.created_at desc limit 30`, [userId]);
+      return r.rows.map((x): Review => ({ id: x.id, orderId: x.order_id, authorName: x.display_name, rating: x.rating, comment: x.comment ?? "", createdAt: x.created_at.getTime() }));
+    },
+
+    async createReport(reporterId, input) {
+      if (!isUuid(reporterId)) throw notFound("Compte");
+      if (!isUuid(input.targetId)) throw notFound(input.targetType === "item" ? "Annonce" : "Membre");
+      if (!(await roleOf(pool, reporterId))) throw notFound("Compte");
+      if (input.targetType === "item") {
+        const it = (await pool.query(`select seller_id, status from items where id = $1`, [input.targetId])).rows[0];
+        if (!it || it.status === "draft" || it.status === "removed") throw notFound("Annonce");
+        if (it.seller_id === reporterId) throw new AppError("OWN_TARGET", "Tu ne peux pas signaler ta propre annonce.", 409);
+      } else {
+        if (!(await roleOf(pool, input.targetId))) throw notFound("Membre");
+        if (input.targetId === reporterId) throw new AppError("OWN_TARGET", "Tu ne peux pas te signaler toi-même.", 409);
+      }
+      const details = input.details.trim();
+      if (details.length > 1000) throw new AppError("VALIDATION", "Les précisions sont limitées à 1 000 caractères.", 422, { details: "Les précisions sont limitées à 1 000 caractères." });
+      const dup = (await pool.query(`select id from reports where reporter_id = $1 and target_type = $2 and target_id = $3 and status = 'open'`, [reporterId, input.targetType, input.targetId])).rows[0];
+      if (dup) return { id: dup.id as string, created: false };
+      const r = (await pool.query(
+        `insert into reports (reporter_id, target_type, target_id, reason, details, created_at) values ($1,$2,$3,$4,$5,$6) returning id`,
+        [reporterId, input.targetType, input.targetId, input.reason, details || null, ts(now())])).rows[0];
+      return { id: r.id as string, created: true };
+    },
+
+    async listReports(staffId, status = "open") {
+      await requireRole(pool, staffId, ["moderator", "support", "admin"]);
+      const ids = (await pool.query(`select id from reports where status = $1 order by created_at limit 200`, [status])).rows.map((r) => r.id as string);
+      return Promise.all(ids.map((id) => reportViewOf(pool, id)));
+    },
+
+    async handleReport(staffId, reportId, action: ReportAction) {
+      await requireRole(pool, staffId, ["moderator", "support", "admin"]);
+      if (!isUuid(reportId)) throw notFound("Signalement");
+      await withTx(pool, async (c) => {
+        const r = (await c.query(`select * from reports where id = $1 for update`, [reportId])).rows[0];
+        if (!r) throw notFound("Signalement");
+        if (r.status !== "open") throw new AppError("INVALID_STATE", "Ce signalement est déjà traité.", 409);
+        let status: "actioned" | "dismissed" = "actioned";
+        if (action === "dismiss") status = "dismissed";
+        else if (action === "hide_item") {
+          if (r.target_type !== "item") throw new AppError("VALIDATION", "Seule une annonce peut être masquée.", 422);
+          await c.query(`update items set status = 'hidden', updated_at = $2 where id = $1 and status = 'active'`, [r.target_id, ts(now())]);
+        } else {
+          const userId = r.target_type === "user" ? r.target_id : (await c.query(`select seller_id from items where id = $1`, [r.target_id])).rows[0]?.seller_id;
+          if (!userId) throw notFound("Membre");
+          await c.query(`insert into sanctions (user_id, kind, reason, starts_at, ends_at, created_by) values ($1,'suspension',$2,$3,$4,$5)`,
+            [userId, `signalement ${r.reason}`, ts(now()), ts(now() + 7 * ONE_DAY), staffId]);
+          await c.query(`delete from sessions where user_id = $1`, [userId]);
+        }
+        await c.query(`update reports set status = $2, handled_by = $3 where id = $1`, [reportId, status, staffId]);
+      });
+      return reportViewOf(pool, reportId);
     },
 
     async getWallet(userId) {

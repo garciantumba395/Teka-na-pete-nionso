@@ -546,5 +546,182 @@ export function defineContract(label: string, factory: () => Promise<ContractEnv
         expect(code(await rejects(data.sendMessage(c.id, seller.id, "Tu es là ?")))).toBe("MEMBER_DELETED");
       });
     });
+
+    describe("litiges et arbitrage", () => {
+      const staff = () => S("user-support-1");
+      it("ouvrir un litige gèle le séquestre : plus d'annulation ni de remise, ni de retrait", async () => {
+        const { seller, buyer, order } = await paidOrder("Acheteur L1", "+243821000101", 10_000);
+        const d = await data.openDispute(order.id, buyer.id, { reason: "not_as_described", description: "La robe est beaucoup trop petite." });
+        expect(d.status).toBe("open");
+        expect(d.viewerRole).toBe("buyer");
+        expect((await data.getOrder(order.id, seller.id)).status).toBe("disputed");
+        expect((await data.getOrder(order.id, seller.id)).dispute?.id).toBe(d.id);
+        expect(code(await rejects(data.cancelOrder(order.id, buyer.id)))).toBe("INVALID_STATE");
+        expect(code(await rejects(data.confirmDelivery(order.id, seller.id, deriveHandoverCode(order.id))))).toBe("INVALID_STATE");
+        expect(code(await rejects(data.openDispute(order.id, seller.id, { reason: "other", description: "Contestation du vendeur." })))).toBe("DISPUTE_EXISTS");
+        expect(await account("order_escrow")).toBe(-Math.round(10_000 + 500) );
+        expect(await ledgerSum("USD")).toBe(0);
+      });
+      it("remboursement par l'assistance : acheteur remboursé en totalité, article remis en vente, grand livre équilibré", async () => {
+        const { seller, buyer, item, order } = await paidOrder("Acheteur L2", "+243821000102", 10_000);
+        const d = await data.openDispute(order.id, seller.id, { reason: "other", description: "L'acheteur refuse de venir au rendez-vous." });
+        await data.addDisputeNote(d.id, buyer.id, "Je n'ai jamais reçu de message du vendeur.");
+        const done = await data.resolveDispute(staff(), d.id, "refund_buyer", "Remboursement : pas de remise.");
+        expect(done.status).toBe("resolved_refund");
+        expect(done.viewerRole).toBe("staff");
+        expect(done.notes.map((n) => [n.staff, n.note])).toEqual([[false, "Je n'ai jamais reçu de message du vendeur."], [true, "Remboursement : pas de remise."]]);
+        expect((await data.getOrder(order.id, buyer.id)).status).toBe("refunded");
+        expect((await data.getItem(item.id))!.status).toBe("active");
+        expect(await account("order_escrow")).toBe(0);
+        expect(await account("seller_available")).toBe(0);
+        expect(await ledgerSum("USD")).toBe(0);
+        expect(env.refunds()).toBe(1);
+        expect(code(await rejects(data.resolveDispute(staff(), d.id, "release_seller")))).toBe("INVALID_STATE");
+        expect(code(await rejects(data.addDisputeNote(d.id, buyer.id, "Trop tard")))).toBe("INVALID_STATE");
+      });
+      it("paiement du vendeur par l'assistance : argent libéré, commande terminée", async () => {
+        const { seller, buyer, item, order } = await paidOrder("Acheteur L3", "+243821000103", 10_000);
+        const d = await data.openDispute(order.id, buyer.id, { reason: "not_received", description: "Le vendeur ne s'est pas présenté." });
+        await data.resolveDispute(staff(), d.id, "release_seller");
+        expect((await data.getOrder(order.id, buyer.id)).status).toBe("completed");
+        expect((await data.getItem(item.id))!.status).toBe("sold");
+        expect((await data.getWallet(seller.id)).balances.find((b) => b.currency === "USD")?.availableMinor).toBe(10_000);
+        expect(await account("order_escrow")).toBe(0);
+        expect(await ledgerSum("USD")).toBe(0);
+        expect(env.refunds()).toBe(0);
+      });
+      it("seule l'assistance tranche ; un tiers ne voit rien (404) ; un membre ne peut pas se servir de l'accès assistance", async () => {
+        const { buyer, order } = await paidOrder("Acheteur L4", "+243821000104", 10_000);
+        const d = await data.openDispute(order.id, buyer.id, { reason: "damaged", description: "Écran fissuré à la remise." });
+        const tiers = await signup("0831000105", "Tiers Litige");
+        expect(code(await rejects(data.getDisputeById(d.id, tiers.id)))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.getOrderDispute(order.id, tiers.id)))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.addDisputeNote(d.id, tiers.id, "Intrus")))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.resolveDispute(tiers.id, d.id, "refund_buyer")))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.resolveDispute(buyer.id, d.id, "refund_buyer")))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.listOpenDisputes(buyer.id)))).toBe("NOT_FOUND");
+        expect((await data.listOpenDisputes(staff())).map((x) => x.id)).toContain(d.id);
+        expect((await data.getOrder(order.id, buyer.id)).status).toBe("disputed");
+      });
+      it("validations : description trop courte, motif inconnu, commande non payée ou déjà remise", async () => {
+        const { buyer, seller, order } = await paidOrder("Acheteur L5", "+243821000106", 10_000);
+        expect(code(await rejects(data.openDispute(order.id, buyer.id, { reason: "other", description: "court" })))).toBe("VALIDATION");
+        expect(code(await rejects(data.openDispute(order.id, buyer.id, { reason: "inconnu" as never, description: "Une description assez longue." })))).toBe("VALIDATION");
+        await data.confirmDelivery(order.id, seller.id, deriveHandoverCode(order.id));
+        expect(code(await rejects(data.openDispute(order.id, buyer.id, { reason: "other", description: "Une description assez longue." })))).toBe("INVALID_STATE");
+        const item2 = await listing(seller.id);
+        const unpaid = await data.createOrder(buyer.id, { itemIds: [item2.id], deliveryMethod: "hand_delivery" });
+        expect(code(await rejects(data.openDispute(unpaid.id, buyer.id, { reason: "other", description: "Une description assez longue." })))).toBe("INVALID_STATE");
+      });
+      it("commande payée jamais remise au-delà du délai : remboursée automatiquement, sauf si un litige est ouvert", async () => {
+        const a = await paidOrder("Acheteur A1", "+243821000107", 10_000);
+        const b = await paidOrder("Acheteur A2", "+243821000108", 10_000);
+        await data.openDispute(b.order.id, b.buyer.id, { reason: "other", description: "Litige ouvert avant le délai." });
+        env.advance(FEES.unhandedOrderMs - 60_000);
+        expect(await data.expireStalePaidOrders()).toBe(0);
+        env.advance(120_000);
+        expect(await data.expireStalePaidOrders()).toBe(1);
+        expect((await data.getOrder(a.order.id, a.buyer.id)).status).toBe("cancelled");
+        expect((await data.getItem(a.item.id))!.status).toBe("active");
+        expect((await data.getOrder(b.order.id, b.buyer.id)).status).toBe("disputed");
+        expect(await data.expireStalePaidOrders()).toBe(0);
+        expect(env.refunds()).toBe(1);
+        expect(await ledgerSum("USD")).toBe(0);
+      });
+    });
+
+    describe("avis", () => {
+      it("un avis par membre et par commande terminée ; la note moyenne suit ; refusé avant la fin", async () => {
+        const { seller, buyer, order } = await paidOrder("Acheteur R1", "+243821000111", 5_000);
+        expect(code(await rejects(data.createReview(order.id, buyer.id, { rating: 5, comment: "" })))).toBe("INVALID_STATE");
+        await data.confirmDelivery(order.id, seller.id, deriveHandoverCode(order.id));
+        expect((await data.getOrder(order.id, buyer.id)).actions).toContain("review");
+        const before = (await data.getUser(seller.id))!;
+        const r = await data.createReview(order.id, buyer.id, { rating: 4, comment: "  Vendeuse ponctuelle.  " });
+        expect(r.comment).toBe("Vendeuse ponctuelle.");
+        const after = (await data.getUser(seller.id))!;
+        expect(after.ratingCount).toBe(before.ratingCount + 1);
+        const expected = Math.round((Math.round((before.ratingAvg ?? 0) * 100) * before.ratingCount + 400) / (before.ratingCount + 1)) / 100;
+        expect(Number(after.ratingAvg)).toBe(expected);
+        expect(code(await rejects(data.createReview(order.id, buyer.id, { rating: 5, comment: "" })))).toBe("REVIEW_EXISTS");
+        expect((await data.getOrder(order.id, buyer.id)).actions).not.toContain("review");
+        const back = await data.createReview(order.id, seller.id, { rating: 5, comment: "" });
+        expect(back.rating).toBe(5);
+        expect((await data.listReviews(seller.id))[0].comment).toBe("Vendeuse ponctuelle.");
+        expect((await data.getMyReview(order.id, buyer.id))?.rating).toBe(4);
+      });
+      it("note hors bornes, commentaire trop long, tiers : refusés", async () => {
+        const { seller, buyer, order } = await paidOrder("Acheteur R2", "+243821000112", 5_000);
+        await data.confirmDelivery(order.id, seller.id, deriveHandoverCode(order.id));
+        for (const rating of [0, 6, 2.5, -1]) expect(code(await rejects(data.createReview(order.id, buyer.id, { rating, comment: "" }))), `note ${rating}`).toBe("VALIDATION");
+        expect(code(await rejects(data.createReview(order.id, buyer.id, { rating: 3, comment: "x".repeat(501) })))).toBe("VALIDATION");
+        const tiers = await signup("0831000113", "Tiers Avis");
+        expect(code(await rejects(data.createReview(order.id, tiers.id, { rating: 1, comment: "" })))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.getMyReview(order.id, tiers.id)))).toBe("NOT_FOUND");
+        expect((await data.getUser(seller.id))!.ratingCount).toBe(31); // aucun avis refusé n'a été compté (31 = valeur de démonstration)
+      });
+    });
+
+    describe("signalement et modération", () => {
+      const moderator = () => S("user-support-2");
+      it("signaler est idempotent et refuse sa propre annonce, sa propre personne et une cible inconnue", async () => {
+        const seller = await signup("0811000121", "Vendeur Signalé");
+        const reporter = await signup("0821000122", "Signaleur");
+        const item = await listing(seller.id);
+        const a = await data.createReport(reporter.id, { targetType: "item", targetId: item.id, reason: "scam", details: "Demande un paiement hors appli." });
+        const b = await data.createReport(reporter.id, { targetType: "item", targetId: item.id, reason: "scam", details: "" });
+        expect(a.created).toBe(true);
+        expect(b).toEqual({ id: a.id, created: false });
+        expect(code(await rejects(data.createReport(seller.id, { targetType: "item", targetId: item.id, reason: "other", details: "" })))).toBe("OWN_TARGET");
+        expect(code(await rejects(data.createReport(seller.id, { targetType: "user", targetId: seller.id, reason: "other", details: "" })))).toBe("OWN_TARGET");
+        expect(code(await rejects(data.createReport(reporter.id, { targetType: "item", targetId: S("item-inconnu"), reason: "other", details: "" })))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.createReport(reporter.id, { targetType: "user", targetId: S("membre-inconnu"), reason: "other", details: "" })))).toBe("NOT_FOUND");
+      });
+      it("la modération masque une annonce ou classe sans suite ; un membre ordinaire n'a pas accès", async () => {
+        const seller = await signup("0811000123", "Vendeur Fautif");
+        const reporter = await signup("0821000124", "Signaleur Deux");
+        const item = await listing(seller.id);
+        const r = await data.createReport(reporter.id, { targetType: "item", targetId: item.id, reason: "prohibited", details: "" });
+        expect(code(await rejects(data.listReports(reporter.id)))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.handleReport(reporter.id, r.id, "hide_item")))).toBe("NOT_FOUND");
+        const open = await data.listReports(moderator());
+        expect(open.find((x) => x.id === r.id)?.targetLabel).toBe("Robe test");
+        const done = await data.handleReport(moderator(), r.id, "hide_item");
+        expect(done.status).toBe("actioned");
+        expect((await data.getItem(item.id, reporter.id))).toBeNull();
+        expect(code(await rejects(data.handleReport(moderator(), r.id, "dismiss")))).toBe("INVALID_STATE");
+        const r2 = await data.createReport(reporter.id, { targetType: "user", targetId: seller.id, reason: "harassment", details: "" });
+        expect(code(await rejects(data.handleReport(moderator(), r2.id, "hide_item")))).toBe("VALIDATION");
+        expect((await data.handleReport(moderator(), r2.id, "dismiss")).status).toBe("dismissed");
+        expect((await data.listReports(moderator(), "dismissed")).length).toBe(1);
+      });
+      it("suspension : sessions coupées, compte marqué suspendu pendant 7 jours puis libéré", async () => {
+        const seller = await signup("0811000125", "Vendeur Suspendu");
+        const reporter = await signup("0821000126", "Signaleur Trois");
+        const sess = await data.createSession(seller.id);
+        const r = await data.createReport(reporter.id, { targetType: "user", targetId: seller.id, reason: "scam", details: "" });
+        await data.handleReport(moderator(), r.id, "suspend_user");
+        expect(await data.getSessionUser(sess.token)).toBeNull();
+        const u = (await data.getUser(seller.id))!;
+        expect(u.suspendedUntil).toBe(env.now() + 7 * 86_400_000);
+        env.advance(7 * 86_400_000 + 1000);
+        expect((await data.getUser(seller.id))!.suspendedUntil ?? null).toBeNull();
+      });
+    });
+
+    describe("filtres de recherche", () => {
+      it("marque (sans accent ni casse), taille exacte, état : combinables", async () => {
+        const seller = await signup("0811000131", "Vendeur Filtres");
+        const a = await listing(seller.id, { title: "Robe filtre A", brand: "Zéphyr", sizeLabel: "M", condition: "new" });
+        const b = await listing(seller.id, { title: "Robe filtre B", brand: "Autre", sizeLabel: "L", condition: "good" });
+        const ids = async (q: Record<string, unknown>) => (await data.listItems({ q: "filtre", ...q })).map((x) => x.id).sort();
+        expect(await ids({ brand: "zephyr" })).toEqual([a.id]);
+        expect(await ids({ sizeLabel: "l" })).toEqual([b.id]);
+        expect(await ids({ conditions: ["new"] })).toEqual([a.id]);
+        expect(await ids({ conditions: ["new", "good"] })).toEqual([a.id, b.id].sort());
+        expect(await ids({ brand: "zephyr", sizeLabel: "L" })).toEqual([]);
+        expect(await ids({ brand: "100%_" })).toEqual([]);
+      });
+    });
   });
 }

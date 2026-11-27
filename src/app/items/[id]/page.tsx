@@ -85,6 +85,7 @@ export default async function ItemPage({ params }: Props) {
               <Icon name="chev" />
             </Link>
 
+            {!own && <Link href={`/report?type=item&id=${item.id}`} className="btn btn-ghost" style={{ justifySelf: "start" }}>Signaler cette annonce</Link>}
             <Banner kind="info" title="Remise en main propre">
               Tu paies sur l&apos;appli, tu vérifies l&apos;article, puis tu donnes un code au vendeur. Il ne reçoit l&apos;argent qu&apos;à ce moment-là.
             </Banner>

@@ -11,7 +11,7 @@ import { detectOffPlatform, MESSAGE_MAX } from "../messaging";
 import { normalizeDrcPhone } from "../phone";
 import { FakeMobileMoneyProvider } from "../payments/fake-provider";
 import {
-  AppError, type Area, type Category, type ChatMessage, type ConversationSummary, type Currency, type Item, type ItemCard, type ItemDetail, type ItemQuery,
+  AppError, type Area, type Category, type ChatMessage, type ConversationSummary, type Currency, type DisputeNote, type DisputeOutcome, type DisputeReason, type DisputeStatus, type DisputeSummary, type DisputeView, type ReportAction, type ReportReason, type ReportStatus, type ReportTarget, type ReportView, type Review, type UserRole, type Item, type ItemCard, type ItemDetail, type ItemQuery,
   type LedgerEntry, type Order, type OrderAction, type OrderView, type Payment, type PaymentMethod, type Payout,
   type ProviderEvent, type PublicProfile, type User, type Wallet,
 } from "../types";
@@ -74,6 +74,15 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
   const deleted = new Set<string>();
   interface ConvRec { id: string; itemId: string; buyerId: string; sellerId: string; lastMessageAt: number | null; createdAt: number }
   interface MsgRec { id: string; convId: string; senderId: string | null; kind: "text" | "system"; body: string; flagged: boolean; readAt: number | null; createdAt: number }
+  interface DisputeRec { id: string; orderId: string; openedBy: string; reason: DisputeReason; description: string; status: DisputeStatus; openedAt: number; resolvedAt: number | null }
+  interface NoteRec { id: string; disputeId: string; authorId: string; staff: boolean; note: string; createdAt: number }
+  interface ReviewRec { id: string; orderId: string; authorId: string; targetId: string; rating: number; comment: string; createdAt: number }
+  interface ReportRec { id: string; reporterId: string; targetType: ReportTarget; targetId: string; reason: ReportReason; details: string; status: ReportStatus; createdAt: number }
+  const disputes = new Map<string, DisputeRec>();
+  const disputeNotes: NoteRec[] = [];
+  const reviews: ReviewRec[] = [];
+  const reports = new Map<string, ReportRec>();
+  const suspensions: { userId: string; endsAt: number }[] = [];
   const convs = new Map<string, ConvRec>();
   const messages: MsgRec[] = [];
 
@@ -160,8 +169,10 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
       if (order.status === "delivered") actions.push("accept", "issue");
     } else {
       if (order.status === "pending_payment") actions.push("cancel");
-      if (live) actions.push("confirm_delivery", "cancel");
+      if (live) actions.push("confirm_delivery", "cancel", "issue");
     }
+    if (order.status === "completed" && !reviews.some((r) => r.orderId === order.id && r.authorId === viewerId)) actions.push("review");
+    const dsp = [...disputes.values()].filter((d) => d.orderId === order.id).sort((a, b) => b.openedAt - a.openedAt)[0];
     return {
       ...order, viewerRole: role,
       items: order.itemIds.map((id) => {
@@ -174,6 +185,7 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
         ? { attemptsLeft: Math.max(0, FEES.handoverMaxAttempts - ship.attempt.attempts), lockedUntil: ship.attempt.lockedUntil && ship.attempt.lockedUntil > now() ? ship.attempt.lockedUntil : null }
         : null,
       actions,
+      dispute: dsp ? { id: dsp.id, status: dsp.status } : null,
     };
   }
 
@@ -198,6 +210,43 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
   const chatMessage = (m: MsgRec, viewerId: string): ChatMessage => ({
     id: m.id, mine: m.senderId === viewerId, kind: m.kind, body: m.body, flagged: m.flagged, createdAt: m.createdAt,
   });
+
+  /** Rembourse intégralement l'acheteur depuis le séquestre (grand livre + fournisseur de paiement). */
+  async function refundEscrow(order: Order) {
+    post(refundEntries(ctx("order", order.id, order.currency), order.totalMinor));
+    const pay = [...payments.values()].find((p) => p.orderId === order.id && p.status === "succeeded");
+    if (pay) {
+      pay.status = "refunded";
+      if (pay.providerRef) await provider.refund({ providerRef: pay.providerRef, amountMinor: pay.amountMinor });
+    }
+  }
+
+  function requireRole(userId: string, allowed: UserRole[]): User {
+    const u = users.get(userId);
+    if (!u || deleted.has(userId) || !allowed.includes(u.role ?? "member")) throw notFound("Ressource");
+    return u;
+  }
+
+  function disputeView(d: DisputeRec, viewerId: string): DisputeView {
+    const order = loadOrder(d.orderId);
+    const staff = !!users.get(viewerId) && ["support", "admin"].includes(users.get(viewerId)!.role ?? "member");
+    if (!staff && viewerId !== order.buyerId && viewerId !== order.sellerId) throw notFound("Litige");
+    const it = items.get(order.itemIds[0]);
+    return {
+      id: d.id, orderId: d.orderId, status: d.status, reason: d.reason, description: d.description,
+      openedByName: profileOf(d.openedBy).displayName, openedByMe: d.openedBy === viewerId, openedAt: d.openedAt, resolvedAt: d.resolvedAt,
+      notes: disputeNotes.filter((n) => n.disputeId === d.id).sort((a, b) => a.createdAt - b.createdAt).map((n): DisputeNote => ({
+        id: n.id, authorName: n.staff ? "Assistance" : profileOf(n.authorId).displayName, mine: n.authorId === viewerId, staff: n.staff, note: n.note, createdAt: n.createdAt,
+      })),
+      order: { itemTitle: it?.title ?? "Article", totalMinor: order.totalMinor, currency: order.currency, buyerName: profileOf(order.buyerId).displayName, sellerName: profileOf(order.sellerId).displayName },
+      viewerRole: staff && viewerId !== order.buyerId && viewerId !== order.sellerId ? "staff" : viewerId === order.buyerId ? "buyer" : "seller",
+    };
+  }
+
+  function reportView(r: ReportRec): ReportView {
+    const label = r.targetType === "item" ? (items.get(r.targetId)?.title ?? "Annonce supprimée") : profileOf(r.targetId).displayName;
+    return { id: r.id, targetType: r.targetType, targetId: r.targetId, targetLabel: label, reason: r.reason, details: r.details, reporterName: profileOf(r.reporterId).displayName, status: r.status, createdAt: r.createdAt };
+  }
 
   function loadOrder(orderId: string): Order {
     const o = orders.get(orderId);
@@ -260,7 +309,10 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
     },
 
     async getUser(id) {
-      return deleted.has(id) ? null : (users.get(id) ?? null);
+      const u = deleted.has(id) ? null : (users.get(id) ?? null);
+      if (!u) return null;
+      const until = Math.max(0, ...suspensions.filter((s) => s.userId === id && s.endsAt > now()).map((s) => s.endsAt));
+      return { ...u, role: u.role ?? "member", suspendedUntil: until > 0 ? until : null };
     },
     async getPublicProfile(id) {
       const u = users.get(id);
@@ -368,6 +420,9 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
           const hay = norm(`${it.title} ${it.brand ?? ""} ${it.description}`);
           if (!tokens.every((t) => hay.includes(t))) return false;
         }
+        if (q.brand && !norm(it.brand ?? "").includes(norm(q.brand))) return false;
+        if (q.sizeLabel && norm(it.sizeLabel ?? "") !== norm(q.sizeLabel)) return false;
+        if (q.conditions?.length && !q.conditions.includes(it.condition)) return false;
         const usd = it.currency === "USD" ? it.priceMinor : Math.round(it.priceMinor / 2800);
         if (q.minPriceUsdMinor != null && usd < q.minPriceUsdMinor) return false;
         if (q.maxPriceUsdMinor != null && usd > q.maxPriceUsdMinor) return false;
@@ -580,12 +635,7 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
         order.cancelledAt = now();
       } else if (order.status === "paid" || order.status === "in_delivery") {
         // Non remis : remboursement intégral de l'acheteur.
-        post(refundEntries(ctx("order", order.id, order.currency), order.totalMinor));
-        const pay = [...payments.values()].find((p) => p.orderId === orderId && p.status === "succeeded");
-        if (pay) {
-          pay.status = "refunded";
-          if (pay.providerRef) await provider.refund({ providerRef: pay.providerRef, amountMinor: pay.amountMinor });
-        }
+        await refundEscrow(order);
         setOrderStatus(order, "cancelled");
         order.cancelledAt = now();
       } else {
@@ -686,6 +736,171 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
       messages.push(m);
       c.lastMessageAt = m.createdAt;
       return chatMessage(m, senderId);
+    },
+
+    async openDispute(orderId, userId, input) {
+      const order = loadOrder(orderId);
+      if (order.buyerId !== userId && order.sellerId !== userId) throw notFound("Commande");
+      if (order.status === "disputed") throw new AppError("DISPUTE_EXISTS", "Un litige est déjà ouvert sur cette commande.", 409);
+      if (order.status !== "paid" && order.status !== "in_delivery") throw new AppError("INVALID_STATE", "Un litige ne peut être ouvert que sur une commande payée et pas encore remise.", 409);
+      const text = input.description.trim();
+      if (text.length < 10) throw new AppError("VALIDATION", "Décris le problème en quelques mots (10 caractères au moins).", 422, { description: "Décris le problème en quelques mots (10 caractères au moins)." });
+      if (text.length > 2000) throw new AppError("VALIDATION", "La description est limitée à 2 000 caractères.", 422, { description: "La description est limitée à 2 000 caractères." });
+      if (!["not_received", "damaged", "not_as_described", "other"].includes(input.reason)) throw new AppError("VALIDATION", "Choisis le motif du problème.", 422, { reason: "Choisis le motif du problème." });
+      setOrderStatus(order, "disputed");
+      const d: DisputeRec = { id: randomUUID(), orderId, openedBy: userId, reason: input.reason, description: text, status: "open", openedAt: now(), resolvedAt: null };
+      disputes.set(d.id, d);
+      return disputeView(d, userId);
+    },
+
+    async getOrderDispute(orderId, viewerId) {
+      const order = loadOrder(orderId);
+      if (order.buyerId !== viewerId && order.sellerId !== viewerId) throw notFound("Commande");
+      const d = [...disputes.values()].filter((x) => x.orderId === orderId).sort((a, b) => b.openedAt - a.openedAt)[0];
+      return d ? disputeView(d, viewerId) : null;
+    },
+
+    async getDisputeById(disputeId, viewerId) {
+      const d = disputes.get(disputeId);
+      if (!d) throw notFound("Litige");
+      return disputeView(d, viewerId);
+    },
+
+    async addDisputeNote(disputeId, authorId, note) {
+      const d = disputes.get(disputeId);
+      if (!d) throw notFound("Litige");
+      const view0 = disputeView(d, authorId); // 404 pour un tiers
+      if (d.status !== "open") throw new AppError("INVALID_STATE", "Ce litige est clos.", 409);
+      const text = note.trim();
+      if (text.length < 1 || text.length > 1000) throw new AppError("VALIDATION", "Un message fait entre 1 et 1 000 caractères.", 422, { note: "Un message fait entre 1 et 1 000 caractères." });
+      disputeNotes.push({ id: randomUUID(), disputeId, authorId, staff: view0.viewerRole === "staff", note: text, createdAt: now() });
+      return disputeView(d, authorId);
+    },
+
+    async listOpenDisputes(staffId) {
+      requireRole(staffId, ["support", "admin"]);
+      return [...disputes.values()].filter((d) => d.status === "open").sort((a, b) => a.openedAt - b.openedAt).map((d): DisputeSummary => {
+        const o = loadOrder(d.orderId);
+        return { id: d.id, orderId: d.orderId, reason: d.reason, openedAt: d.openedAt, itemTitle: items.get(o.itemIds[0])?.title ?? "Article", totalMinor: o.totalMinor, currency: o.currency };
+      });
+    },
+
+    async resolveDispute(staffId, disputeId, outcome: DisputeOutcome, note) {
+      requireRole(staffId, ["support", "admin"]);
+      const d = disputes.get(disputeId);
+      if (!d) throw notFound("Litige");
+      if (d.status !== "open") throw new AppError("INVALID_STATE", "Ce litige est déjà clos.", 409);
+      const order = loadOrder(d.orderId);
+      if (order.status !== "disputed") throw new AppError("INVALID_STATE", "La commande n'est plus en litige.", 409);
+      if (outcome === "refund_buyer") {
+        await refundEscrow(order);
+        setOrderStatus(order, "refunded");
+        d.status = "resolved_refund";
+      } else {
+        const ship = shipments.get(order.id);
+        if (ship) { ship.status = "delivered"; ship.confirmedBy = "auto"; }
+        setOrderStatus(order, "completed");
+        order.deliveredAt = order.deliveredAt ?? now();
+        order.completedAt = now();
+        release(order);
+        d.status = "resolved_release";
+      }
+      d.resolvedAt = now();
+      const text = (note ?? "").trim();
+      if (text) disputeNotes.push({ id: randomUUID(), disputeId, authorId: staffId, staff: true, note: text.slice(0, 1000), createdAt: now() });
+      return disputeView(d, staffId);
+    },
+
+    async expireStalePaidOrders() {
+      let n = 0;
+      for (const o of orders.values()) {
+        if ((o.status === "paid" || o.status === "in_delivery") && o.paidAt != null && now() - o.paidAt >= FEES.unhandedOrderMs) {
+          await refundEscrow(o);
+          setOrderStatus(o, "cancelled");
+          o.cancelledAt = now();
+          n++;
+        }
+      }
+      return n;
+    },
+
+    async createReview(orderId, authorId, input) {
+      const order = loadOrder(orderId);
+      if (order.buyerId !== authorId && order.sellerId !== authorId) throw notFound("Commande");
+      if (order.status !== "completed") throw new AppError("INVALID_STATE", "Tu pourras donner ton avis une fois la vente terminée.", 409);
+      if (!Number.isInteger(input.rating) || input.rating < 1 || input.rating > 5) throw new AppError("VALIDATION", "Choisis une note de 1 à 5.", 422, { rating: "Choisis une note de 1 à 5." });
+      const comment = input.comment.trim();
+      if (comment.length > 500) throw new AppError("VALIDATION", "Un avis est limité à 500 caractères.", 422, { comment: "Un avis est limité à 500 caractères." });
+      if (reviews.some((r) => r.orderId === orderId && r.authorId === authorId)) throw new AppError("REVIEW_EXISTS", "Tu as déjà donné ton avis sur cette commande.", 409);
+      const targetId = authorId === order.buyerId ? order.sellerId : order.buyerId;
+      const r: ReviewRec = { id: randomUUID(), orderId, authorId, targetId, rating: input.rating, comment, createdAt: now() };
+      reviews.push(r);
+      const t = users.get(targetId);
+      if (t) {
+        // Arithmétique entière (centièmes) : comme numeric côté PostgreSQL, sans erreur d'arrondi flottante.
+        const totalHundredths = Math.round((t.ratingAvg ?? 0) * 100) * t.ratingCount + input.rating * 100;
+        t.ratingCount += 1;
+        t.ratingAvg = Math.round(totalHundredths / t.ratingCount) / 100;
+      }
+      return { id: r.id, orderId, authorName: profileOf(authorId).displayName, rating: r.rating, comment: r.comment, createdAt: r.createdAt };
+    },
+
+    async getMyReview(orderId, authorId) {
+      const order = loadOrder(orderId);
+      if (order.buyerId !== authorId && order.sellerId !== authorId) throw notFound("Commande");
+      const r = reviews.find((x) => x.orderId === orderId && x.authorId === authorId);
+      return r ? { id: r.id, orderId, authorName: profileOf(authorId).displayName, rating: r.rating, comment: r.comment, createdAt: r.createdAt } : null;
+    },
+
+    async listReviews(userId) {
+      return reviews.filter((r) => r.targetId === userId).sort((a, b) => b.createdAt - a.createdAt).slice(0, 30)
+        .map((r) => ({ id: r.id, orderId: r.orderId, authorName: profileOf(r.authorId).displayName, rating: r.rating, comment: r.comment, createdAt: r.createdAt }));
+    },
+
+    async createReport(reporterId, input) {
+      if (!users.has(reporterId) || deleted.has(reporterId)) throw notFound("Compte");
+      if (input.targetType === "item") {
+        const it = items.get(input.targetId);
+        if (!it || it.status === "draft" || it.status === "removed") throw notFound("Annonce");
+        if (it.sellerId === reporterId) throw new AppError("OWN_TARGET", "Tu ne peux pas signaler ta propre annonce.", 409);
+      } else {
+        if (!users.has(input.targetId) || deleted.has(input.targetId)) throw notFound("Membre");
+        if (input.targetId === reporterId) throw new AppError("OWN_TARGET", "Tu ne peux pas te signaler toi-même.", 409);
+      }
+      const details = input.details.trim();
+      if (details.length > 1000) throw new AppError("VALIDATION", "Les précisions sont limitées à 1 000 caractères.", 422, { details: "Les précisions sont limitées à 1 000 caractères." });
+      const dup = [...reports.values()].find((r) => r.reporterId === reporterId && r.targetType === input.targetType && r.targetId === input.targetId && r.status === "open");
+      if (dup) return { id: dup.id, created: false };
+      const r: ReportRec = { id: randomUUID(), reporterId, targetType: input.targetType, targetId: input.targetId, reason: input.reason, details, status: "open", createdAt: now() };
+      reports.set(r.id, r);
+      return { id: r.id, created: true };
+    },
+
+    async listReports(staffId, status = "open") {
+      requireRole(staffId, ["moderator", "support", "admin"]);
+      return [...reports.values()].filter((r) => r.status === status).sort((a, b) => a.createdAt - b.createdAt).map(reportView);
+    },
+
+    async handleReport(staffId, reportId, action: ReportAction) {
+      requireRole(staffId, ["moderator", "support", "admin"]);
+      const r = reports.get(reportId);
+      if (!r) throw notFound("Signalement");
+      if (r.status !== "open") throw new AppError("INVALID_STATE", "Ce signalement est déjà traité.", 409);
+      if (action === "dismiss") {
+        r.status = "dismissed";
+      } else if (action === "hide_item") {
+        if (r.targetType !== "item") throw new AppError("VALIDATION", "Seule une annonce peut être masquée.", 422);
+        const it = items.get(r.targetId);
+        if (it && it.status === "active") it.status = "hidden";
+        r.status = "actioned";
+      } else {
+        const userId = r.targetType === "user" ? r.targetId : items.get(r.targetId)?.sellerId;
+        if (!userId) throw notFound("Membre");
+        suspensions.push({ userId, endsAt: now() + 7 * 86_400_000 });
+        await api.deleteAllSessions(userId);
+        r.status = "actioned";
+      }
+      return reportView(r);
     },
 
     async getWallet(userId) {

@@ -41,6 +41,8 @@ export interface LedgerEntry {
   createdAt: number;
 }
 
+export type UserRole = "member" | "moderator" | "support" | "admin";
+
 export interface User {
   id: string;
   phone: string; // E.164
@@ -51,6 +53,9 @@ export interface User {
   ratingAvg: number | null;
   ratingCount: number;
   createdAt: number;
+  role?: UserRole;
+  /** Fin de la suspension en cours (sanction de modération), sinon null. */
+  suspendedUntil?: number | null;
 }
 
 export interface PublicProfile {
@@ -134,6 +139,10 @@ export interface ItemQuery {
   lng?: number;
   radiusKm?: number;
   sellerId?: string;
+  /** Filtres de recherche (marque : contient, sans accent ni casse ; taille : égalité sans casse ; état : un ou plusieurs). */
+  brand?: string;
+  sizeLabel?: string;
+  conditions?: Condition[];
   includeSold?: boolean;
   limit?: number;
 }
@@ -160,7 +169,7 @@ export interface Order {
   createdAt: number;
 }
 
-export type OrderAction = "pay" | "cancel" | "reveal_code" | "confirm_delivery" | "accept" | "issue";
+export type OrderAction = "pay" | "cancel" | "reveal_code" | "confirm_delivery" | "accept" | "issue" | "review";
 
 export interface OrderView extends Order {
   viewerRole: "buyer" | "seller";
@@ -169,6 +178,8 @@ export interface OrderView extends Order {
   payment: { id: string; status: PaymentStatus; method: PaymentMethod; failureCode: string | null } | null;
   handover: { attemptsLeft: number; lockedUntil: number | null } | null;
   actions: OrderAction[];
+  /** Litige ouvert ou clos sur cette commande, s'il y en a un. */
+  dispute: { id: string; status: DisputeStatus } | null;
 }
 
 export interface Payment {
@@ -267,4 +278,73 @@ export interface ConversationSummary {
 
 export interface ConversationView extends ConversationSummary {
   messages: ChatMessage[];
+}
+
+// ------------------------------------------------------------------------------------------------ litiges
+export type DisputeReason = "not_received" | "damaged" | "not_as_described" | "other";
+export type DisputeStatus = "open" | "resolved_refund" | "resolved_release";
+export type DisputeOutcome = "refund_buyer" | "release_seller";
+
+export interface DisputeNote {
+  id: string;
+  authorName: string;
+  mine: boolean;
+  /** Message de l'équipe d'assistance. */
+  staff: boolean;
+  note: string;
+  createdAt: number;
+}
+
+export interface DisputeView {
+  id: string;
+  orderId: string;
+  status: DisputeStatus;
+  reason: DisputeReason;
+  description: string;
+  openedByName: string;
+  openedByMe: boolean;
+  openedAt: number;
+  resolvedAt: number | null;
+  notes: DisputeNote[];
+  order: { itemTitle: string; totalMinor: number; currency: Currency; buyerName: string; sellerName: string };
+  viewerRole: "buyer" | "seller" | "staff";
+}
+
+export interface DisputeSummary {
+  id: string;
+  orderId: string;
+  reason: DisputeReason;
+  openedAt: number;
+  itemTitle: string;
+  totalMinor: number;
+  currency: Currency;
+}
+
+// ------------------------------------------------------------------------------------------------ avis
+export interface Review {
+  id: string;
+  orderId: string;
+  authorName: string;
+  rating: number;
+  comment: string;
+  createdAt: number;
+}
+
+// ------------------------------------------------------------------------------------------------ signalement
+export type ReportTarget = "item" | "user";
+export type ReportReason = "prohibited" | "counterfeit" | "scam" | "offensive" | "harassment" | "other";
+export type ReportStatus = "open" | "actioned" | "dismissed";
+export type ReportAction = "dismiss" | "hide_item" | "suspend_user";
+
+export interface ReportView {
+  id: string;
+  targetType: ReportTarget;
+  targetId: string;
+  /** Titre de l'annonce ou nom du membre signalé. */
+  targetLabel: string;
+  reason: ReportReason;
+  details: string;
+  reporterName: string;
+  status: ReportStatus;
+  createdAt: number;
 }

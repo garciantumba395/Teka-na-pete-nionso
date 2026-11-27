@@ -45,9 +45,9 @@ export async function seedDemo(pool: Pool, now: number = Date.now()): Promise<vo
   const users = seedUsers(now);
   for (const u of users) {
     await pool.query(
-      `insert into profiles (id, phone, phone_verified_at, display_name, bio, area_id, verification_level, rating_avg, rating_count, created_at)
-       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) on conflict (id) do nothing`,
-      [u.id, u.phone, new Date(u.createdAt), u.displayName, u.bio, u.areaId, u.verificationLevel, u.ratingAvg, u.ratingCount, new Date(u.createdAt)],
+      `insert into profiles (id, phone, phone_verified_at, display_name, bio, area_id, verification_level, rating_avg, rating_count, created_at, role)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) on conflict (id) do nothing`,
+      [u.id, u.phone, new Date(u.createdAt), u.displayName, u.bio, u.areaId, u.verificationLevel, u.ratingAvg, u.ratingCount, new Date(u.createdAt), u.role ?? "member"],
     );
   }
   for (const it of seedItems(now, seedAreas())) {

@@ -29,6 +29,11 @@ export const randomIp = () => `198.51.${rnd(250) + 1}.${rnd(250) + 1}`;
 export const uniquePhone = () => `082${String(Date.now() % 1e3).padStart(3, "0")}${String(++seq % 100).padStart(2, "0")}${String(rnd(100)).padStart(2, "0")}`;
 export const uniqueTitle = (base = "Robe") => `${base} ${Date.now().toString(36)}${++seq}`;
 
+/** Numéros des comptes d'assistance de démonstration (voir src/lib/data/seed.ts), utilisés à tour de rôle. */
+const STAFF_PHONES = ["0899999991", "0899999992", "0899999993", "0899999994"];
+let staffTurn = Math.floor(Math.random() * STAFF_PHONES.length);
+export const staffPhone = () => STAFF_PHONES[staffTurn++ % STAFF_PHONES.length];
+
 export interface Actor {
   name: string;
   phone: string;
@@ -41,7 +46,7 @@ export interface Actor {
 interface Fixtures {
   ip: string;
   /** Crée un membre connecté (contexte navigateur isolé, IP propre, session ouverte par l'API). */
-  makeActor: (name?: string) => Promise<Actor>;
+  makeActor: (name?: string, phone?: string) => Promise<Actor>;
   /** Faux, sauf si le test l'autorise : échoue sur erreur console, exception de page ou réponse 5xx. */
   allowConsoleErrors: { value: boolean };
 }
@@ -56,8 +61,8 @@ export const test = base.extend<Fixtures>({
   makeActor: async ({ browser, allowConsoleErrors }, use) => {
     const made: BrowserContext[] = [];
     const problems: string[] = [];
-    await use(async (name = "Testeur") => {
-      const actor = await newActor(browser, name, problems);
+    await use(async (name = "Testeur", phone?: string) => {
+      const actor = await newActor(browser, name, problems, phone);
       made.push(actor.context);
       return actor;
     });
@@ -83,12 +88,12 @@ function watch(page: Page, problems: string[]) {
   });
 }
 
-async function newActor(browser: Browser, name: string, problems: string[]): Promise<Actor> {
+async function newActor(browser: Browser, name: string, problems: string[], fixedPhone?: string): Promise<Actor> {
   const ip = randomIp();
   const context = await browser.newContext({ viewport: { width: 390, height: 844 }, locale: "fr-FR", timezoneId: "Africa/Kinshasa", extraHTTPHeaders: { "x-forwarded-for": ip }, baseURL: process.env.BASE_URL ?? "http://localhost:3100" });
   const page = await context.newPage();
   watch(page, problems);
-  const phone = uniquePhone();
+  const phone = fixedPhone ?? uniquePhone();
   const user = await signUp(context.request, phone, name);
   return { name, phone, userId: user.id, context, page, request: context.request };
 }
@@ -102,13 +107,13 @@ export async function signUp(request: APIRequestContext, phone = uniquePhone(), 
   return { id: (await b.json()).user.id, phone };
 }
 
-export interface ListingOpts { title?: string; priceMinor?: number; currency?: "USD" | "CDF"; categoryId?: string; areaId?: string; description?: string; photos?: string[] }
+export interface ListingOpts { brand?: string; sizeLabel?: string; condition?: string; title?: string; priceMinor?: number; currency?: "USD" | "CDF"; categoryId?: string; areaId?: string; description?: string; photos?: string[] }
 
 export async function apiListing(request: APIRequestContext, o: ListingOpts = {}): Promise<{ id: string; title: string }> {
   const title = o.title ?? uniqueTitle();
   const d = await request.post("/api/v1/items", {
     data: {
-      title, description: o.description ?? "Article de test", categoryId: o.categoryId ?? ID.catRobes, condition: "good",
+      title, description: o.description ?? "Article de test", categoryId: o.categoryId ?? ID.catRobes, condition: o.condition ?? "good", brand: o.brand, sizeLabel: o.sizeLabel,
       priceMinor: o.priceMinor ?? 2500, currency: o.currency ?? "USD", areaId: o.areaId ?? ID.areaGombe, photos: o.photos ?? [PHOTO],
     },
   });
@@ -223,3 +228,11 @@ export const money = (s: string) => s.replace(/[  ]/g, " ");
 
 /** Les vraies alertes de l'application, sans l'annonceur de routes de Next.js (toujours présent et vide). */
 export const alerts = (page: Page) => page.locator('[role="alert"]:not(#__next-route-announcer__)');
+
+/** Vente terminée par l'API : l'acheteur paie, le vendeur saisit le code de remise. */
+export async function apiComplete(buyer: APIRequestContext, seller: APIRequestContext, itemId: string): Promise<string> {
+  const orderId = await apiBuyAndPay(buyer, itemId);
+  const r = await seller.post(`/api/v1/orders/${orderId}/confirm-delivery`, { data: { code: await apiCode(buyer, orderId) } });
+  expect(r.status(), `remise : ${await r.text()}`).toBe(200);
+  return orderId;
+}

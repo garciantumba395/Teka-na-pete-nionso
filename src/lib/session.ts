@@ -31,5 +31,8 @@ export async function currentUser(): Promise<User | null> {
 export async function requireUser(): Promise<User> {
   const u = await currentUser();
   if (!u) throw new AppError("UNAUTHENTICATED", "Connecte-toi pour continuer.", 401);
+  if (u.suspendedUntil && u.suspendedUntil > Date.now()) {
+    throw new AppError("ACCOUNT_SUSPENDED", "Ton compte est suspendu suite à un signalement. Contacte l'assistance.", 403);
+  }
   return u;
 }

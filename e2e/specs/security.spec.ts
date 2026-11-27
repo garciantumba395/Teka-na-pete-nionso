@@ -107,7 +107,7 @@ test.describe("SEC Sécurité", () => {
     expect((await request.get("/api/internal/jobs/purge_expired", { headers: { authorization: "Bearer faux" } })).status()).toBe(401);
     const ok = await request.get("/api/internal/jobs/all", { headers: { authorization: `Bearer ${CRON_SECRET}` } });
     expect(ok.status()).toBe(200);
-    expect(Object.keys((await ok.json()).result).sort()).toEqual(["expire_unpaid_orders", "purge_expired", "reconcile_pending_payments"]);
+    expect(Object.keys((await ok.json()).result).sort()).toEqual(["expire_unpaid_orders", "purge_expired", "reconcile_pending_payments", "refund_unhanded_orders"]);
     expect((await request.get("/api/internal/jobs/inconnue", { headers: { authorization: `Bearer ${CRON_SECRET}` } })).status()).toBe(404);
   });
 
@@ -162,7 +162,9 @@ test.describe("SEC Sécurité", () => {
     expect(p.status()).toBeLessThan(500);
     const after = (await (await buyer.request.get("/api/v1/me")).json()).user;
     for (const k of ["id", "phone", "ratingAvg", "ratingCount", "verificationLevel"]) expect(after[k], k).toEqual(before[k]);
-    expect(after.role).toBeUndefined();
+    expect(after.role ?? "member", "le rôle ne peut pas être modifié par le client").toBe("member");
+    expect((await buyer.request.get("/api/v1/staff/disputes")).status(), "aucune élévation de privilège").toBe(404);
+    expect((await buyer.request.get("/api/v1/staff/reports")).status()).toBe(404);
   });
 
   test("SEC-12 photos : identifiant invalide 404 ; en-têtes de sécurité et cache immuable", async ({ makeActor, request }) => {

@@ -47,6 +47,26 @@ export const conversationCreate = z.object({ itemId: uuid });
 export const messageCreate = z.object({
   body: z.string().transform(cleanText).pipe(z.string().trim().min(1, "Écris un message.").max(2000, "Un message est limité à 2 000 caractères.")),
 });
+export const disputeOpen = z.object({
+  reason: z.enum(["not_received", "damaged", "not_as_described", "other"], { message: "Choisis le motif du problème." }),
+  description: multiline(2000).pipe(z.string().trim().min(10, "Décris le problème en quelques mots (10 caractères au moins).")),
+});
+export const disputeNote = z.object({ note: z.string().transform(cleanText).pipe(z.string().trim().min(1, "Écris un message.").max(1000, "Un message est limité à 1 000 caractères.")) });
+export const disputeResolve = z.object({
+  outcome: z.enum(["refund_buyer", "release_seller"], { message: "Choisis une décision." }),
+  note: z.string().transform(cleanText).pipe(z.string().trim().max(1000)).optional(),
+});
+export const reviewCreate = z.object({
+  rating: z.number({ message: "Choisis une note de 1 à 5." }).int("Choisis une note de 1 à 5.").min(1, "Choisis une note de 1 à 5.").max(5, "Choisis une note de 1 à 5."),
+  comment: z.string().transform(cleanText).pipe(z.string().trim().max(500, "Un avis est limité à 500 caractères.")).default(""),
+});
+export const reportCreate = z.object({
+  targetType: z.enum(["item", "user"], { message: "Cible invalide." }),
+  targetId: uuid,
+  reason: z.enum(["prohibited", "counterfeit", "scam", "offensive", "harassment", "other"], { message: "Choisis un motif." }),
+  details: z.string().transform(cleanText).pipe(z.string().trim().max(1000, "Les précisions sont limitées à 1 000 caractères.")).default(""),
+});
+export const reportHandle = z.object({ action: z.enum(["dismiss", "hide_item", "suspend_user"], { message: "Action invalide." }) });
 export const payOrder = z.object({ method, msisdn: phone, idempotencyKey });
 export const confirmDelivery = z.object({ code: z.string().trim().regex(/^\d{6}$/, "Le code a 6 chiffres.") });
 export const payoutCreate = z.object({

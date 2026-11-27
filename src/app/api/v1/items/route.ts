@@ -3,6 +3,14 @@ import { asString, handle, json, num, readJson } from "@/lib/http";
 import { enforce } from "@/lib/ratelimit";
 import { itemCreate, parse } from "@/lib/schemas";
 import { requireUser } from "@/lib/session";
+import { CONDITIONS } from "@/lib/validation";
+
+const CONDITION_VALUES = CONDITIONS.map((c) => c.value);
+/** « condition=good,new » : valeurs inconnues ignorées. */
+function conditionsParam(raw: string | null) {
+  const list = (raw ?? "").split(",").map((s) => s.trim()).filter((s): s is (typeof CONDITION_VALUES)[number] => (CONDITION_VALUES as string[]).includes(s));
+  return list.length ? list : undefined;
+}
 
 export async function GET(req: Request) {
   return handle(async () => {
@@ -17,6 +25,9 @@ export async function GET(req: Request) {
       minPriceUsdMinor: num(p.get("min_usd")),
       maxPriceUsdMinor: num(p.get("max_usd")),
       sellerId: p.get("seller") ?? undefined,
+      brand: asString(p.get("brand"), 40) || undefined,
+      sizeLabel: asString(p.get("size"), 20) || undefined,
+      conditions: conditionsParam(p.get("condition")),
       limit: Math.min(num(p.get("limit")) ?? 60, 100),
     });
     return json({ items });

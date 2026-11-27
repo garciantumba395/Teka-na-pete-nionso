@@ -9,6 +9,8 @@ export interface FeeConfig {
   handoverLockMs: number;
   maxPhotos: number;
   claimWindowMs: number;
+  /** Commande payée mais jamais remise : au-delà, remboursement automatique de l'acheteur. */
+  unhandedOrderMs: number;
 }
 
 // VALEURS PAR DÉFAUT = PLACEHOLDERS : elles ne viennent PAS de Vinted (non lues) et ne sont pas décidées.
@@ -22,6 +24,7 @@ export const FEES: FeeConfig = {
   handoverLockMs: 15 * 60 * 1000,
   maxPhotos: 20,
   claimWindowMs: 48 * 3600 * 1000,
+  unhandedOrderMs: 7 * 86_400_000, // PLACEHOLDER : 7 jours
 };
 
 export function protectionFee(itemsMinor: number, currency: Currency, cfg: FeeConfig = FEES): number {

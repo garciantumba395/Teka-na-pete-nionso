@@ -9,6 +9,7 @@ import { AppError } from "./types";
  */
 export const JOBS = {
   expire_unpaid_orders: async () => ({ expired: await getData().expireUnpaidOrders() }),
+  refund_unhanded_orders: async () => ({ refunded: await getData().expireStalePaidOrders() }),
   reconcile_pending_payments: async () => ({ resolved: await getData().reconcilePendingPayments() }),
   purge_expired: async () => getData().purgeExpired(),
 } as const;

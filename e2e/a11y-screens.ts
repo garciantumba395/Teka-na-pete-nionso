@@ -48,6 +48,9 @@ export function defineA11y(label: string) {
       await buyer.request.post(`/api/v1/conversations/${conv}/messages`, { data: { body: "Bonjour, 0821234567 pour discuter" } });
       await check("S07 messages (liste)", bp, "/inbox");
       await check("S07 conversation (avec rappel de sécurité)", bp, `/inbox/${conv}`);
+      await check("S11 litige : formulaire", bp, `/orders/${paidId}/dispute`);
+      await check("S19 signalement", bp, `/report?type=item&id=${item.id}`);
+      await check("S03 recherche avec marque, taille et état", bp, "/search?brand=zephyr&size=M&condition=good&condition=new");
       // vendeur
       const sp = seller.page;
       await check("S09 commande payée (vendeur, saisie du code)", sp, `/orders/${paidId}`);
