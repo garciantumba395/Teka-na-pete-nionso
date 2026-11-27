@@ -11,6 +11,8 @@ export interface FeeConfig {
   claimWindowMs: number;
   /** Commande payée mais jamais remise : au-delà, remboursement automatique de l'acheteur. */
   unhandedOrderMs: number;
+  /** Demande d'annulation de l'acheteur sans réponse du vendeur : au-delà, elle est traitée comme un refus (aucun mouvement d'argent). */
+  cancelRequestTtlMs: number;
 }
 
 // VALEURS PAR DÉFAUT = PLACEHOLDERS : elles ne viennent PAS de Vinted (non lues) et ne sont pas décidées.
@@ -25,6 +27,7 @@ export const FEES: FeeConfig = {
   maxPhotos: 20,
   claimWindowMs: 48 * 3600 * 1000,
   unhandedOrderMs: 7 * 86_400_000, // PLACEHOLDER : 7 jours
+  cancelRequestTtlMs: 3 * 86_400_000, // PLACEHOLDER : 3 jours
 };
 
 export function protectionFee(itemsMinor: number, currency: Currency, cfg: FeeConfig = FEES): number {

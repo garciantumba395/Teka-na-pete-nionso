@@ -27,6 +27,7 @@ export function feesFromSettings(rows: { key: string; value: unknown }[]): FeeCo
     maxPhotos: num("max_photos", FEES.maxPhotos),
     claimWindowMs: FEES.claimWindowMs,
     unhandedOrderMs: num("unhanded_order_days", FEES.unhandedOrderMs / 86_400_000) * 86_400_000,
+    cancelRequestTtlMs: num("cancel_request_days", FEES.cancelRequestTtlMs / 86_400_000) * 86_400_000,
   };
 }
 

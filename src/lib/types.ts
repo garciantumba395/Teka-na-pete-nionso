@@ -169,7 +169,13 @@ export interface Order {
   createdAt: number;
 }
 
-export type OrderAction = "pay" | "cancel" | "reveal_code" | "confirm_delivery" | "accept" | "issue" | "review";
+export type OrderAction =
+  | "pay" | "cancel" | "reveal_code" | "confirm_delivery" | "accept" | "issue" | "review"
+  // Annulation encadrée après paiement : l'acheteur demande (ou retire), le vendeur accepte ou refuse.
+  | "request_cancel" | "withdraw_cancel" | "accept_cancel" | "decline_cancel";
+
+/** pending : en attente du vendeur ; accepted : acceptée (commande annulée) ; declined : refusée ; expired : sans réponse dans le délai, traitée comme un refus. */
+export type CancelRequestStatus = "pending" | "accepted" | "declined" | "expired";
 
 export interface OrderView extends Order {
   viewerRole: "buyer" | "seller";
@@ -180,6 +186,8 @@ export interface OrderView extends Order {
   actions: OrderAction[];
   /** Litige ouvert ou clos sur cette commande, s'il y en a un. */
   dispute: { id: string; status: DisputeStatus } | null;
+  /** Dernière demande d'annulation de l'acheteur (null si aucune, ou si elle a été retirée). `expiresAt` : au-delà, elle vaut refus. */
+  cancelRequest: { status: CancelRequestStatus; requestedAt: number; expiresAt: number } | null;
 }
 
 export interface Payment {
