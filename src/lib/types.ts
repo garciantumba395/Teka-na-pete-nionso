@@ -258,8 +258,12 @@ export interface ChatMessage {
   /** true si le message vient du membre qui consulte. */
   mine: boolean;
   /** « system » : message de la plateforme (pas d'expéditeur). */
-  kind: "text" | "system";
+  kind: "text" | "system" | "image";
   body: string;
+  /** Photo jointe (kind « image ») : adresse privée, lisible seulement par les deux participants. */
+  photoUrl: string | null;
+  /** Nom de l'expéditeur (texte alternatif de la photo). null pour un message de la plateforme. */
+  senderName: string | null;
   /** Contient un numéro ou un lien : l'écran affiche un rappel de sécurité. Le message est quand même remis. */
   flagged: boolean;
   createdAt: number;
@@ -295,6 +299,19 @@ export interface DisputeNote {
   createdAt: number;
 }
 
+// ---- agent B : photos de preuve et de messagerie
+/** Photo de preuve d'un litige, avec une note facultative. Jamais présente dans une liste publique. */
+export interface DisputeEvidence {
+  id: string;
+  /** « Assistance » pour l'équipe d'assistance. */
+  authorName: string;
+  mine: boolean;
+  staff: boolean;
+  photoUrl: string;
+  note: string;
+  createdAt: number;
+}
+
 export interface DisputeView {
   id: string;
   orderId: string;
@@ -306,6 +323,8 @@ export interface DisputeView {
   openedAt: number;
   resolvedAt: number | null;
   notes: DisputeNote[];
+  /** Photos de preuve, de la plus ancienne à la plus récente. */
+  evidence: DisputeEvidence[];
   order: { itemTitle: string; totalMinor: number; currency: Currency; buyerName: string; sellerName: string };
   viewerRole: "buyer" | "seller" | "staff";
 }

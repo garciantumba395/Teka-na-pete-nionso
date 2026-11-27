@@ -723,5 +723,142 @@ export function defineContract(label: string, factory: () => Promise<ContractEnv
         expect(await ids({ brand: "100%_" })).toEqual([]);
       });
     });
+
+    // ---- agent B : photos de preuve et de messagerie
+    describe("photos de messages et de preuves de litige", () => {
+      const PNG = `data:image/png;base64,${Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4]).toString("base64")}`;
+      const DISGUISED = `data:image/jpeg;base64,${Buffer.from("ceci est un fichier texte, pas une image").toString("base64")}`;
+      const TOO_BIG = `data:image/jpeg;base64,${Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]), Buffer.alloc(460_000, 1)]).toString("base64")}`;
+      const idOf = (url: string) => url.split("/").pop()!;
+      const support = () => S("user-support-1");
+      const uuid = "11111111-2222-4333-8444-555555555555";
+
+      async function chat(buyerName = "Acheteur Photo", phone = "0821000301") {
+        const seller = await signup(`0811${phone.slice(4)}`, "Vendeur Photo");
+        const buyer = await signup(phone, buyerName);
+        const item = await listing(seller.id);
+        const conv = await data.startConversation(buyer.id, item.id);
+        return { seller, buyer, item, convId: conv.id };
+      }
+      async function disputed() {
+        const { seller, buyer, order } = await paidOrder("Acheteur Preuve", "+243821000302");
+        const dispute = await data.openDispute(order.id, buyer.id, { reason: "not_as_described", description: "La robe ne ressemble pas aux photos." });
+        return { seller, buyer, order, dispute };
+      }
+
+      it("message avec photo : texte facultatif, vu par les deux membres, octets et type vérifiés", async () => {
+        const { seller, buyer, convId } = await chat();
+        const withText = await data.sendPhotoMessage(convId, buyer.id, { body: "Voici la tache", photo: PHOTO });
+        expect(withText).toMatchObject({ kind: "image", mine: true, body: "Voici la tache", senderName: "Acheteur Photo" });
+        expect(withText.photoUrl).toMatch(/^\/api\/v1\/private-photos\/[0-9a-f-]{36}$/);
+        const only = await data.sendPhotoMessage(convId, seller.id, { body: "", photo: PNG });
+        expect(only.body).toBe("");
+        // la messagerie texte garde sa règle : un message vide reste refusé
+        expect(code(await rejects(data.sendMessage(convId, buyer.id, "   ")))).toBe("VALIDATION");
+
+        const view = await data.getConversation(convId, seller.id);
+        const photos = view.messages.filter((m) => m.kind === "image");
+        expect(photos.map((m) => [m.mine, m.senderName, m.body])).toEqual([[false, "Acheteur Photo", "Voici la tache"], [true, "Vendeur Photo", ""]]);
+        expect(view.lastMessage).toBe("Photo");
+        expect((await data.getConversation(convId, buyer.id)).messages.find((m) => m.id === only.id)?.mine).toBe(false);
+
+        const a = await data.getPrivatePhoto(idOf(withText.photoUrl!), seller.id);
+        expect(a?.mime).toBe("image/jpeg");
+        expect(a?.bytes.length).toBeGreaterThan(3);
+        expect((await data.getPrivatePhoto(idOf(only.photoUrl!), buyer.id))?.mime).toBe("image/png");
+        expect((await data.getPrivatePhoto(idOf(withText.photoUrl!), buyer.id))?.mime).toBe("image/jpeg");
+      });
+
+      it("message avec photo : un tiers n'a ni la conversation (404) ni la photo (null), identifiant inconnu = même réponse", async () => {
+        const { buyer, convId } = await chat("Acheteur Secret", "0821000303");
+        const tiers = await signup("0821000304", "Tiers Curieux");
+        const m = await data.sendPhotoMessage(convId, buyer.id, { body: "", photo: PHOTO });
+        expect(code(await rejects(data.sendPhotoMessage(convId, tiers.id, { body: "", photo: PHOTO })))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.getConversation(convId, tiers.id)))).toBe("NOT_FOUND");
+        expect(await data.getPrivatePhoto(idOf(m.photoUrl!), tiers.id)).toBeNull();
+        expect(await data.getPrivatePhoto(uuid, buyer.id)).toBeNull();
+        expect(await data.getPrivatePhoto("pas-un-uuid", buyer.id)).toBeNull();
+        expect(await data.getPrivatePhoto(idOf(m.photoUrl!), uuid)).toBeNull();
+        // jamais dans les listes ni dans le service public des photos d'annonces
+        expect(await data.listConversations(tiers.id)).toEqual([]);
+        expect(await data.getPhoto(idOf(m.photoUrl!))).toBeNull();
+      });
+
+      it("message avec photo : fichier texte déguisé, format inconnu, trop lourd, texte trop long : refusés sans rien stocker", async () => {
+        const { buyer, convId } = await chat("Acheteur Refus", "0821000305");
+        for (const bad of [DISGUISED, TOO_BIG, "data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=", "data:image/gif;base64,R0lGODlhAQABAAAAACw=", "https://exemple.cd/photo.jpg", ""]) {
+          const e = await rejects(data.sendPhotoMessage(convId, buyer.id, { body: "x", photo: bad }));
+          expect(e.code).toBe("VALIDATION");
+          expect(e.details?.photo).toBeTruthy();
+        }
+        expect(code(await rejects(data.sendPhotoMessage(convId, buyer.id, { body: "é".repeat(2001), photo: PHOTO })))).toBe("VALIDATION");
+        expect((await data.getConversation(convId, buyer.id)).messages).toEqual([]);
+      });
+
+      it("message avec photo : refusé si l'autre membre a supprimé son compte", async () => {
+        const { seller, buyer, convId } = await chat("Acheteur Départ", "0821000306");
+        await data.deleteAccount(seller.id);
+        expect(code(await rejects(data.sendPhotoMessage(convId, buyer.id, { body: "", photo: PHOTO })))).toBe("MEMBER_DELETED");
+      });
+
+      it("preuve de litige : les deux parties et l'assistance voient les photos et leurs notes ; un tiers n'y a pas accès", async () => {
+        const { seller, buyer, dispute } = await disputed();
+        const tiers = await signup("0821000307", "Tiers Preuve");
+        const sellerName = seller.displayName;
+        const v1 = await data.addDisputeEvidence(dispute.id, buyer.id, { photo: PHOTO, note: "Le col est déchiré" });
+        expect(v1.evidence).toHaveLength(1);
+        expect(v1.evidence[0]).toMatchObject({ authorName: "Acheteur Preuve", mine: true, staff: false, note: "Le col est déchiré" });
+        await data.addDisputeEvidence(dispute.id, seller.id, { photo: PNG });
+        await data.addDisputeEvidence(dispute.id, support(), { photo: PHOTO, note: "Photo demandée par l'assistance" });
+
+        const forSeller = await data.getDisputeById(dispute.id, seller.id);
+        expect(forSeller.evidence.map((e) => [e.authorName, e.mine, e.staff])).toEqual([["Acheteur Preuve", false, false], [sellerName, true, false], ["Assistance", false, true]]);
+        const forStaff = await data.getDisputeById(dispute.id, support());
+        expect(forStaff.viewerRole).toBe("staff");
+        expect(forStaff.evidence).toHaveLength(3);
+        // les photos de preuve ne s'affichent pas dans les échanges (notes)
+        expect(forStaff.notes).toEqual([]);
+
+        for (const e of forStaff.evidence) {
+          for (const who of [buyer.id, seller.id, support()]) expect(await data.getPrivatePhoto(idOf(e.photoUrl), who)).not.toBeNull();
+          expect(await data.getPrivatePhoto(idOf(e.photoUrl), tiers.id)).toBeNull();
+        }
+        expect(code(await rejects(data.addDisputeEvidence(dispute.id, tiers.id, { photo: PHOTO })))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.getDisputeById(dispute.id, tiers.id)))).toBe("NOT_FOUND");
+        // jamais dans le service public des photos d'annonces
+        expect(await data.getPhoto(idOf(forStaff.evidence[0].photoUrl))).toBeNull();
+      });
+
+      it("preuve de litige : 6 photos au plus par membre et par litige, photo invalide refusée, litige clos refusé", async () => {
+        const { seller, buyer, dispute } = await disputed();
+        const bad = await rejects(data.addDisputeEvidence(dispute.id, buyer.id, { photo: DISGUISED }));
+        expect([bad.code, !!bad.details?.photo]).toEqual(["VALIDATION", true]);
+        expect(code(await rejects(data.addDisputeEvidence(dispute.id, buyer.id, { photo: TOO_BIG })))).toBe("VALIDATION");
+        expect(code(await rejects(data.addDisputeEvidence(dispute.id, buyer.id, { photo: PHOTO, note: "x".repeat(501) })))).toBe("VALIDATION");
+        expect((await data.getDisputeById(dispute.id, buyer.id)).evidence).toEqual([]);
+
+        for (let i = 0; i < 6; i++) await data.addDisputeEvidence(dispute.id, buyer.id, { photo: PHOTO, note: `photo ${i + 1}` });
+        expect(code(await rejects(data.addDisputeEvidence(dispute.id, buyer.id, { photo: PHOTO })))).toBe("EVIDENCE_LIMIT");
+        // la limite est par membre : le vendeur et l'assistance gardent leurs 6
+        await data.addDisputeEvidence(dispute.id, seller.id, { photo: PNG });
+        await data.addDisputeEvidence(dispute.id, support(), { photo: PHOTO });
+        expect((await data.getDisputeById(dispute.id, seller.id)).evidence).toHaveLength(8);
+
+        await data.resolveDispute(support(), dispute.id, "refund_buyer");
+        expect(code(await rejects(data.addDisputeEvidence(dispute.id, seller.id, { photo: PHOTO })))).toBe("INVALID_STATE");
+        // une fois le litige clos, les preuves restent consultables par les participants
+        const closed = await data.getDisputeById(dispute.id, buyer.id);
+        expect(closed.evidence).toHaveLength(8);
+        expect(await data.getPrivatePhoto(idOf(closed.evidence[0].photoUrl), buyer.id)).not.toBeNull();
+      });
+
+      it("preuve de litige : deux envois simultanés ne dépassent pas la limite", async () => {
+        const { buyer, dispute } = await disputed();
+        for (let i = 0; i < 5; i++) await data.addDisputeEvidence(dispute.id, buyer.id, { photo: PHOTO });
+        const results = await Promise.allSettled([data.addDisputeEvidence(dispute.id, buyer.id, { photo: PHOTO }), data.addDisputeEvidence(dispute.id, buyer.id, { photo: PHOTO })]);
+        expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+        expect((await data.getDisputeById(dispute.id, buyer.id)).evidence).toHaveLength(6);
+      });
+    });
   });
 }

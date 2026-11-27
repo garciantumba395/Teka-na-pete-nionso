@@ -115,6 +115,23 @@ export interface DataLayer {
   /** Commandes payées jamais remises depuis trop longtemps (sans litige) : remboursées automatiquement. Retourne leur nombre. */
   expireStalePaidOrders(): Promise<number>;
 
+  // ---- agent B : photos de preuve et de messagerie
+  /**
+   * Message avec UNE photo (data URL JPEG/PNG/WebP, type vérifié sur le contenu), avec ou sans texte.
+   * Mêmes règles d'accès que sendMessage (tiers = 404).
+   */
+  sendPhotoMessage(conversationId: string, senderId: string, input: { body: string; photo: string }): Promise<ChatMessage>;
+  /**
+   * Ajoute une photo de preuve (et une note facultative) à un litige ouvert : parties ou assistance, 6 au plus par membre.
+   * Retourne le litige à jour. Tiers = 404.
+   */
+  addDisputeEvidence(disputeId: string, authorId: string, input: { photo: string; note?: string }): Promise<DisputeView>;
+  /**
+   * Octets d'une photo de message ou de preuve. null (donc 404) si elle n'existe pas OU si `viewerId` n'est pas
+   * participant : un tiers ne peut pas savoir si l'identifiant existe.
+   */
+  getPrivatePhoto(id: string, viewerId: string): Promise<{ mime: string; bytes: Buffer } | null>;
+
   // Avis : une note par membre et par commande terminée.
   createReview(orderId: string, authorId: string, input: { rating: number; comment: string }): Promise<Review>;
   getMyReview(orderId: string, authorId: string): Promise<Review | null>;
