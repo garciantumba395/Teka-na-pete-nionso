@@ -42,7 +42,9 @@ npm test                         # tests unitaires et couche factice (les tests 
 npm run test:pg                  # tout, y compris PostgreSQL, sur une base jetable créée puis supprimée
 npm run typecheck
 npm run build
-npm run e2e                      # parcours Playwright contre un serveur lancé (npm run dev), captures dans replica/clone-screens/
+npm run test:e2e                 # suite Playwright (couche factice) : 95 tests, mobile et bureau, axe inclus
+npm run test:e2e:pg              # la même contre PostgreSQL (base jetable)
+npm run e2e                      # ancien parcours avec captures dans replica/clone-screens/
 ```
 
 Le parcours E2E se lance contre `npm run dev` : `npm start` (production) **refuse** volontairement les fournisseurs factices.

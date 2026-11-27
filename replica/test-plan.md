@@ -9,7 +9,7 @@ Deux exécutions : **couche factice** (`npm run test:e2e`) et **PostgreSQL** (`n
 
 - **type** : H = chemin nominal, E = cas limite, N = cas négatif, G = « écart connu » (fonction non construite, on vérifie seulement que l'écran répond proprement).
 - **auto** : `e2e` = automatisé (Playwright, `e2e/specs/`), `manuel` = à faire à la main (voir fin du document), `—` = sans objet.
-- **résultat** : rempli par `node scripts/plan-results.mjs` depuis le dernier rapport. Une case vide = jamais exécutée.
+- **résultats** : voir « Couverture » en bas de page (le rapport brut est `test-results/report.json`, régénéré à chaque exécution).
 - Les fonctions **non construites** (F03 à F08, sauf routes) ne sont **pas comptées comme réussies** : voir « Couverture ».
 
 ## Flux de la carte de reconnaissance
@@ -173,4 +173,16 @@ Deux exécutions : **couche factice** (`npm run test:e2e`) et **PostgreSQL** (`n
 
 ## Couverture
 
-À remplir après exécution (voir `bugs.md` pour les défauts) : cas exécutés, réussis, échoués, non construits, manuels.
+Exécution du 2026-11-27 sur le build `a00bebe` (95 tests Playwright : projet mobile 390 px + projet bureau 1440 px).
+
+| Cible | Réussis | Échoués | Ignorés |
+| --- | --- | --- | --- |
+| Couche factice (`npm run test:e2e`) | 92 | 0 | 3 |
+| PostgreSQL (`npm run test:e2e:pg`) | 93 | 0 | 2 |
+| Unitaires + contrat des deux couches (`npm run test:pg`) | 133 | 0 | 0 |
+
+- **Ignorés** : par construction (contrôle fait une seule fois, sur mobile ; vérifications de base de données seulement sur PostgreSQL), pas des échecs masqués.
+- **Défauts** : 10 trouvés, 10 corrigés, aucun S1 (voir `bugs.md`). Avant corrections : 14 échecs sur la couche factice, 3 de plus sur PostgreSQL.
+- **Non construits** : F03 à F08 (messagerie, litiges, avis, signalement, retours, favoris) : seuls les écrans « Bientôt disponible » sont testés (`unbuilt.spec.ts`). Ils ne comptent **pas** comme réussis.
+- **Manuels** : les 6 points de la liste ci-dessus, non exécutés.
+- **Pas couvert** : parcours de la messagerie et du coursier (pas construits), paiement réel, performance sur appareil.

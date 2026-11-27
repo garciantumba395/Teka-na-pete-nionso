@@ -75,3 +75,8 @@ Voir `replica/features.csv`. Parité : **39,9 / 100**, **10 des 24 must-haves fa
 - **Identifiants** : les données de référence et de démonstration utilisent maintenant des UUID déterministes (`seedId`). Les anciens liens `area-com-gombe` etc. n'existent plus.
 - **Écarts avec l'architecture** : authentification maison (OTP SMS + sessions en base) au lieu de Supabase Auth ; accès à la base par le serveur seulement, RLS activée sans politique ; photos en base ; frais lus depuis `settings`. Raisons dans `backend.md`.
 - **Reste à la charge de l'équipe** : PSP, fournisseur SMS, projet de base de données, secrets, avis juridique. Le serveur **refuse de servir** en production tant que ce n'est pas branché.
+
+## Mise à jour : `/replica-test` (2026-11-27)
+
+- Suite Playwright de **95 tests** (`e2e/`), plan dans `replica/test-plan.md`, défauts dans `replica/bugs.md` : **10 trouvés et corrigés, aucun S1 ouvert**. Réussie à 100 % sur la couche factice (92 + 3 ignorés) et sur PostgreSQL (93 + 2 ignorés).
+- Les plus utiles : horloge du téléphone fausse (impossible de payer), texte invalide stocké (erreur d'hydratation pour tous les visiteurs, 500 sur PostgreSQL), POST en `text/plain` accepté, lien d'évitement sans effet, débordement à 320 px.
