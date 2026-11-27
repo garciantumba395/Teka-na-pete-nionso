@@ -56,11 +56,15 @@ export function defineA11y(label: string) {
       await check("S11 litige : formulaire", bp, `/orders/${paidId}/dispute`);
       await check("S19 signalement", bp, `/report?type=item&id=${item.id}`);
       await check("S03 recherche avec marque, taille et état", bp, "/search?brand=zephyr&size=M&condition=good&condition=new");
+      await check("S21 notifications (vide)", bp, "/notifications"); // agent C
+      await check("S22 réglages des notifications", bp, "/me/notifications"); // agent C
       // vendeur
       const sp = seller.page;
       await check("S09 commande payée (vendeur, demande d'annulation à traiter + saisie du code)", sp, `/orders/${paidId}`);
       await check("S09 commande payée (vendeur, confirmation d'acceptation)", sp, `/orders/${paidId}`, async () => { await sp.getByRole("button", { name: "Accepter l'annulation" }).click(); await sp.getByRole("alertdialog").first().waitFor(); });
       await check("S04 fiche (propriétaire)", sp, `/items/${item.id}`);
+      await check("S21 notifications (liste, avec pastille de non-lus)", sp, "/notifications"); // agent C : le vendeur a un message non lu et une commande payée
+      await check("S15 mon profil (avec pastille de non-lus)", sp, "/me"); // agent C
       await sp.request.post(`/api/v1/orders/${paidId}/confirm-delivery`, { data: { code } });
       await check("S16 portefeuille (avec solde)", sp, "/wallet");
 

@@ -15,6 +15,7 @@ export default async function MePage() {
   const me = await currentUser();
   if (!me) redirect("/signin?next=/me");
   const orders = await getData().listMyOrders(me.id);
+  const unread = await getData().countUnreadNotifications(me.id);
   return (
     <div className="narrow">
       <AppBar title="Mon profil" />
@@ -25,6 +26,10 @@ export default async function MePage() {
         </div>
 
         <nav aria-label="Mon compte">
+          <Link href="/notifications" className="row row-link">
+            <span className="lead"><Icon name="bell" /> Notifications</span>
+            {unread > 0 ? <><span className="pastille" aria-hidden="true">{unread}</span><span className="sr-only">{`${unread} non lue${unread > 1 ? "s" : ""}`}</span></> : <Icon name="chev" />}
+          </Link>
           <Link href="/wallet" className="row row-link"><span className="lead"><Icon name="wallet" /> Portefeuille</span><Icon name="chev" /></Link>
           <Link href="/sell" className="row row-link"><span className="lead"><Icon name="plus" /> Vendre un article</span><Icon name="chev" /></Link>
           <Link href="/favourites" className="row row-link"><span className="lead"><Icon name="heart" /> Favoris</span><Icon name="chev" /></Link>

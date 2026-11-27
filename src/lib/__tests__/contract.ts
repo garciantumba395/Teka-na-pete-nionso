@@ -18,6 +18,9 @@ export interface ContractEnv {
   pendingEvents(): Promise<ProviderEvent[]>;
   flush(): Promise<void>;
   refunds(): number;
+  /** agent C : SMS « envoyés » par le fournisseur factice, et attente des envois en cours (ils ne bloquent jamais la méthode métier). */
+  sentSms(): { to: string; text: string }[];
+  settleSms(): Promise<void>;
   close?(): Promise<void>;
 }
 
@@ -1410,5 +1413,302 @@ export function defineContract(label: string, factory: () => Promise<ContractEnv
         expect(await ledgerSum("USD")).toBe(0);
       });
     });
+
+    // ---- agent C : notifications
+    describe("notifications", () => {
+      /** SMS de notification seulement : les codes de connexion (inscription des acteurs du test) passent aussi par le fournisseur en PostgreSQL. */
+      const notifSms = () => env.sentSms().filter((s) => !/ton code/.test(s.text));
+      const kinds = async (id: string) => (await data.listNotifications(id)).items.map((n) => n.kind).sort();
+      const marie = () => S("user-marie");
+      const moderator = () => S("user-support-2");
+      const staff = () => S("user-support-1");
+      async function duo(a = "0811000191", b = "0821000192") {
+        const seller = await signup(a, "Vendeuse Notif");
+        const buyer = await signup(b, "Acheteur Notif");
+        const item = await listing(seller.id);
+        return { seller, buyer, item };
+      }
+
+      it("message : une seule notification non lue par conversation, regroupée, jamais pour l'auteur", async () => {
+        const { seller, buyer, item } = await duo();
+        const conv = await data.startConversation(buyer.id, item.id);
+        expect(await kinds(seller.id)).toEqual([]); // ouvrir une conversation ne prévient personne
+        await data.sendMessage(conv.id, buyer.id, "Bonjour, il est disponible ?");
+        await data.sendMessage(conv.id, buyer.id, "Je peux passer demain.");
+        const l = await data.listNotifications(seller.id);
+        expect(l.unreadCount).toBe(1);
+        expect(l.items).toHaveLength(1);
+        expect(l.items[0].kind).toBe("message_received");
+        expect(l.items[0].payload).toMatchObject({ conversationId: conv.id, count: 2, senderName: "Acheteur Notif" });
+        expect(await kinds(buyer.id)).toEqual([]); // l'auteur n'est jamais prévenu de son propre message
+        await data.sendMessage(conv.id, seller.id, "Oui, à Gombe.");
+        expect(await kinds(buyer.id)).toEqual(["message_received"]);
+        expect((await data.listNotifications(seller.id)).items).toHaveLength(1);
+        // ouvrir la conversation lit sa notification ; le message suivant en crée une nouvelle
+        await data.getConversation(conv.id, seller.id);
+        expect((await data.listNotifications(seller.id)).unreadCount).toBe(0);
+        await data.sendMessage(conv.id, buyer.id, "Parfait, merci.");
+        const again = await data.listNotifications(seller.id);
+        expect(again.unreadCount).toBe(1);
+        expect(again.items).toHaveLength(2);
+        expect(again.items[0].read).toBe(false); // non lues d'abord
+        expect(again.items[0].payload.count).toBe(1);
+      });
+
+      it("commande payée : le vendeur est prévenu une seule fois, même si l'événement du PSP est rejoué ; pas l'acheteur", async () => {
+        const seller = (await data.getUser(marie()))!;
+        const buyer = await signup("+243821000301", "Acheteur P1");
+        const item = await listing(seller.id);
+        const order = await data.createOrder(buyer.id, { itemIds: [item.id], deliveryMethod: "hand_delivery" });
+        expect(await kinds(seller.id)).toEqual([]); // réservé mais pas encore payé
+        await data.startPayment(order.id, buyer.id, { method: "mpesa", msisdn: "0821111111", idempotencyKey: `k-${order.id}` });
+        const [ev] = await env.pendingEvents();
+        await env.flush();
+        expect(await kinds(seller.id)).toEqual(["order_paid"]);
+        expect((await data.listNotifications(seller.id)).items[0].payload).toMatchObject({ orderId: order.id, role: "seller", itemTitle: "Robe test" });
+        expect(await kinds(buyer.id)).toEqual([]);
+        expect((await data.handleProviderEvent(ev)).duplicate).toBe(true);
+        expect((await data.handleProviderEvent({ ...ev, eventId: "autre-evt" })).duplicate).toBe(true);
+        expect(await kinds(seller.id)).toEqual(["order_paid"]);
+      });
+
+      it("remise confirmée : l'acheteur est prévenu (pas le vendeur, auteur) ; avis : la cible seulement", async () => {
+        const { seller, buyer, order } = await paidOrder("Acheteur P2", "+243821000302");
+        await data.confirmDelivery(order.id, seller.id, deriveHandoverCode(order.id));
+        expect(await kinds(buyer.id)).toEqual(["order_completed"]);
+        expect((await data.listNotifications(buyer.id)).items[0].payload).toMatchObject({ role: "buyer", orderId: order.id });
+        expect(await kinds(seller.id)).toEqual(["order_paid"]);
+        await data.createReview(order.id, buyer.id, { rating: 4, comment: "Très bien." });
+        expect(await kinds(seller.id)).toEqual(["order_paid", "review_received"]);
+        expect((await data.listNotifications(seller.id)).items.find((n) => n.kind === "review_received")!.payload.rating).toBe(4);
+        expect(await kinds(buyer.id)).toEqual(["order_completed"]);
+      });
+
+      it("annulation : seule l'autre partie est prévenue ; expiration : les deux, une seule fois", async () => {
+        const { seller, buyer, item } = await duo("0811000193", "0821000194");
+        const o1 = await data.createOrder(buyer.id, { itemIds: [item.id], deliveryMethod: "hand_delivery" });
+        await data.cancelOrder(o1.id, buyer.id);
+        expect(await kinds(seller.id)).toEqual(["order_cancelled"]);
+        expect(await kinds(buyer.id)).toEqual([]);
+        const o2 = await data.createOrder(buyer.id, { itemIds: [item.id], deliveryMethod: "hand_delivery" });
+        env.advance(FEES.orderPaymentTtlMs + 1);
+        expect(await data.expireUnpaidOrders()).toBe(1);
+        expect(await data.expireUnpaidOrders()).toBe(0);
+        expect(await kinds(seller.id)).toEqual(["order_cancelled", "order_expired"]);
+        expect(await kinds(buyer.id)).toEqual(["order_expired"]);
+        expect((await data.listNotifications(buyer.id)).items[0].payload).toMatchObject({ orderId: o2.id, role: "buyer" });
+      });
+
+      it("commande payée annulée par le vendeur : l'acheteur est prévenu et remboursé ; jamais d'auto-notification", async () => {
+        const { seller, buyer, order } = await paidOrder("Acheteur P3", "+243821000303");
+        await data.cancelOrder(order.id, seller.id);
+        const n = (await data.listNotifications(buyer.id)).items;
+        expect(n.map((x) => x.kind)).toEqual(["order_cancelled"]);
+        expect(n[0].payload).toMatchObject({ role: "buyer", refunded: true });
+        expect((await kinds(seller.id)).includes("order_cancelled")).toBe(false);
+      });
+
+      it("commande payée jamais remise, remboursée automatiquement : les deux parties sont prévenues", async () => {
+        const { seller, buyer, order } = await paidOrder("Acheteur P4", "+243821000304");
+        env.advance(FEES.unhandedOrderMs + 1000);
+        expect(await data.expireStalePaidOrders()).toBe(1);
+        expect(await data.expireStalePaidOrders()).toBe(0);
+        expect((await data.listNotifications(buyer.id)).items.map((n) => [n.kind, n.payload.auto])).toEqual([["order_cancelled", true]]);
+        expect((await kinds(seller.id)).filter((k) => k === "order_cancelled")).toHaveLength(1);
+        void order;
+      });
+
+      it("litige : ouverture (l'autre partie), messages (l'autre partie ; assistance : les deux), résolution (les deux, pas l'assistance)", async () => {
+        const { seller, buyer, order } = await paidOrder("Acheteur L9", "+243821000309", 10_000);
+        const d = await data.openDispute(order.id, buyer.id, { reason: "not_received", description: "Le vendeur ne s'est pas présenté." });
+        expect((await kinds(seller.id)).filter((k) => k === "dispute_opened")).toHaveLength(1);
+        expect(await kinds(buyer.id)).toEqual([]);
+        await data.addDisputeNote(d.id, seller.id, "J'étais bien au rendez-vous.");
+        expect(await kinds(buyer.id)).toEqual(["dispute_message"]);
+        expect((await kinds(seller.id)).includes("dispute_message")).toBe(false);
+        await data.addDisputeNote(d.id, staff(), "Pouvez-vous envoyer une preuve ?");
+        expect((await kinds(buyer.id)).filter((k) => k === "dispute_message")).toHaveLength(2);
+        expect((await kinds(seller.id)).filter((k) => k === "dispute_message")).toHaveLength(1);
+        expect(await kinds(staff())).toEqual([]);
+        await data.resolveDispute(staff(), d.id, "refund_buyer", "Remboursement.");
+        for (const id of [buyer.id, seller.id]) {
+          const r = (await data.listNotifications(id)).items.filter((n) => n.kind === "dispute_resolved");
+          expect(r).toHaveLength(1);
+          expect(r[0].payload).toMatchObject({ disputeId: d.id, orderId: order.id, outcome: "refund_buyer" });
+        }
+        expect(await kinds(staff())).toEqual([]);
+      });
+
+      it("signalement traité : le signaleur est remercié sans détail ; suspension : le membre suspendu est prévenu", async () => {
+        const reporter = await signup("0821000195", "Signaleur N");
+        const target = await signup("0811000196", "Vendeur Signalé");
+        const it2 = await listing(target.id);
+        const r1 = await data.createReport(reporter.id, { targetType: "user", targetId: target.id, reason: "scam", details: "Détail confidentiel du signalement" });
+        expect(await kinds(reporter.id)).toEqual([]);
+        await data.handleReport(moderator(), r1.id, "suspend_user");
+        const mine = (await data.listNotifications(reporter.id)).items;
+        expect(mine.map((n) => n.kind)).toEqual(["report_handled"]);
+        expect(mine[0].payload).toEqual({}); // aucun détail sur la décision
+        const sus = (await data.listNotifications(target.id)).items;
+        expect(sus.map((n) => n.kind)).toEqual(["suspension"]);
+        expect(sus[0].payload.until).toBe(env.now() + 7 * 86_400_000);
+        const r2 = await data.createReport(reporter.id, { targetType: "item", targetId: it2.id, reason: "other", details: "" });
+        await data.handleReport(moderator(), r2.id, "dismiss");
+        expect(await kinds(reporter.id)).toEqual(["report_handled", "report_handled"]);
+        expect(await kinds(moderator())).toEqual([]);
+      });
+
+      it("lecture : marquer lue est idempotent, tout marquer comme lu, non lues d'abord", async () => {
+        const seller = await signup("0811000197", "Vendeuse Lecture");
+        const buyer = await signup("0821000198", "Acheteur Lecture");
+        const a = await listing(seller.id, { title: "Robe A" });
+        const b = await listing(seller.id, { title: "Robe B" });
+        const ca = await data.startConversation(buyer.id, a.id);
+        const cb = await data.startConversation(buyer.id, b.id);
+        await data.sendMessage(ca.id, buyer.id, "Question A");
+        env.advance(1000);
+        await data.sendMessage(cb.id, buyer.id, "Question B");
+        const l = await data.listNotifications(seller.id);
+        expect(l.items.map((n) => n.payload.itemTitle)).toEqual(["Robe B", "Robe A"]); // plus récente d'abord
+        await data.markNotificationRead(seller.id, l.items[0].id);
+        await data.markNotificationRead(seller.id, l.items[0].id); // idempotent
+        expect(await data.countUnreadNotifications(seller.id)).toBe(1);
+        const after = await data.listNotifications(seller.id);
+        expect(after.items.map((n) => n.read)).toEqual([false, true]); // non lues d'abord
+        expect(after.unreadCount).toBe(1);
+        expect(await data.markAllNotificationsRead(seller.id)).toBe(1);
+        expect(await data.markAllNotificationsRead(seller.id)).toBe(0);
+        expect(await data.countUnreadNotifications(seller.id)).toBe(0);
+      });
+
+      it("isolation : un membre ne voit ni ne modifie les notifications d'un autre (404, liste vide)", async () => {
+        const { seller, buyer, item } = await duo("0811000199", "0821000200");
+        const conv = await data.startConversation(buyer.id, item.id);
+        await data.sendMessage(conv.id, buyer.id, "Bonjour");
+        const tiers = await signup("0831000201", "Tiers Notif");
+        const id = (await data.listNotifications(seller.id)).items[0].id;
+        expect(code(await rejects(data.markNotificationRead(tiers.id, id)))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.markNotificationRead(buyer.id, id)))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.markNotificationRead(seller.id, "00000000-0000-4000-8000-000000000000")))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.markNotificationRead(seller.id, "pas-un-identifiant")))).toBe("NOT_FOUND");
+        expect((await data.listNotifications(tiers.id))).toEqual({ items: [], unreadCount: 0 });
+        expect(await data.markAllNotificationsRead(tiers.id)).toBe(0);
+        expect((await data.listNotifications(seller.id)).unreadCount).toBe(1); // intacte
+      });
+
+      it("SMS : commande payée (vendeur) et litige ouvert ou résolu, texte court sans donnée sensible ; rien pour messages, avis, annulation", async () => {
+        const seller = (await data.getUser(marie()))!;
+        const { buyer, order } = await paidOrder("Acheteur S1", "+243821000311", 12_345);
+        await env.settleSms();
+        expect(notifSms().map((s) => s.to)).toEqual([seller.phone]);
+        const code6 = deriveHandoverCode(order.id);
+        const d = await data.openDispute(order.id, buyer.id, { reason: "damaged", description: "Écran fissuré à la remise." });
+        await env.settleSms();
+        expect(notifSms().map((s) => s.to)).toEqual([seller.phone, seller.phone]);
+        await data.resolveDispute(staff(), d.id, "release_seller", "Paiement du vendeur.");
+        await env.settleSms();
+        expect(notifSms().map((s) => s.to).sort()).toEqual([seller.phone, seller.phone, seller.phone, (await data.getUser(buyer.id))!.phone].sort());
+        for (const s of notifSms()) {
+          expect(s.text.length).toBeLessThanOrEqual(160);
+          expect(s.text).not.toContain(code6);
+          expect(s.text).not.toMatch(/\d/); // ni montant, ni code, ni numéro
+          expect(s.text).not.toMatch(/Robe test|Acheteur S1|Marie/);
+        }
+        // pas de SMS pour un message, un avis ni une annulation
+        const before = notifSms().length;
+        const conv = await data.startConversation(buyer.id, (await listing(seller.id)).id);
+        await data.sendMessage(conv.id, buyer.id, "Bonjour");
+        await data.createReview(order.id, buyer.id, { rating: 5, comment: "" });
+        const o2 = await data.createOrder(buyer.id, { itemIds: [(await listing(seller.id)).id], deliveryMethod: "hand_delivery" });
+        await data.cancelOrder(o2.id, buyer.id);
+        await env.settleSms();
+        expect(notifSms()).toHaveLength(before);
+      });
+
+      it("préférences SMS : par catégorie ; désactivés, plus de SMS mais la notification interne reste ; les valeurs invalides sont ignorées", async () => {
+        const seller = (await data.getUser(marie()))!;
+        expect(await data.getNotificationPreferences(seller.id)).toEqual({ orders: true, disputes: true });
+        expect(await data.updateNotificationPreferences(seller.id, { orders: false })).toEqual({ orders: false, disputes: true });
+        expect(await data.getNotificationPreferences(seller.id)).toEqual({ orders: false, disputes: true });
+        const { buyer, order } = await paidOrder("Acheteur S2", "+243821000312");
+        await env.settleSms();
+        expect(notifSms()).toHaveLength(0);
+        expect(await kinds(seller.id)).toEqual(["order_paid"]);
+        // les litiges restent activés
+        await data.openDispute(order.id, buyer.id, { reason: "other", description: "Un autre problème à signaler." });
+        await env.settleSms();
+        expect(notifSms()).toHaveLength(1);
+        // couper les litiges aussi, puis réactiver les commandes
+        expect(await data.updateNotificationPreferences(seller.id, { disputes: false })).toEqual({ orders: false, disputes: false });
+        expect(await data.updateNotificationPreferences(seller.id, { orders: true })).toEqual({ orders: true, disputes: false });
+        await paidOrder("Acheteur S3", "+243821000313");
+        await env.settleSms();
+        expect(notifSms()).toHaveLength(2);
+        // les préférences d'un membre n'affectent pas celles d'un autre ; compte inconnu : 404
+        const autre = await signup("0831000202", "Autre Pref");
+        expect(await data.getNotificationPreferences(autre.id)).toEqual({ orders: true, disputes: true });
+        expect(code(await rejects(data.getNotificationPreferences(S("user-inconnu"))))).toBe("NOT_FOUND");
+      });
+
+      it("SMS : plafond quotidien par numéro (les notifications internes continuent), puis reprise le lendemain", async () => {
+        const seller = (await data.getUser(marie()))!;
+        for (let i = 0; i < 6; i++) await paidOrder(`Acheteur Q${i}`, `+24382100033${i}`);
+        await env.settleSms();
+        expect(notifSms()).toHaveLength(5);
+        expect((await kinds(seller.id)).filter((k) => k === "order_paid")).toHaveLength(6);
+        env.advance(86_400_000 + 1000);
+        await paidOrder("Acheteur Q9", "+243821000339");
+        await env.settleSms();
+        expect(notifSms()).toHaveLength(6);
+      });
+
+      it("un échec d'envoi SMS ne casse jamais l'événement métier", async () => {
+        const seller = (await data.getUser(marie()))!;
+        // On fait échouer le fournisseur SMS le temps de l'événement.
+        const provider = (data as unknown as { __sms: { send(to: string, text: string): Promise<void> } }).__sms;
+        const original = provider.send.bind(provider);
+        provider.send = async (to, text) => { if (/ton code/.test(text)) return original(to, text); throw new Error("fournisseur indisponible"); }; // les codes de connexion passent encore (inscriptions du test)
+        try {
+          const { order } = await paidOrder("Acheteur S4", "+243821000314");
+          await env.settleSms();
+          expect((await data.getOrder(order.id, seller.id)).status).toBe("paid");
+          expect(await kinds(seller.id)).toEqual(["order_paid"]);
+        } finally {
+          provider.send = original;
+        }
+      });
+
+      it("membre supprimé : ses notifications disparaissent et il n'en reçoit plus", async () => {
+        const { seller, buyer, order } = await paidOrder("Acheteur D1", "+243821000321");
+        await data.confirmDelivery(order.id, seller.id, deriveHandoverCode(order.id));
+        expect(await kinds(buyer.id)).toEqual(["order_completed"]);
+        await data.deleteAccount(buyer.id);
+        expect(await data.listNotifications(buyer.id)).toEqual({ items: [], unreadCount: 0 });
+        await data.createReview(order.id, seller.id, { rating: 5, comment: "Acheteur ponctuel." }); // la cible est supprimée : aucune erreur
+        expect(await data.listNotifications(buyer.id)).toEqual({ items: [], unreadCount: 0 });
+        await env.settleSms();
+        expect(notifSms().filter((s) => s.to === "+243821000321")).toEqual([]);
+      });
+
+      it("rétention : seules les notifications LUES depuis plus de 90 jours sont supprimées", async () => {
+        const seller = await signup("0811000203", "Vendeuse Purge");
+        const buyer = await signup("0821000204", "Acheteur Purge");
+        const a = await listing(seller.id, { title: "Robe PA" });
+        const b = await listing(seller.id, { title: "Robe PB" });
+        const ca = await data.startConversation(buyer.id, a.id);
+        const cb = await data.startConversation(buyer.id, b.id);
+        await data.sendMessage(ca.id, buyer.id, "A");
+        await data.sendMessage(cb.id, buyer.id, "B");
+        await data.getConversation(ca.id, seller.id); // A lue maintenant, B reste non lue
+        env.advance(89 * 86_400_000);
+        expect(await data.purgeOldNotifications()).toBe(0);
+        env.advance(2 * 86_400_000);
+        expect(await data.purgeOldNotifications()).toBe(1);
+        const left = await data.listNotifications(seller.id);
+        expect(left.items.map((n) => n.payload.itemTitle)).toEqual(["Robe PB"]); // la non lue est conservée, quel que soit son âge
+        expect(await data.purgeOldNotifications()).toBe(0);
+      });
+    });
+    // ---- fin agent C : notifications
   });
 }

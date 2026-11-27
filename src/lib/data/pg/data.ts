@@ -13,6 +13,10 @@ import type { PaymentProvider } from "../../payments/provider";
 import { detectOffPlatform, MESSAGE_MAX } from "../../messaging";
 import { normalizeDrcPhone } from "../../phone";
 import { decodePhotoDataUrl, MAX_EVIDENCE_PER_MEMBER, PHOTO_INVALID_MESSAGE, privatePhotoUrl } from "../../photos";
+import {
+  DEFAULT_SMS_PREFERENCES, NOTIFICATIONS_PAGE_LIMIT, NOTIFICATIONS_RETENTION_DAYS, SMS_DAILY_LIMIT, SMS_KIND_CATEGORY, smsText,
+  type NotificationItem, type NotificationKind, type NotifySpec, type SmsPreferences,
+} from "../../notifications";
 import { ConsoleSmsProvider, type SmsProvider } from "../../sms/provider";
 import {
   AppError, type Area, type Category, type ChatMessage, type Condition, type ConversationSummary, type DisputeNote, type DisputeOutcome, type DisputeSummary, type DisputeView, type ReportAction, type ReportView, type Review, type UserRole, type Currency, type Item, type ItemCard, type ItemDetail, type LedgerEntry, type Order, type OrderAction, type OrderView, type CancelRequestStatus, type Payment, type PaymentMethod, type DisputeEvidence,
@@ -46,6 +50,8 @@ export interface PgData extends DataLayer {
   __flush(): Promise<void>;
   __provider: PaymentProvider;
   __sms: SmsProvider;
+  /** Attend la fin des envois SMS de notification en cours (ils ne bloquent jamais les méthodes métier). */
+  __settleSms(): Promise<void>;
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -187,8 +193,22 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
 
   /** Libère les commandes dont le délai de paiement est dépassé. Les triggers de la base remettent les articles en vente. */
   async function expireUnpaid(q: Queryable): Promise<number> {
-    const r = await q.query(`update orders set status = 'expired' where status = 'pending_payment' and payment_expires_at < $1`, [ts(now())]);
-    return r.rowCount ?? 0;
+    // agent C : les notifications des deux parties sont créées par la MÊME instruction que l'expiration (atomique, idempotente par clé d'événement).
+    const r = await q.query(
+      `with e as (
+         update orders set status = 'expired' where status = 'pending_payment' and payment_expires_at < $1 returning id, buyer_id, seller_id
+       ), ins as (
+         insert into notifications (user_id, kind, payload, event_key, created_at)
+         select u.uid, 'order_expired',
+                jsonb_build_object('orderId', e.id, 'role', u.role,
+                  'itemTitle', (select i.title from order_items oi join items i on i.id = oi.item_id where oi.order_id = e.id order by i.id limit 1)),
+                'order_expired:' || e.id, $1
+         from e cross join lateral (values (e.buyer_id, 'buyer'), (e.seller_id, 'seller')) as u(uid, role)
+         join profiles p on p.id = u.uid and p.deleted_at is null
+         on conflict (user_id, event_key) where event_key is not null do nothing
+       )
+       select count(*)::int as n from e`, [ts(now())]);
+    return r.rows[0]?.n ?? 0;
   }
 
   // ---- agent D : livraison par coursier
@@ -368,9 +388,88 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
     return pay?.provider_ref ? { providerRef: pay.provider_ref, amountMinor: pay.amount_minor } : null;
   }
 
+  // ---- agent C : notifications
+  interface SmsJob { id: string; userId: string; kind: NotificationKind }
+  const smsInFlight = new Set<Promise<void>>();
+
+  async function orderTitleOf(q: Queryable, orderId: string): Promise<string> {
+    const r = await q.query(`select i.title from order_items oi join items i on i.id = oi.item_id where oi.order_id = $1 order by i.id limit 1`, [orderId]);
+    return r.rows[0]?.title ?? "Article";
+  }
+
+  /**
+   * Crée, fusionne ou ignore une notification, DANS la transaction de l'événement (q = le client de la transaction).
+   * Jamais pour un membre supprimé ou inconnu (la jointure sur profiles ne renvoie alors aucune ligne).
+   *  - eventKey : unique par (membre, clé) : rejouer l'événement ne crée aucun doublon ;
+   *  - groupKey : une seule notification non lue par (membre, groupe), incrémentée à chaque arrivée.
+   * Si la notification est NOUVELLE et critique, elle est ajoutée à `jobs` : le SMS part APRÈS la validation de la transaction.
+   */
+  async function notifyTx(q: Queryable, spec: NotifySpec, jobs?: SmsJob[]): Promise<void> {
+    if (!isUuid(spec.userId)) return;
+    const at = ts(now());
+    let id: string | undefined;
+    if (spec.groupKey) {
+      const r = await q.query(
+        `insert into notifications (user_id, kind, payload, group_key, created_at)
+         select $1::uuid, $2::text, $3::jsonb, $4::text, $5::timestamptz from profiles where id = $1::uuid and deleted_at is null
+         on conflict (user_id, group_key) where group_key is not null and read_at is null
+         do update set payload = notifications.payload || (excluded.payload - 'count')
+                              || jsonb_build_object('count', coalesce((notifications.payload->>'count')::int, 1) + 1),
+                       created_at = excluded.created_at
+         returning id, (xmax = 0) as fresh`,
+        [spec.userId, spec.kind, JSON.stringify({ ...spec.payload, count: 1 }), spec.groupKey, at]);
+      if (r.rows[0]?.fresh) id = r.rows[0].id;
+    } else {
+      const r = await q.query(
+        `insert into notifications (user_id, kind, payload, event_key, created_at)
+         select $1::uuid, $2::text, $3::jsonb, $4::text, $5::timestamptz from profiles where id = $1::uuid and deleted_at is null
+         on conflict (user_id, event_key) where event_key is not null do nothing
+         returning id`,
+        [spec.userId, spec.kind, JSON.stringify(spec.payload), spec.eventKey ?? null, at]);
+      id = r.rows[0]?.id;
+    }
+    if (id && jobs && SMS_KIND_CATEGORY[spec.kind]) jobs.push({ id, userId: spec.userId, kind: spec.kind });
+  }
+
+  /** Les deux parties d'une commande, sauf l'auteur de l'action (`except`). */
+  async function notifyParties(q: Queryable, o: Order, make: (role: "buyer" | "seller") => Omit<NotifySpec, "userId">, jobs?: SmsJob[], except?: string) {
+    for (const [uid, role] of [[o.buyerId, "buyer"], [o.sellerId, "seller"]] as const) {
+      if (uid !== except) await notifyTx(q, { ...make(role), userId: uid }, jobs);
+    }
+  }
+
+  /** Envoi des SMS critiques : HORS transaction, jamais bloquant, jamais d'erreur remontée à l'appelant. Préférences, plafond quotidien et membre supprimé vérifiés ici. */
+  function fireSms(jobs: SmsJob[]) {
+    for (const j of jobs) {
+      const category = SMS_KIND_CATEGORY[j.kind];
+      const text = smsText(j.kind);
+      if (!category || !text) continue;
+      const p: Promise<void> = (async () => {
+        try {
+          const r = (await pool.query(
+            `select p.phone, coalesce(np.sms_orders, true) as sms_orders, coalesce(np.sms_disputes, true) as sms_disputes
+             from profiles p left join notification_preferences np on np.user_id = p.id where p.id = $1 and p.deleted_at is null`, [j.userId])).rows[0];
+          if (!r?.phone) return;
+          if (!(category === "orders" ? r.sms_orders : r.sms_disputes)) return;
+          const rl = await api.rateLimit(`sms:notif:${sha256(r.phone).slice(0, 24)}`, SMS_DAILY_LIMIT, 86_400);
+          if (!rl.allowed) return;
+          await sms.send(r.phone, text);
+          await pool.query(`update notifications set channels_sent = array_append(channels_sent, 'sms') where id = $1`, [j.id]);
+        } catch (e) {
+          console.error("[notifications] SMS non envoyé", (e as Error).message);
+        }
+      })().finally(() => smsInFlight.delete(p));
+      smsInFlight.add(p);
+    }
+  }
+  // ---- fin agent C : notifications
+
   const api: PgData = {
     __provider: provider,
     __sms: sms,
+    async __settleSms() {
+      while (smsInFlight.size) await Promise.all([...smsInFlight]);
+    },
     __pendingEvents: () => [...queue],
     async __flush() {
       while (queue.length) await api.handleProviderEvent(queue.shift()!);
@@ -508,6 +607,7 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
         await c.query(`delete from favourites where user_id = $1`, [userId]);
         await c.query(`delete from devices where user_id = $1`, [userId]);
         await c.query(`delete from notifications where user_id = $1`, [userId]);
+        await c.query(`delete from notification_preferences where user_id = $1`, [userId]);
         await c.query(`delete from identity_verifications where user_id = $1`, [userId]);
         await c.query(
           `update profiles set display_name = 'Membre supprimé', bio = '', phone = null, avatar_path = null, area_id = null, deleted_at = $2 where id = $1`,
@@ -879,6 +979,7 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
         await c.query(`update orders set status = 'completed', completed_at = $2 where id = $1`, [orderId, ts(now())]);
         await closePendingTx(c, orderId); // agent A : le code vaut acceptation, la demande d'annulation est close
         await post(c, releaseEntries(ctx("order", orderId, order.currency), { sellerId: order.sellerId, itemsMinor: order.itemsMinor, shippingMinor: order.shippingMinor, feeMinor: order.protectionFeeMinor }));
+        await notifyTx(c, { userId: order.buyerId, kind: "order_completed", payload: { orderId, itemTitle: await orderTitleOf(c, orderId), role: "buyer" }, eventKey: `order_completed:${orderId}` });
         return { ok: true };
       });
       if ("err" in out) throw out.err;
@@ -892,6 +993,7 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
         if (order.status !== "delivered") throw new AppError("INVALID_STATE", "Tu pourras accepter l'article une fois qu'il est livré.", 409);
         await c.query(`update orders set status = 'completed', completed_at = $2 where id = $1`, [orderId, ts(now())]);
         await post(c, releaseEntries(ctx("order", orderId, order.currency), { sellerId: order.sellerId, itemsMinor: order.itemsMinor, shippingMinor: order.shippingMinor, feeMinor: order.protectionFeeMinor }));
+        await notifyTx(c, { userId: order.sellerId, kind: "order_completed", payload: { orderId, itemTitle: await orderTitleOf(c, orderId), role: "seller" }, eventKey: `order_completed:${orderId}` });
       });
       return buildView(pool, await loadOrder(pool, orderId), buyerId);
     },
@@ -920,6 +1022,11 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
         } else {
           throw new AppError("INVALID_STATE", "Cette commande ne peut plus être annulée.", 409);
         }
+        const other = actorId === order.buyerId ? order.sellerId : order.buyerId;
+        await notifyTx(c, {
+          userId: other, kind: "order_cancelled", eventKey: `order_cancelled:${orderId}`,
+          payload: { orderId, itemTitle: await orderTitleOf(c, orderId), role: other === order.buyerId ? "buyer" : "seller", refunded: order.status !== "pending_payment" },
+        });
       });
       if (refund) await refundAtProvider(refund);
       return buildView(pool, await loadOrder(pool, orderId), actorId);
@@ -971,6 +1078,7 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
 
     async handleProviderEvent(ev) {
       let refund: { providerRef: string; amountMinor: number } | null = null;
+      const jobs: SmsJob[] = [];
       const res = await withTx<{ duplicate: boolean; matched: boolean }>(pool, async (c) => {
         // Référence inconnue : on n'enregistre PAS l'événement, il pourra être rejoué (le PSP répond parfois avant
         // que notre référence soit écrite, l'appel au fournisseur se faisant hors transaction).
@@ -999,6 +1107,7 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
             const sh = (await c.query(`insert into shipments (order_id, method, status, handover_code_hash) values ($1,$2,'pending',$3) returning id`,
               [order.id, order.deliveryMethod, order.deliveryMethod === "courier" ? null : hashCode(deriveHandoverCode(order.id))])).rows[0];
             if (order.deliveryMethod === "courier") await logShipment(c, sh.id, order.id, "paid", null);
+            await notifyTx(c, { userId: order.sellerId, kind: "order_paid", payload: { orderId: order.id, itemTitle: await orderTitleOf(c, order.id), role: "seller" }, eventKey: `order_paid:${order.id}` }, jobs);
           } else {
             // Paiement arrivé APRÈS expiration ou annulation : on ne garde jamais l'argent, remboursement automatique.
             await post(c, holdEntries(ctx("payment", pay.id, order.currency), pay.amount_minor));
@@ -1022,6 +1131,7 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
         await c.query(`update webhook_events set processed_at = $3 where provider = $1 and event_id = $2`, [provider.name, ev.eventId, ts(now())]);
         return { duplicate: false, matched: true };
       });
+      fireSms(jobs);
       if (refund) await refundAtProvider(refund);
       return res;
     },
@@ -1071,6 +1181,7 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
       const c = (await pool.query(`select id from conversations where id = $1 and (buyer_id = $2 or seller_id = $2)`, [conversationId, viewerId])).rows[0];
       if (!c) throw notFound("Conversation");
       await pool.query(`update messages set read_at = $3 where conversation_id = $1 and read_at is null and sender_id is distinct from $2`, [conversationId, viewerId, ts(now())]);
+      await pool.query(`update notifications set read_at = $2 where user_id = $1 and group_key = $3 and read_at is null`, [viewerId, ts(now()), `conv:${conversationId}`]); // agent C : ouvrir la conversation lit sa notification
       const summary = (await api.listConversations(viewerId)).find((s) => s.id === conversationId);
       if (!summary) throw notFound("Conversation");
       const msgs = await pool.query(
@@ -1101,6 +1212,11 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
           `insert into messages (conversation_id, sender_id, kind, body, flagged, flag_reason, created_at) values ($1, $2, 'text', $3, $4, $5, $6) returning id`,
           [conversationId, senderId, text, flagged !== null, flagged, at])).rows[0];
         await tx.query(`update conversations set last_message_at = $2 where id = $1`, [conversationId, at]);
+        const other = c.buyer_id === senderId ? c.seller_id : c.buyer_id;
+        const info = (await tx.query(
+          `select (select title from items where id = cv.item_id) as title, (select display_name from profiles where id = $2) as sender from conversations cv where cv.id = $1`,
+          [conversationId, senderId])).rows[0];
+        await notifyTx(tx, { userId: other, kind: "message_received", payload: { conversationId, itemTitle: info?.title ?? "Article", senderName: info?.sender ?? "Un membre" }, groupKey: `conv:${conversationId}` });
         return m;
       });
       const me = (await pool.query(`select display_name from profiles where id = $1`, [senderId])).rows[0];
@@ -1182,6 +1298,7 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
     async openDispute(orderId, userId, input) {
       if (!isUuid(orderId) || !isUuid(userId)) throw notFound("Commande");
       const text = input.description.trim();
+      const jobs: SmsJob[] = [];
       const id = await withTx(pool, async (c) => {
         const order = await loadOrder(c, orderId, true);
         if (order.buyerId !== userId && order.sellerId !== userId) throw notFound("Commande");
@@ -1198,8 +1315,11 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
         const d = (await c.query(
           `insert into disputes (order_id, opened_by, reason, description, status, opened_at, updated_at) values ($1,$2,$3,$4,'open',$5,$5) returning id`,
           [orderId, userId, input.reason, text, ts(now())])).rows[0];
+        const other = userId === order.buyerId ? order.sellerId : order.buyerId;
+        await notifyTx(c, { userId: other, kind: "dispute_opened", payload: { orderId, disputeId: d.id, itemTitle: await orderTitleOf(c, orderId) }, eventKey: `dispute_opened:${d.id}` }, jobs);
         return d.id as string;
       });
+      fireSms(jobs);
       return disputeViewOf(pool, id, userId);
     },
 
@@ -1220,7 +1340,12 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
       if (v.status !== "open") throw new AppError("INVALID_STATE", "Ce litige est clos.", 409);
       const text = note.trim();
       if (text.length < 1 || text.length > 1000) throw new AppError("VALIDATION", "Un message fait entre 1 et 1 000 caractères.", 422, { note: "Un message fait entre 1 et 1 000 caractères." });
-      await pool.query(`insert into dispute_evidence (dispute_id, author_id, note, created_at) values ($1,$2,$3,$4)`, [disputeId, authorId, text, ts(now())]);
+      await withTx(pool, async (c) => {
+        const ev = (await c.query(`insert into dispute_evidence (dispute_id, author_id, note, created_at) values ($1,$2,$3,$4) returning id`, [disputeId, authorId, text, ts(now())])).rows[0];
+        const order = await loadOrder(c, (await c.query(`select order_id from disputes where id = $1`, [disputeId])).rows[0].order_id);
+        const title = await orderTitleOf(c, order.id);
+        await notifyParties(c, order, () => ({ kind: "dispute_message", payload: { orderId: order.id, disputeId, itemTitle: title }, eventKey: `dispute_message:${ev.id}` }), undefined, authorId);
+      });
       return disputeViewOf(pool, disputeId, authorId);
     },
 
@@ -1237,6 +1362,7 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
       await requireRole(pool, staffId, ["support", "admin"]);
       if (!isUuid(disputeId)) throw notFound("Litige");
       let refund: { providerRef: string; amountMinor: number } | null = null;
+      const jobs: SmsJob[] = [];
       await withTx(pool, async (c) => {
         const d = (await c.query(`select * from disputes where id = $1 for update`, [disputeId])).rows[0];
         if (!d) throw notFound("Litige");
@@ -1256,7 +1382,10 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
           [disputeId, outcome === "refund_buyer" ? "resolved_refund" : "resolved_release", staffId, at]);
         const text = (note ?? "").trim();
         if (text) await c.query(`insert into dispute_evidence (dispute_id, author_id, note, created_at) values ($1,$2,$3,$4)`, [disputeId, staffId, text.slice(0, 1000), at]);
+        const title = await orderTitleOf(c, order.id);
+        await notifyParties(c, order, () => ({ kind: "dispute_resolved", payload: { orderId: order.id, disputeId, itemTitle: title, outcome }, eventKey: `dispute_resolved:${disputeId}` }), jobs, staffId);
       });
+      fireSms(jobs);
       if (refund) await refundAtProvider(refund);
       return disputeViewOf(pool, disputeId, staffId);
     },
@@ -1274,6 +1403,8 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
           refund = await refundEscrowTx(c, order);
           await c.query(`update orders set status = 'cancelled', cancelled_at = $2 where id = $1`, [id, ts(now())]);
           await closePendingTx(c, id);
+          const title = await orderTitleOf(c, id);
+          await notifyParties(c, order, (role) => ({ kind: "order_cancelled", payload: { orderId: id, itemTitle: title, role, auto: true, refunded: true }, eventKey: `order_cancelled:${id}` }));
           return true;
         });
         if (done) { n++; if (refund) await refundAtProvider(refund); }
@@ -1303,6 +1434,7 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
         await c.query(
           `update profiles set rating_avg = round(((coalesce(rating_avg, 0) * rating_count + $2) / (rating_count + 1))::numeric, 2), rating_count = rating_count + 1 where id = $1`,
           [targetId, input.rating]);
+        await notifyTx(c, { userId: targetId, kind: "review_received", payload: { orderId, itemTitle: await orderTitleOf(c, orderId), rating: input.rating }, eventKey: `review:${row.id}` });
         const me = (await c.query(`select display_name from profiles where id = $1`, [authorId])).rows[0];
         return { id: row.id as string, orderId, authorName: me.display_name as string, rating: input.rating, comment, createdAt: at.getTime() } as Review;
       });
@@ -1359,6 +1491,7 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
         if (!r) throw notFound("Signalement");
         if (r.status !== "open") throw new AppError("INVALID_STATE", "Ce signalement est déjà traité.", 409);
         let status: "actioned" | "dismissed" = "actioned";
+        let suspended: { userId: string; until: number } | null = null;
         if (action === "dismiss") status = "dismissed";
         else if (action === "hide_item") {
           if (r.target_type !== "item") throw new AppError("VALIDATION", "Seule une annonce peut être masquée.", 422);
@@ -1369,8 +1502,11 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
           await c.query(`insert into sanctions (user_id, kind, reason, starts_at, ends_at, created_by) values ($1,'suspension',$2,$3,$4,$5)`,
             [userId, `signalement ${r.reason}`, ts(now()), ts(now() + 7 * ONE_DAY), staffId]);
           await c.query(`delete from sessions where user_id = $1`, [userId]);
+          suspended = { userId, until: now() + 7 * ONE_DAY };
         }
         await c.query(`update reports set status = $2, handled_by = $3 where id = $1`, [reportId, status, staffId]);
+        if (suspended) await notifyTx(c, { userId: (suspended as { userId: string }).userId, kind: "suspension", payload: { until: (suspended as { until: number }).until }, eventKey: `suspension:${reportId}` });
+        if (r.reporter_id !== staffId) await notifyTx(c, { userId: r.reporter_id, kind: "report_handled", payload: {}, eventKey: `report_handled:${reportId}` });
       });
       return reportViewOf(pool, reportId);
     },
@@ -1450,6 +1586,53 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
       }
       return payoutOf(u);
     },
+
+    // ---- agent C : notifications
+    async listNotifications(userId, o) {
+      if (!isUuid(userId)) return { items: [], unreadCount: 0 };
+      const limit = Math.max(1, Math.min(o?.limit ?? NOTIFICATIONS_PAGE_LIMIT, NOTIFICATIONS_PAGE_LIMIT));
+      const [rows, cnt] = await Promise.all([
+        pool.query(`select id, kind, payload, read_at, created_at from notifications where user_id = $1 order by (read_at is not null), created_at desc, id limit $2`, [userId, limit]),
+        pool.query(`select count(*)::int as n from notifications where user_id = $1 and read_at is null`, [userId]),
+      ]);
+      return {
+        items: rows.rows.map((r): NotificationItem => ({ id: r.id, kind: r.kind, payload: r.payload ?? {}, read: r.read_at !== null, createdAt: r.created_at.getTime() })),
+        unreadCount: cnt.rows[0].n,
+      };
+    },
+    async countUnreadNotifications(userId) {
+      if (!isUuid(userId)) return 0;
+      return (await pool.query(`select count(*)::int as n from notifications where user_id = $1 and read_at is null`, [userId])).rows[0].n;
+    },
+    async markNotificationRead(userId, notificationId) {
+      if (!isUuid(userId) || !isUuid(notificationId)) throw notFound("Notification");
+      const r = await pool.query(`update notifications set read_at = coalesce(read_at, $3) where id = $1 and user_id = $2 returning id`, [notificationId, userId, ts(now())]);
+      if (!r.rowCount) throw notFound("Notification");
+    },
+    async markAllNotificationsRead(userId) {
+      if (!isUuid(userId)) return 0;
+      return (await pool.query(`update notifications set read_at = $2 where user_id = $1 and read_at is null`, [userId, ts(now())])).rowCount ?? 0;
+    },
+    async getNotificationPreferences(userId) {
+      if (!isUuid(userId) || !(await roleOf(pool, userId))) throw notFound("Compte");
+      const r = (await pool.query(`select sms_orders, sms_disputes from notification_preferences where user_id = $1`, [userId])).rows[0];
+      return r ? { orders: r.sms_orders, disputes: r.sms_disputes } : { ...DEFAULT_SMS_PREFERENCES };
+    },
+    async updateNotificationPreferences(userId, patch) {
+      if (!isUuid(userId) || !(await roleOf(pool, userId))) throw notFound("Compte");
+      const r = (await pool.query(
+        `insert into notification_preferences (user_id, sms_orders, sms_disputes, updated_at)
+         values ($1, coalesce($2::boolean, true), coalesce($3::boolean, true), $4)
+         on conflict (user_id) do update set sms_orders = coalesce($2::boolean, notification_preferences.sms_orders),
+           sms_disputes = coalesce($3::boolean, notification_preferences.sms_disputes), updated_at = $4
+         returning sms_orders, sms_disputes`,
+        [userId, patch.orders ?? null, patch.disputes ?? null, ts(now())])).rows[0];
+      return { orders: r.sms_orders, disputes: r.sms_disputes } as SmsPreferences;
+    },
+    async purgeOldNotifications() {
+      return (await pool.query(`delete from notifications where read_at is not null and read_at < $1`, [ts(now() - NOTIFICATIONS_RETENTION_DAYS * ONE_DAY)])).rowCount ?? 0;
+    },
+    // ---- fin agent C : notifications
 
     async listPayouts(userId) {
       const r = await pool.query(`select * from payouts where user_id = $1 order by requested_at desc limit 100`, [userId]);

@@ -22,6 +22,8 @@ export const JOBS = {
   release_delivered_orders: async (o?: JobOptions) => ({ released: await getData().releaseDeliveredOrders(o) }),
   /** Rembourse les colis restés « remis au coursier » trop longtemps sans livraison. */
   refund_stale_courier_orders: async (o?: JobOptions) => ({ refunded: await getData().refundStaleCourierOrders(o) }),
+  /** Supprime les notifications lues depuis plus de 90 jours (quotidienne). */
+  purge_old_notifications: async () => ({ purged: await getData().purgeOldNotifications() }),
 } as const;
 
 /** Lit le paramètre de test `asOf` (millisecondes). Jamais accepté en production : on ne triche pas avec l'horloge des délais d'argent. */

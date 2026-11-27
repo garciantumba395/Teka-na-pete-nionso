@@ -99,6 +99,12 @@ export const webhookEvent = z.object({
   providerRef: z.string().min(1).max(200),
   failureCode: z.string().max(100).optional(),
 });
+// ---- agent C : notifications
+export const notificationPrefsPatch = z.object({
+  orders: z.boolean({ message: "Valeur invalide." }).optional(),
+  disputes: z.boolean({ message: "Valeur invalide." }).optional(),
+}).strict();
+// ---- fin agent C : notifications
 export const idParam = uuid;
 
 /** Valide une entrée et lève une erreur 422 avec un message par champ. */

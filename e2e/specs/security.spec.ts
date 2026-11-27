@@ -108,7 +108,7 @@ test.describe("SEC Sécurité", () => {
     expect((await request.get("/api/internal/jobs/purge_expired", { headers: { authorization: "Bearer faux" } })).status()).toBe(401);
     const ok = await request.get("/api/internal/jobs/all", { headers: { authorization: `Bearer ${CRON_SECRET}` } });
     expect(ok.status()).toBe(200);
-    expect(Object.keys((await ok.json()).result).sort()).toEqual(["expire_unpaid_orders", "purge_expired", "reconcile_pending_payments", "refund_stale_courier_orders", "refund_unhanded_orders", "release_delivered_orders"]);
+    expect(Object.keys((await ok.json()).result).sort()).toEqual(["expire_unpaid_orders", "purge_expired", "purge_old_notifications", "reconcile_pending_payments", "refund_stale_courier_orders", "refund_unhanded_orders", "release_delivered_orders"]);
     expect((await request.get("/api/internal/jobs/inconnue", { headers: { authorization: `Bearer ${CRON_SECRET}` } })).status()).toBe(404);
   });
 

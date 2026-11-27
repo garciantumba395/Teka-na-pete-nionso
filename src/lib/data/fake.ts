@@ -10,6 +10,11 @@ import {
 import { detectOffPlatform, MESSAGE_MAX } from "../messaging";
 import { normalizeDrcPhone } from "../phone";
 import { decodePhotoDataUrl, MAX_EVIDENCE_PER_MEMBER, PHOTO_INVALID_MESSAGE, privatePhotoUrl } from "../photos";
+import {
+  DEFAULT_SMS_PREFERENCES, NOTIFICATIONS_PAGE_LIMIT, NOTIFICATIONS_RETENTION_DAYS, SMS_DAILY_LIMIT, SMS_KIND_CATEGORY, smsText,
+  type NotificationItem, type NotificationKind, type NotificationPayload, type NotifySpec, type SmsPreferences,
+} from "../notifications";
+import { ConsoleSmsProvider, type SmsProvider } from "../sms/provider";
 import { FakeMobileMoneyProvider } from "../payments/fake-provider";
 import {
   AppError, type Area, type Category, type ChatMessage, type ConversationSummary, type Currency, type DisputeNote, type DisputeOutcome, type DisputeReason, type DisputeStatus, type DisputeSummary, type DisputeView, type ReportAction, type ReportReason, type ReportStatus, type ReportTarget, type ReportView, type Review, type UserRole, type Item, type ItemCard, type ItemDetail, type ItemQuery, type LedgerEntry, type Order, type OrderAction, type OrderView, type CancelRequestStatus, type Payment, type PaymentMethod, type Payout, type DisputeEvidence,
@@ -28,6 +33,8 @@ export interface FakeOptions {
   providerDelayMs?: number;
   otpCode?: string;
   seed?: boolean;
+  /** Fournisseur SMS des notifications critiques (par défaut : console factice). */
+  sms?: SmsProvider;
 }
 
 export interface FakeData extends DataLayer {
@@ -36,6 +43,9 @@ export interface FakeData extends DataLayer {
   __pendingEvents(): ProviderEvent[];
   __flush(): Promise<void>;
   __provider: FakeMobileMoneyProvider;
+  __sms: SmsProvider;
+  /** Attend la fin des envois SMS de notification en cours (ils ne bloquent jamais les méthodes métier). */
+  __settleSms(): Promise<void>;
 }
 
 interface ShipmentRec {
@@ -105,6 +115,14 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
   const privatePhotos = new Map<string, PrivatePhotoRec>();
   const evidenceRows: EvidenceRec[] = [];
 
+  // ---- agent C : notifications
+  const sms = opts.sms ?? new ConsoleSmsProvider();
+  interface NotifRec { id: string; userId: string; kind: NotificationKind; payload: NotificationPayload; eventKey: string | null; groupKey: string | null; readAt: number | null; createdAt: number; channels: string[] }
+  const notifs: NotifRec[] = [];
+  const smsPrefs = new Map<string, SmsPreferences>();
+  const smsInFlight = new Set<Promise<void>>();
+  // ---- fin agent C : notifications
+
   if (opts.seed !== false) {
     const t = now();
     seedUsers(t).forEach((u) => users.set(u.id, u));
@@ -119,6 +137,57 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
   const ctx = (refType: LedgerEntry["refType"], refId: string, currency: Currency) => ({ txnId: randomUUID(), refType, refId, currency });
   const byPhone = (phone: string) => [...users.values()].find((u) => u.phone === phone) ?? null;
   const notFound = (what: string) => new AppError("NOT_FOUND", `${what} introuvable.`, 404);
+
+  // ---- agent C : notifications
+  const isMember = (id: string) => users.has(id) && !deleted.has(id);
+  const orderTitle = (o: Order) => items.get(o.itemIds[0])?.title ?? "Article";
+
+  /** Crée (ou fusionne, ou ignore) une notification. Jamais pour un membre supprimé ou inconnu. Retourne la notification si elle est NOUVELLE. */
+  function notify(spec: NotifySpec): NotifRec | null {
+    if (!isMember(spec.userId)) return null;
+    if (spec.eventKey && notifs.some((n) => n.userId === spec.userId && n.eventKey === spec.eventKey)) return null; // idempotence
+    if (spec.groupKey) {
+      const open = notifs.find((n) => n.userId === spec.userId && n.groupKey === spec.groupKey && n.readAt === null);
+      if (open) {
+        open.payload = { ...open.payload, ...spec.payload, count: (open.payload.count ?? 1) + 1 };
+        open.createdAt = now();
+        return null;
+      }
+    }
+    const rec: NotifRec = {
+      id: randomUUID(), userId: spec.userId, kind: spec.kind, payload: spec.groupKey ? { ...spec.payload, count: 1 } : spec.payload,
+      eventKey: spec.eventKey ?? null, groupKey: spec.groupKey ?? null, readAt: null, createdAt: now(), channels: [],
+    };
+    notifs.push(rec);
+    return rec;
+  }
+
+  /** SMS d'une notification critique : hors transaction, jamais bloquant, une erreur est journalisée sans donnée personnelle. */
+  function dispatchSms(rec: NotifRec | null) {
+    if (!rec) return;
+    const category = SMS_KIND_CATEGORY[rec.kind];
+    const text = smsText(rec.kind);
+    if (!category || !text) return;
+    const p: Promise<void> = (async () => {
+      try {
+        const u = users.get(rec.userId);
+        if (!u || deleted.has(rec.userId) || !u.phone) return;
+        if (!(smsPrefs.get(rec.userId) ?? DEFAULT_SMS_PREFERENCES)[category]) return;
+        const rl = await api.rateLimit(`sms:notif:${sha256(u.phone).slice(0, 24)}`, SMS_DAILY_LIMIT, 86_400);
+        if (!rl.allowed) return;
+        await sms.send(u.phone, text);
+        rec.channels.push("sms");
+      } catch (e) {
+        console.error("[notifications] SMS non envoyé", (e as Error).message);
+      }
+    })().finally(() => smsInFlight.delete(p));
+    smsInFlight.add(p);
+  }
+  const notifyAndSms = (spec: NotifySpec) => dispatchSms(notify(spec));
+  const bothParties = (o: Order, make: (role: "buyer" | "seller") => NotifySpec, except?: string) => {
+    for (const [id, role] of [[o.buyerId, "buyer"], [o.sellerId, "seller"]] as const) if (id !== except) notifyAndSms({ ...make(role), userId: id });
+  };
+  // ---- fin agent C : notifications
 
   const publicProfile = (u: User): PublicProfile => ({
     id: u.id, displayName: u.displayName, bio: u.bio, areaId: u.areaId,
@@ -361,6 +430,10 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
   // ------------------------------------------------------------------------ API
   const api: FakeData = {
     __provider: provider,
+    __sms: sms,
+    async __settleSms() {
+      while (smsInFlight.size) await Promise.all([...smsInFlight]);
+    },
     __ledger: () => ledger,
     __pendingEvents: () => [...queue],
     async __flush() {
@@ -464,6 +537,8 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
       u.phone = `deleted:${userId}`;
       u.areaId = null;
       deleted.add(userId);
+      for (let i = notifs.length - 1; i >= 0; i--) if (notifs[i].userId === userId) notifs.splice(i, 1);
+      smsPrefs.delete(userId);
       await api.deleteAllSessions(userId);
     },
     async getPhoto() {
@@ -596,6 +671,7 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
       for (const o of orders.values()) {
         if (o.status === "pending_payment" && o.paymentExpiresAt != null && o.paymentExpiresAt < now()) {
           setOrderStatus(o, "expired");
+          bothParties(o, (role) => ({ userId: "", kind: "order_expired", payload: { orderId: o.id, itemTitle: orderTitle(o), role }, eventKey: `order_expired:${o.id}` }));
           n++;
         }
       }
@@ -729,6 +805,7 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
       order.completedAt = now();
       release(order);
       closePending(orderId); // agent A : le code vaut acceptation, la demande d'annulation est close
+      notifyAndSms({ userId: order.buyerId, kind: "order_completed", payload: { orderId, itemTitle: orderTitle(order), role: "buyer" }, eventKey: `order_completed:${orderId}` });
       return view(order, sellerId);
     },
 
@@ -739,12 +816,14 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
       setOrderStatus(order, "completed");
       order.completedAt = now();
       release(order);
+      notifyAndSms({ userId: order.sellerId, kind: "order_completed", payload: { orderId, itemTitle: orderTitle(order), role: "seller" }, eventKey: `order_completed:${orderId}` });
       return view(order, buyerId);
     },
 
     async cancelOrder(orderId, actorId) {
       const order = loadOrder(orderId);
       if (order.buyerId !== actorId && order.sellerId !== actorId) throw notFound("Commande");
+      let refunded = false;
       if (order.status === "pending_payment") {
         setOrderStatus(order, "cancelled");
         order.cancelledAt = now();
@@ -761,9 +840,12 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
         setOrderStatus(order, "cancelled");
         order.cancelledAt = now();
         closePending(orderId);
+        refunded = true;
       } else {
         throw new AppError("INVALID_STATE", "Cette commande ne peut plus être annulée.", 409);
       }
+      const other = actorId === order.buyerId ? order.sellerId : order.buyerId;
+      notifyAndSms({ userId: other, kind: "order_cancelled", payload: { orderId, itemTitle: orderTitle(order), role: other === order.buyerId ? "buyer" : "seller", refunded }, eventKey: `order_cancelled:${orderId}` });
       return view(order, actorId);
     },
 
@@ -833,6 +915,7 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
           setOrderStatus(order, "paid");
           order.paidAt = now();
           post(holdEntries(ctx("payment", pay.id, order.currency), order.totalMinor));
+          notifyAndSms({ userId: order.sellerId, kind: "order_paid", payload: { orderId: order.id, itemTitle: orderTitle(order), role: "seller" }, eventKey: `order_paid:${order.id}` });
           const code = deriveHandoverCode(order.id);
           const ship: ShipmentRec = {
             orderId: order.id, status: "pending", attempt: { attempts: 0, lockedUntil: null }, codeHash: order.deliveryMethod === "courier" ? "" : hashCode(code), confirmedBy: null,
@@ -891,6 +974,7 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
       const c = loadConv(conversationId, viewerId);
       const mine = messages.filter((m) => m.convId === c.id);
       for (const m of mine) if (m.senderId !== viewerId && m.readAt === null) m.readAt = now();
+      for (const n of notifs) if (n.userId === viewerId && n.groupKey === `conv:${c.id}` && n.readAt === null) n.readAt = now(); // agent C : ouvrir la conversation lit sa notification
       return { ...convSummary(c, viewerId), messages: mine.map((m) => chatMessage(m, viewerId)) };
     },
 
@@ -904,6 +988,7 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
       const m: MsgRec = { id: randomUUID(), convId: c.id, senderId, kind: "text", body: text, flagged: detectOffPlatform(text) !== null, readAt: null, createdAt: now() };
       messages.push(m);
       c.lastMessageAt = m.createdAt;
+      notifyAndSms({ userId: other, kind: "message_received", payload: { conversationId: c.id, itemTitle: items.get(c.itemId)?.title ?? "Article", senderName: profileOf(senderId).displayName }, groupKey: `conv:${c.id}` });
       return chatMessage(m, senderId);
     },
 
@@ -923,6 +1008,8 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
       setOrderStatus(order, "disputed");
       const d: DisputeRec = { id: randomUUID(), orderId, openedBy: userId, reason: input.reason, description: text, status: "open", openedAt: now(), resolvedAt: null };
       disputes.set(d.id, d);
+      const other = userId === order.buyerId ? order.sellerId : order.buyerId;
+      notifyAndSms({ userId: other, kind: "dispute_opened", payload: { orderId, disputeId: d.id, itemTitle: orderTitle(order) }, eventKey: `dispute_opened:${d.id}` });
       return disputeView(d, userId);
     },
 
@@ -946,7 +1033,10 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
       if (d.status !== "open") throw new AppError("INVALID_STATE", "Ce litige est clos.", 409);
       const text = note.trim();
       if (text.length < 1 || text.length > 1000) throw new AppError("VALIDATION", "Un message fait entre 1 et 1 000 caractères.", 422, { note: "Un message fait entre 1 et 1 000 caractères." });
-      disputeNotes.push({ id: randomUUID(), disputeId, authorId, staff: view0.viewerRole === "staff", note: text, createdAt: now() });
+      const noteId = randomUUID();
+      disputeNotes.push({ id: noteId, disputeId, authorId, staff: view0.viewerRole === "staff", note: text, createdAt: now() });
+      const dOrder = loadOrder(d.orderId);
+      bothParties(dOrder, () => ({ userId: "", kind: "dispute_message", payload: { orderId: d.orderId, disputeId, itemTitle: orderTitle(dOrder) }, eventKey: `dispute_message:${noteId}` }), authorId);
       return disputeView(d, authorId);
     },
 
@@ -981,6 +1071,7 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
       d.resolvedAt = now();
       const text = (note ?? "").trim();
       if (text) disputeNotes.push({ id: randomUUID(), disputeId, authorId: staffId, staff: true, note: text.slice(0, 1000), createdAt: now() });
+      bothParties(order, () => ({ userId: "", kind: "dispute_resolved", payload: { orderId: order.id, disputeId, itemTitle: orderTitle(order), outcome }, eventKey: `dispute_resolved:${disputeId}` }), staffId);
       return disputeView(d, staffId);
     },
 
@@ -1041,6 +1132,7 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
           setOrderStatus(o, "cancelled");
           o.cancelledAt = now();
           closePending(o.id);
+          bothParties(o, (role) => ({ userId: "", kind: "order_cancelled", payload: { orderId: o.id, itemTitle: orderTitle(o), role, auto: true, refunded: true }, eventKey: `order_cancelled:${o.id}` }));
           n++;
         }
       }
@@ -1058,6 +1150,7 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
       const targetId = authorId === order.buyerId ? order.sellerId : order.buyerId;
       const r: ReviewRec = { id: randomUUID(), orderId, authorId, targetId, rating: input.rating, comment, createdAt: now() };
       reviews.push(r);
+      notifyAndSms({ userId: targetId, kind: "review_received", payload: { orderId, itemTitle: orderTitle(order), rating: input.rating }, eventKey: `review:${r.id}` });
       const t = users.get(targetId);
       if (t) {
         // Arithmétique entière (centièmes) : comme numeric côté PostgreSQL, sans erreur d'arrondi flottante.
@@ -1119,10 +1212,13 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
       } else {
         const userId = r.targetType === "user" ? r.targetId : items.get(r.targetId)?.sellerId;
         if (!userId) throw notFound("Membre");
-        suspensions.push({ userId, endsAt: now() + 7 * 86_400_000 });
+        const endsAt = now() + 7 * 86_400_000;
+        suspensions.push({ userId, endsAt });
         await api.deleteAllSessions(userId);
         r.status = "actioned";
+        notifyAndSms({ userId, kind: "suspension", payload: { until: endsAt }, eventKey: `suspension:${r.id}` });
       }
+      if (r.reporterId !== staffId) notifyAndSms({ userId: r.reporterId, kind: "report_handled", payload: {}, eventKey: `report_handled:${r.id}` });
       return reportView(r);
     },
 
@@ -1283,6 +1379,48 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
       }
       return n;
     },
+
+    // ---- agent C : notifications
+    async listNotifications(userId, o) {
+      const mine = notifs.filter((n) => n.userId === userId);
+      const items = [...mine]
+        .sort((a, b) => (a.readAt === null ? 0 : 1) - (b.readAt === null ? 0 : 1) || b.createdAt - a.createdAt)
+        .slice(0, Math.max(1, Math.min(o?.limit ?? NOTIFICATIONS_PAGE_LIMIT, NOTIFICATIONS_PAGE_LIMIT)))
+        .map((n): NotificationItem => ({ id: n.id, kind: n.kind, payload: { ...n.payload }, read: n.readAt !== null, createdAt: n.createdAt }));
+      return { items, unreadCount: mine.filter((n) => n.readAt === null).length };
+    },
+    async countUnreadNotifications(userId) {
+      return notifs.filter((n) => n.userId === userId && n.readAt === null).length;
+    },
+    async markNotificationRead(userId, notificationId) {
+      const n = notifs.find((x) => x.id === notificationId && x.userId === userId);
+      if (!n) throw notFound("Notification");
+      if (n.readAt === null) n.readAt = now();
+    },
+    async markAllNotificationsRead(userId) {
+      let c = 0;
+      for (const n of notifs) if (n.userId === userId && n.readAt === null) { n.readAt = now(); c++; }
+      return c;
+    },
+    async getNotificationPreferences(userId) {
+      if (!isMember(userId)) throw notFound("Compte");
+      return { ...DEFAULT_SMS_PREFERENCES, ...smsPrefs.get(userId) };
+    },
+    async updateNotificationPreferences(userId, patch) {
+      if (!isMember(userId)) throw notFound("Compte");
+      const cur = { ...DEFAULT_SMS_PREFERENCES, ...smsPrefs.get(userId) };
+      if (patch.orders !== undefined) cur.orders = !!patch.orders;
+      if (patch.disputes !== undefined) cur.disputes = !!patch.disputes;
+      smsPrefs.set(userId, cur);
+      return { ...cur };
+    },
+    async purgeOldNotifications() {
+      const cutoff = now() - NOTIFICATIONS_RETENTION_DAYS * 86_400_000;
+      let c = 0;
+      for (let i = notifs.length - 1; i >= 0; i--) if (notifs[i].readAt !== null && notifs[i].readAt! < cutoff) { notifs.splice(i, 1); c++; }
+      return c;
+    },
+    // ---- fin agent C : notifications
   };
 
   return api;

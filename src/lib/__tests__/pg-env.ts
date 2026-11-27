@@ -60,5 +60,7 @@ export async function makePgEnv(overrides: Partial<PgOptions> = {}): Promise<PgE
     pendingEvents: async () => data.__pendingEvents(),
     flush: () => data.__flush(),
     refunds: () => provider.refunds.length,
+    sentSms: () => sms.sent,
+    settleSms: () => data.__settleSms(),
   };
 }
