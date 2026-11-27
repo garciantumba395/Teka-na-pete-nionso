@@ -1,2 +1,10 @@
 replica/screens/*
 !replica/screens/.gitkeep
+
+# app
+node_modules/
+.next/
+next-env.d.ts
+*.tsbuildinfo
+test-results/
+.env*.local
