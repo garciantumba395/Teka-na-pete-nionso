@@ -137,6 +137,7 @@ Seules les API officielles et publiques des fournisseurs, avec nos propres clés
 | GET /me/orders | Mes commandes | membre | rôle, curseur | liste | F02 |
 | POST /orders/{id}/pay | Lance l'encaissement mobile money | acheteur | moyen, numéro | paiement | F02 |
 | GET /orders/{id}/payment | État du paiement (polling) | acheteur | | statut | F02 |
+| GET /orders/{id}/handover-code | Affiche le code de remise (dérivé, jamais stocké en clair) | acheteur | | code à 6 chiffres | F02 |
 | POST /orders/{id}/cancel | Annule (avant paiement, ou remboursement si non expédié) | partie | motif | commande | F02 |
 | POST /orders/{id}/ship | Marque comme remis au coursier ou prêt pour la remise | vendeur | coursier, repère | expédition | F01 |
 | POST /orders/{id}/confirm-delivery | Confirme avec le code de remise (5 essais maximum) | vendeur ou coursier | code | commande livrée | F01, F02 |
@@ -183,7 +184,7 @@ Seules les API officielles et publiques des fournisseurs, avec nos propres clés
 - **Fuseaux** : deux fuseaux en RDC, pas d'heure d'été. Tout en UTC, affichage selon `areas.tz`. Les échéances (fenêtre de réclamation, expiration) sont calculées en heures, pas en « jours calendaires » ambigus.
 - **Idempotence** : un webhook arrive souvent deux fois, un client réessaie un paiement après un coupure réseau. `webhook_events` et `idempotency_key` protègent ; tout traitement de webhook doit être rejouable sans effet de bord.
 - **Course sur l'article** : résolue par l'index unique partiel, pas par l'interface. La réservation est une transaction : insertion dans `order_items` puis `items.status = 'reserved'`, ou rien.
-- **Mobile money asynchrone** : l'acheteur confirme par code PIN sur son téléphone, parfois après le délai. Un paiement peut réussir **après** l'expiration de la commande. Règle : si l'article est encore libre, on rouvre la commande ; sinon remboursement automatique. Ne jamais empocher un paiement tardif.
+- **Mobile money asynchrone** : l'acheteur confirme par code PIN sur son téléphone, parfois après le délai. Un paiement peut réussir **après** l'expiration de la commande. Règle construite : **remboursement automatique** (le trigger de la base interdit `expired → paid`, donc pas de réouverture). Ne jamais empocher un paiement tardif.
 - **Code de remise** : 6 chiffres, haché, 5 essais puis verrouillage temporaire. Le code est donné par l'acheteur **après** avoir inspecté l'article. Il vaut acceptation et libère les fonds.
 - **Double devise** : une devise par commande, taux figé (`fx_rate_id`). Arrondis du CDF à l'unité entière même si la norme ISO prévoit des centimes. Écarts de change à la charge de qui ? Décision de produit.
 - **Frais du mobile money** : les frais de retrait peuvent représenter une part importante d'un petit panier. Ils doivent être modélisés avant de fixer les frais de protection (voir risques).
@@ -231,3 +232,7 @@ Porte avant M0 (en parallèle) : choix du PSP et ses conditions, avis juridique 
 ## Étape suivante
 
 `/replica-design` : jetons de design (couleurs, typographie, composants) pour une interface légère, à partir des captures de référence, avec nos propres ressources. Prévoir de fournir des captures publiques de Vinted dans `replica/screens/` ; sans cela, je définis le design système depuis `recon.md` seulement.
+
+## Écarts constatés à la construction
+
+Voir `replica/build-log.md` : code de remise dérivé par HMAC, paiement tardif remboursé, route `handover-code` ajoutée, risque de blocage d'articles par réservation répétée.

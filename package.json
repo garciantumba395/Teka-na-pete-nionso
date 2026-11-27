@@ -9,8 +9,8 @@
     "start": "next start -p 3100",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "sync:design": "python3 replica/design/build_tokens.py && cp replica/design/tokens.css replica/design/primitives.css replica/design/tailwind.tokens.ts src/styles/",
-    "e2e": "node e2e/journey.mjs"
+    "sync:design": "python3 replica/design/build_tokens.py && cp replica/design/tokens.json replica/design/tokens.css replica/design/primitives.css replica/design/tailwind.tokens.ts src/styles/",
+    "e2e": "node e2e/journey.cjs"
   },
   "dependencies": {
     "next": "^16.4.6",

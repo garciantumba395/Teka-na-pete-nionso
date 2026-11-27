@@ -293,7 +293,7 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
       const seller = users.get(it.sellerId);
       if (!seller) return null;
       const detail: ItemDetail = {
-        ...toCard(it), description: it.description, photos: it.photos, condition: it.condition,
+        ...toCard(it), brand: it.brand, sizeLabel: it.sizeLabel, description: it.description, photos: it.photos, condition: it.condition,
         categoryName: categories.find((c) => c.id === it.categoryId)?.name ?? "", seller: publicProfile(seller), sellerId: it.sellerId,
       };
       return detail;

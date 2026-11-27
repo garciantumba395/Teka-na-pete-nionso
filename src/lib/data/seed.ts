@@ -113,7 +113,7 @@ export function seedItems(now: number, areas: Area[]): Item[] {
       areaId: area.id,
       lat: area.lat ? Math.round(area.lat * 100) / 100 : null,
       lng: area.lng ? Math.round(area.lng * 100) / 100 : null,
-      photos: [svgPhoto(title.split(" ").slice(0, 2).join(" "), hue), svgPhoto("Détail", (hue + 20) % 360)],
+      photos: [svgPhoto(title.split(" ")[0], hue), svgPhoto("Détail", (hue + 20) % 360)],
       publishedAt: at,
       createdAt: at,
     };

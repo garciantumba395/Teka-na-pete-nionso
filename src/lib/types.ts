@@ -114,6 +114,8 @@ export interface ItemCard {
 }
 
 export interface ItemDetail extends ItemCard {
+  brand: string | null;
+  sizeLabel: string | null;
   description: string;
   photos: string[];
   condition: Condition;
@@ -210,6 +212,20 @@ export interface ProviderEvent {
   type: "collection.succeeded" | "collection.failed" | "payout.succeeded" | "payout.failed";
   providerRef: string;
   failureCode?: string;
+}
+
+/**
+ * Reconnaît une AppError par ses propriétés, PAS par `instanceof` : Next.js empaquette la couche de données
+ * et les routes dans des bundles séparés, la classe existe alors en plusieurs exemplaires et `instanceof`
+ * échoue entre eux (toute erreur métier devenait un 500).
+ */
+export function isAppError(e: unknown): e is AppError {
+  return (
+    e instanceof Error &&
+    e.name === "AppError" &&
+    typeof (e as AppError).code === "string" &&
+    typeof (e as AppError).status === "number"
+  );
 }
 
 // Erreurs métier : code stable (pour l'interface) + statut HTTP.
