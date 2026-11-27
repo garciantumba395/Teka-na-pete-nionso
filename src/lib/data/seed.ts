@@ -1,4 +1,5 @@
 import type { Area, Category, Condition, Currency, Item, User } from "../types";
+import { seedId } from "./ids";
 
 // Données de départ. Fictives. Les photos sont des illustrations SVG générées ici (aucune image d'un tiers).
 
@@ -40,8 +41,8 @@ const CATS: Cat[] = [
 
 export function seedCategories(): Category[] {
   return CATS.map(([id, parentId, name, isSellable]) => ({
-    id,
-    parentId,
+    id: seedId(id),
+    parentId: parentId ? seedId(parentId) : null,
     slug: id.replace(/^cat-/, ""),
     name,
     isSellable,
@@ -65,10 +66,10 @@ const COMMUNES: [string, number, number][] = [
 ];
 
 export function seedAreas(): Area[] {
-  const areas: Area[] = [{ id: "area-cd", parentId: null, kind: "country", name: "République démocratique du Congo", lat: null, lng: null }];
-  for (const p of PROVINCES) areas.push({ id: `area-prov-${slug(p)}`, parentId: "area-cd", kind: "province", name: p, lat: null, lng: null });
+  const areas: Area[] = [{ id: seedId("area-cd"), parentId: null, kind: "country", name: "République démocratique du Congo", lat: null, lng: null }];
+  for (const p of PROVINCES) areas.push({ id: seedId(`area-prov-${slug(p)}`), parentId: seedId("area-cd"), kind: "province", name: p, lat: null, lng: null });
   for (const [name, lat, lng] of COMMUNES)
-    areas.push({ id: `area-com-${slug(name)}`, parentId: "area-prov-kinshasa", kind: "commune", name, lat, lng });
+    areas.push({ id: seedId(`area-com-${slug(name)}`), parentId: seedId("area-prov-kinshasa"), kind: "commune", name, lat, lng });
   return areas;
 }
 
@@ -77,11 +78,11 @@ const slug = (s: string) => s.toLowerCase().normalize("NFD").replace(/\p{M}/gu, 
 export const SEED_PHONES = { marie: "+243810000001", patrick: "+243820000002", jp: "+243990000003" };
 
 export function seedUsers(now: number): User[] {
-  const base = { areaId: "area-com-gombe", verificationLevel: "phone" as const, createdAt: now - 90 * 86400_000 };
+  const base = { areaId: seedId("area-com-gombe"), verificationLevel: "phone" as const, createdAt: now - 90 * 86400_000 };
   return [
-    { ...base, id: "user-marie", phone: SEED_PHONES.marie, displayName: "Marie K.", bio: "Je vends mes vêtements en bon état. Remise à Gombe ou Limete.", ratingAvg: 4.8, ratingCount: 31, areaId: "area-com-gombe" },
-    { ...base, id: "user-patrick", phone: SEED_PHONES.patrick, displayName: "Patrick M.", bio: "", ratingAvg: null, ratingCount: 0, areaId: "area-com-lemba" },
-    { ...base, id: "user-jp", phone: SEED_PHONES.jp, displayName: "Jean-Paul B.", bio: "Électronique et maison.", ratingAvg: 4.5, ratingCount: 12, areaId: "area-com-ngaliema" },
+    { ...base, id: seedId("user-marie"), phone: SEED_PHONES.marie, displayName: "Marie K.", bio: "Je vends mes vêtements en bon état. Remise à Gombe ou Limete.", ratingAvg: 4.8, ratingCount: 31, areaId: seedId("area-com-gombe") },
+    { ...base, id: seedId("user-patrick"), phone: SEED_PHONES.patrick, displayName: "Patrick M.", bio: "", ratingAvg: null, ratingCount: 0, areaId: seedId("area-com-lemba") },
+    { ...base, id: seedId("user-jp"), phone: SEED_PHONES.jp, displayName: "Jean-Paul B.", bio: "Électronique et maison.", ratingAvg: 4.5, ratingCount: 12, areaId: seedId("area-com-ngaliema") },
   ];
 }
 
@@ -104,11 +105,11 @@ const ITEMS: Seed[] = [
 
 export function seedItems(now: number, areas: Area[]): Item[] {
   return ITEMS.map(([title, categoryId, condition, priceMinor, currency, brand, sizeLabel, sellerId, areaSlug, hue, description], i) => {
-    const area = areas.find((a) => a.id === `area-com-${areaSlug}`)!;
+    const area = areas.find((a) => a.id === seedId(`area-com-${areaSlug}`))!;
     const at = now - (i + 1) * 3 * 3600_000;
     return {
-      id: `item-${String(i + 1).padStart(2, "0")}`,
-      sellerId, categoryId, title, description, condition, sizeLabel, brand, priceMinor, currency,
+      id: seedId(`item-${String(i + 1).padStart(2, "0")}`),
+      sellerId: seedId(sellerId), categoryId: seedId(categoryId), title, description, condition, sizeLabel, brand, priceMinor, currency,
       status: "active" as const,
       areaId: area.id,
       lat: area.lat ? Math.round(area.lat * 100) / 100 : null,

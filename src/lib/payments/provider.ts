@@ -29,6 +29,11 @@ export interface PaymentProvider {
   initiateCollection(req: CollectionRequest): Promise<{ providerRef: string }>;
   initiatePayout(req: PayoutRequest): Promise<{ providerRef: string }>;
   refund(args: { providerRef: string; amountMinor: number }): Promise<{ ok: boolean }>;
+  /**
+   * Interroge l'état d'un encaissement (rattrapage quand un webhook se perd).
+   * Optionnel : un fournisseur qui n'expose pas cette fonction est rattrapé par le rapprochement quotidien.
+   */
+  getCollection?(providerRef: string): Promise<{ status: "pending" | "succeeded" | "failed"; failureCode?: string }>;
 }
 
 const SECRET = process.env.PSP_WEBHOOK_SECRET ?? "dev-only-webhook-secret-change-me";

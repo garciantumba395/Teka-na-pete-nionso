@@ -7,6 +7,14 @@ const { chromium } = require("playwright");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const crypto = require("node:crypto");
+/** Même UUID déterministe que src/lib/data/ids.ts */
+function seedId(name) {
+  const h = crypto.createHash("sha1").update(`marketplace-rdc:${name}`).digest();
+  h[6] = (h[6] & 0x0f) | 0x50; h[8] = (h[8] & 0x3f) | 0x80;
+  const x = h.subarray(0, 16).toString("hex");
+  return `${x.slice(0,8)}-${x.slice(8,12)}-${x.slice(12,16)}-${x.slice(16,20)}-${x.slice(20,32)}`;
+}
 
 const BASE = process.env.BASE_URL || "http://localhost:3100";
 const OUT = path.join(__dirname, "..", "replica", "clone-screens");
@@ -25,6 +33,14 @@ const nb = (s) => s.replace(/[  ]/g, " ");
 
 // Réponses 4xx attendues (parcours d'erreur volontaires). Toute autre 4xx/5xx fait échouer le parcours.
 const EXPECTED_4XX = [/\/auth\/otp$/, /\/auth\/otp\/verify$/, /\/orders\/[^/]+\/confirm-delivery$/, /\/items\/[^/]+\/publish$/];
+
+
+/** Navigue puis attend que la page soit interactive (hydratée) : les clics et touches avant ce moment sont perdus. */
+async function open(page, url) {
+  const r = await page.goto(url);
+  await page.waitForSelector('html[data-hydrated="1"]', { timeout: 30000 }).catch(() => undefined);
+  return r;
+}
 
 function watch(page, label) {
   page.on("console", (m) => {
@@ -59,7 +75,7 @@ async function shot(page, name) {
 
 /** Connexion au clavier seulement : numéro, Entrée, code à 6 chiffres, (nom, Entrée). */
 async function signInKeyboard(page, phone, name) {
-  await page.goto(`${BASE}/signin`);
+  await open(page, `${BASE}/signin`);
   await page.keyboard.type(phone, { delay: 20 }); // autoFocus sur le champ du numéro
   await page.keyboard.press("Enter");
   await page.getByText("Code reçu par SMS").waitFor();
@@ -95,8 +111,9 @@ async function makePhotos(browser, dir) {
   return files;
 }
 
+let browser;
 (async () => {
-  const browser = await chromium.launch();
+  browser = await chromium.launch();
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "e2e-"));
   const mobile = { viewport: { width: 390, height: 844 }, deviceScaleFactor: 1 };
   const photos = await makePhotos(browser, tmp);
@@ -110,13 +127,13 @@ async function makePhotos(browser, dir) {
   watch(seller, "vendeur"); watch(buyer, "acheteur"); watch(desk, "bureau");
 
   // ---------------------------------------------------------------- S01 accueil, S03 recherche
-  await buyer.goto(`${BASE}/`);
+  await open(buyer, `${BASE}/`);
   await buyer.getByRole("heading", { name: "Dernières annonces" }).waitFor();
   const n = await buyer.locator("ul.grid > li").count();
   check(n >= 12, `S01 : ${n} annonces affichées (seed)`);
   await noOverflow(buyer, "S01 390px");
   await shot(buyer, "S01");
-  await desk.goto(`${BASE}/`);
+  await open(desk, `${BASE}/`);
   await desk.getByRole("navigation", { name: "Navigation principale" }).waitFor();
   await desk.getByRole("heading", { name: "Dernières annonces" }).waitFor();
   await desk.locator("ul.grid > li").first().waitFor();
@@ -124,27 +141,27 @@ async function makePhotos(browser, dir) {
   await noOverflow(desk, "S01 1440px");
   await shot(desk, "S01-desktop");
 
-  await buyer.goto(`${BASE}/search?area=area-com-gombe&radius=3`);
+  await open(buyer, `${BASE}/search?area=${seedId("area-com-gombe")}&radius=3`);
   const near = await buyer.getByRole("status").first().innerText();
   const nearCount = Number(near.match(/\d+/)?.[0] ?? -1);
   check(nearCount > 0 && nearCount < n, `S03 : rayon 3 km autour de Gombe = ${nearCount} résultats (moins que les ${n} totaux)`);
   await noOverflow(buyer, "S03 390px");
   await shot(buyer, "S03");
-  await buyer.goto(`${BASE}/search?q=ecouteurs`);
+  await open(buyer, `${BASE}/search?q=ecouteurs`);
   check((await buyer.getByText("Écouteurs filaires").count()) > 0, "S03 : recherche sans accents « ecouteurs » trouve « Écouteurs filaires »");
-  await buyer.goto(`${BASE}/search?q=zzzz-introuvable`);
+  await open(buyer, `${BASE}/search?q=zzzz-introuvable`);
   check(await buyer.getByText("Aucun résultat").first().isVisible(), "S03 : état vide « Aucun résultat »");
 
   // ---------------------------------------------------------------- S02 connexion (vendeur existant, puis acheteur nouveau)
   await signInKeyboard(seller, "0810000001", null);
-  await seller.goto(`${BASE}/me`);
+  await open(seller, `${BASE}/me`);
   await seller.locator("main").getByText("Marie K.").first().waitFor();
   check(true, "S02 : le vendeur seed se connecte au clavier, sans demande de nom");
-  await seller.goto(`${BASE}/signin`);
+  await open(seller, `${BASE}/signin`);
   await seller.waitForURL(`${BASE}/`); // déjà connecté : redirigé
   check(true, "S02 : /signin redirige un membre connecté");
 
-  await buyer.goto(`${BASE}/signin`);
+  await open(buyer, `${BASE}/signin`);
   await buyer.keyboard.type("12345");
   await buyer.keyboard.press("Enter");
   await buyer.getByRole("alert").filter({ hasText: "Numéro de téléphone invalide" }).waitFor();
@@ -165,7 +182,7 @@ async function makePhotos(browser, dir) {
   check(true, "S02 : un nouvel acheteur crée son compte au clavier (numéro, code, nom)");
 
   // ---------------------------------------------------------------- S05 vendre
-  await seller.goto(`${BASE}/sell`);
+  await open(seller, `${BASE}/sell`);
   await seller.getByRole("button", { name: "Publier l'annonce" }).click();
   check(await seller.getByRole("alert").filter({ hasText: "Corrige les champs signalés" }).first().isVisible(), "S05 : formulaire vide, erreurs affichées");
   check((await seller.locator("#title-err, #categoryId-err, #condition-err, #priceMinor-err").count()) >= 3, "S05 : une erreur par champ requis");
@@ -191,18 +208,18 @@ async function makePhotos(browser, dir) {
   check(true, "S05 -> S04 : annonce publiée et affichée");
 
   // ---------------------------------------------------------------- S04 fiche article
-  await buyer.goto(itemUrl);
+  await open(buyer, itemUrl);
   await buyer.getByRole("heading", { name: "Robe test E2E" }).waitFor();
   check(nb(await buyer.locator(".price").first().innerText()) === "25 $", "S04 : prix 25 $");
   check(nb(await buyer.locator(".price-incl").first().innerText()).includes("26,25 $"), "S04 : prix avec protection 26,25 $ (5 %)");
   check((await buyer.locator(".gallery img").count()) === 2, "S04 : 2 photos dans la galerie");
   await noOverflow(buyer, "S04 390px");
   await shot(buyer, "S04");
-  await desk.goto(itemUrl);
+  await open(desk, itemUrl);
   await desk.getByRole("heading", { name: "Robe test E2E" }).waitFor();
   await noOverflow(desk, "S04 1440px");
   await shot(desk, "S04-desktop");
-  await seller.goto(itemUrl);
+  await open(seller, itemUrl);
   check(await seller.getByText("C'est ton annonce").isVisible() && (await seller.getByRole("button", { name: /^Acheter/ }).count()) === 0, "S04 : le vendeur ne peut pas acheter son propre article");
 
   // ---------------------------------------------------------------- S08 paiement
@@ -217,7 +234,7 @@ async function makePhotos(browser, dir) {
   const op = await other.newPage();
   watch(op, "autre");
   await signInKeyboard(op, "0821000009", "Autre Acheteur");
-  await op.goto(itemUrl);
+  await open(op, itemUrl);
   check(await op.getByText("Réservé").first().isVisible() && (await op.getByRole("button", { name: /^Acheter/ }).count()) === 0, "S04 : pendant le paiement, l'article apparaît « Réservé » pour un autre acheteur");
   await other.close();
 
@@ -238,11 +255,11 @@ async function makePhotos(browser, dir) {
   await shot(buyer, "S09");
   const noAuth = await desk.request.get(`${BASE}/orders/${orderId}`, { maxRedirects: 0 });
   check(noAuth.status() === 307 && (noAuth.headers().location || "").startsWith("/signin?next="), `S09 : sans connexion, vrai code HTTP 307 vers la connexion (reçu ${noAuth.status()})`);
-  await desk.goto(`${BASE}/orders/${orderId}`);
+  await open(desk, `${BASE}/orders/${orderId}`);
   await desk.waitForURL(/\/signin\?next=/);
   check(true, "S09 : le navigateur arrive sur la page de connexion");
 
-  await seller.goto(`${BASE}/orders/${orderId}`);
+  await open(seller, `${BASE}/orders/${orderId}`);
   await seller.getByText("Code de l'acheteur").first().waitFor();
   await seller.locator(".otp input").first().click();
   await seller.keyboard.type("000000", { delay: 40 });
@@ -255,14 +272,14 @@ async function makePhotos(browser, dir) {
   check(true, "S09 : le bon code termine la vente");
   await noOverflow(seller, "S09 vendeur 390px");
   await shot(seller, "S09-seller");
-  await desk.goto(`${BASE}/signin`);
+  await open(desk, `${BASE}/signin`);
 
   // l'acheteur voit la commande terminée sans recharger (rafraîchissement automatique)
   await buyer.getByText("Article reçu").waitFor({ timeout: 10000 });
   check(true, "S09 : l'écran de l'acheteur se met à jour tout seul quand le vendeur valide");
 
   // ---------------------------------------------------------------- S16 portefeuille et retrait
-  await seller.goto(`${BASE}/wallet`);
+  await open(seller, `${BASE}/wallet`);
   check(nb(await seller.getByTestId("balance-USD").innerText()) === "25 $", "S16 : le vendeur reçoit 25 $ (le prix de l'article, sans les frais de protection)");
   await shot(seller, "S16");
   await seller.locator("#amount").fill("10");
@@ -278,7 +295,7 @@ async function makePhotos(browser, dir) {
   check(await seller.getByRole("alert").filter({ hasText: "ne couvre pas" }).isVisible(), "S16 : retrait supérieur au solde refusé");
 
   // ---------------------------------------------------------------- paiement refusé puis annulation
-  await buyer.goto(`${BASE}/items/item-02`);
+  await open(buyer, `${BASE}/items/${seedId("item-02")}`);
   await buyer.getByRole("button", { name: /^Acheter/ }).click();
   await buyer.waitForURL(/\/orders\/[^/]+\/pay$/);
   const order2 = buyer.url().split("/")[4];
@@ -287,28 +304,85 @@ async function makePhotos(browser, dir) {
   await buyer.getByRole("alert").filter({ hasText: "Solde insuffisant" }).waitFor({ timeout: 15000 });
   check(true, "S08 : paiement refusé, message clair et possibilité de réessayer");
   await shot(buyer, "S08-failed");
-  await buyer.goto(`${BASE}/orders/${order2}`);
+  await open(buyer, `${BASE}/orders/${order2}`);
   await buyer.getByRole("button", { name: "Annuler la commande" }).click();
   await buyer.getByRole("button", { name: "Oui, annuler" }).click();
   await buyer.getByText("Commande annulée").waitFor();
-  await buyer.goto(`${BASE}/items/item-02`);
+  await open(buyer, `${BASE}/items/${seedId("item-02")}`);
   check(await buyer.getByRole("button", { name: /^Acheter/ }).isVisible(), "S09 : après annulation, l'article est de nouveau disponible");
 
   // ---------------------------------------------------------------- stubs : toutes les routes répondent
   for (const p of ["/inbox", "/favourites", "/pro", "/report", "/legal", `/orders/${orderId}/dispute`, `/orders/${orderId}/return`, `/orders/${orderId}/review`, `/orders/${orderId}/shipping`]) {
-    const r = await buyer.goto(`${BASE}${p}`);
+    const r = await open(buyer, `${BASE}${p}`);
     check(r.status() === 200 && (await buyer.getByText("Bientôt disponible").isVisible()), `Stub ${p} : état « Bientôt disponible »`);
   }
   for (const p of ["/items/inexistant", "/members/inexistant", `/orders/00000000-0000-0000-0000-000000000000`]) {
-    const nf = await buyer.goto(`${BASE}${p}`);
+    const nf = await open(buyer, `${BASE}${p}`);
     check(nf.status() === 404 && (await buyer.getByText("Page introuvable").isVisible()), `${p} : vrai code 404 et page lisible (reçu ${nf.status()})`);
   }
-  const mine = await buyer.goto(`${BASE}/me`);
+  const mine = await open(buyer, `${BASE}/me`);
   check(mine.status() === 200 && (await buyer.getByText("Mes commandes").isVisible()), "S15 : profil et liste des commandes");
   await shot(buyer, "S15");
-  await buyer.goto(`${BASE}/members/user-marie`);
+  await open(buyer, `${BASE}/members/${seedId("user-marie")}`);
   check(await buyer.getByRole("heading", { name: "Marie K." }).isVisible(), "S14 : profil public d'un vendeur");
   await shot(buyer, "S14");
+
+  // ---------------------------------------------------------------- backend : session, limites, tâches, photos, suppression
+  const ck = (await buyerCtx.cookies()).find((c) => /(^|-)sid$/.test(c.name));
+  check(!!ck && ck.httpOnly && ck.sameSite === "Lax", "Session : cookie HttpOnly et SameSite=Lax");
+  check(!!ck && !/[0-9a-f]{8}-[0-9a-f]{4}-/i.test(ck.value) && ck.value.length >= 40, "Session : le cookie est un jeton opaque, il ne contient pas l'identifiant du membre");
+
+  const firstImg = await open(buyer, `${BASE}/items/${seedId("item-02")}`).then(() => buyer.locator(".gallery img").first().getAttribute("src"));
+  if (firstImg && firstImg.startsWith("/api/v1/photos/")) {
+    const ph = await buyerCtx.request.get(`${BASE}${firstImg}`);
+    const h = ph.headers();
+    check(ph.status() === 200 && /^image\//.test(h["content-type"] || ""), `Photos : servies depuis la base (${h["content-type"]})`);
+    check((h["cache-control"] || "").includes("immutable") && h["x-content-type-options"] === "nosniff", "Photos : cache immuable (économie de données) et nosniff");
+    check((h["content-security-policy"] || "").includes("sandbox"), "Photos : en-tête CSP sandbox (aucun contenu actif exécuté)");
+    check((await buyerCtx.request.get(`${BASE}/api/v1/photos/inexistant`)).status() === 404, "Photos : identifiant invalide = 404");
+  }
+
+  // limitation de débit : on isole une adresse IP de test pour ne pas gêner le reste du parcours
+  let limited = 0, retryAfter = null;
+  for (let i = 0; i < 25; i++) {
+    const r = await buyerCtx.request.post(`${BASE}/api/v1/auth/otp`, { data: { phone: "12345" }, headers: { "x-forwarded-for": "203.0.113.77" } });
+    if (r.status() === 429) { limited++; retryAfter = r.headers()["retry-after"]; }
+  }
+  check(limited >= 4 && !!retryAfter, `Limite de débit : ${limited} réponses 429 sur 25 appels, avec Retry-After (${retryAfter})`);
+
+  const cron = process.env.CRON_SECRET;
+  if (cron) {
+    check((await buyerCtx.request.get(`${BASE}/api/internal/jobs/purge_expired`)).status() === 401, "Tâches : refusées sans secret");
+    check((await buyerCtx.request.get(`${BASE}/api/internal/jobs/purge_expired`, { headers: { authorization: "Bearer faux-secret" } })).status() === 401, "Tâches : refusées avec un mauvais secret");
+    const ok = await buyerCtx.request.get(`${BASE}/api/internal/jobs/all`, { headers: { authorization: `Bearer ${cron}` } });
+    check(ok.status() === 200 && "expire_unpaid_orders" in (await ok.json()).result, "Tâches : exécutées avec le bon secret");
+  }
+
+  // « se déconnecter partout » depuis un appareil révoque la session de l'autre appareil
+  const second = await browser.newContext(mobile);
+  const sp = await second.newPage();
+  watch(sp, "second appareil");
+  await signInKeyboard(sp, "0831234567", null);
+  check((await second.request.get(`${BASE}/api/v1/me`)).status() === 200, "Session : le second appareil est connecté");
+  const out = await buyerCtx.request.post(`${BASE}/api/v1/auth/logout-all`);
+  check(out.status() === 200, "Session : « se déconnecter partout » depuis le premier appareil");
+  check((await second.request.get(`${BASE}/api/v1/me`)).status() === 401, "Session : la session du second appareil est révoquée côté serveur (le cookie ne sert plus à rien)");
+  await second.close();
+
+  // suppression de compte : anonymisation, déconnexion, numéro libéré
+  const gone = await browser.newContext(mobile);
+  const gp = await gone.newPage();
+  watch(gp, "compte jetable");
+  await signInKeyboard(gp, "0841234567", "Compte Jetable");
+  const del = await gone.request.delete(`${BASE}/api/v1/me`);
+  check(del.status() === 200, "Compte : suppression acceptée (aucune commande ouverte, aucun solde)");
+  check((await gone.request.get(`${BASE}/api/v1/me`)).status() === 401, "Compte : la session est révoquée après la suppression");
+  const gp2 = await (await browser.newContext(mobile)).newPage();
+  watch(gp2, "compte recréé");
+  await signInKeyboard(gp2, "0841234567", "Nouveau Nom");
+  await open(gp2, `${BASE}/me`);
+  await gp2.locator("main").getByText("Nouveau Nom").first().waitFor();
+  check(true, "Compte : le numéro est libéré, un nouveau compte peut être créé avec");
 
   await browser.close();
   fs.rmSync(tmp, { recursive: true, force: true });
@@ -317,8 +391,9 @@ async function makePhotos(browser, dir) {
   console.log(`\nRéponses API 4xx observées (attendues) : ${apiStatuses.length ? apiStatuses.join(", ") : "aucune"}`);
   console.log(`\n${failures === 0 ? "PARCOURS RÉUSSI" : `ÉCHEC : ${failures} vérification(s)`} (${log.filter((l) => l.startsWith("OK")).length} OK)`);
   process.exit(failures === 0 ? 0 : 1);
-})().catch((e) => {
+})().catch(async (e) => {
   console.log(log.join("\n"));
   console.error("\nERREUR :", e.message);
+  await browser?.close().catch(() => undefined); // jamais de navigateur orphelin, même en cas d'échec
   process.exit(1);
 });

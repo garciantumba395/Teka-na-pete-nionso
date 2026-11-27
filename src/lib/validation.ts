@@ -1,4 +1,4 @@
-import { FEES } from "./fees";
+import { FEES, type FeeConfig } from "./fees";
 import { toUsdMinor } from "./money";
 import type { Category, Condition, Currency } from "./types";
 
@@ -26,7 +26,7 @@ export interface ListingInput {
 export type FieldErrors = Partial<Record<keyof ListingInput | "form", string>>;
 
 /** Règles de publication, appliquées par le SERVEUR (le client ne peut pas contourner plafond ni catégorie). */
-export function validateListing(input: ListingInput, categories: Category[]): FieldErrors {
+export function validateListing(input: ListingInput, categories: Category[], cfg: FeeConfig = FEES): FieldErrors {
   const errors: FieldErrors = {};
   const title = input.title?.trim() ?? "";
   if (title.length < 3 || title.length > 80) errors.title = "Le titre doit faire entre 3 et 80 caractères.";
@@ -40,13 +40,13 @@ export function validateListing(input: ListingInput, categories: Category[]): Fi
   if (!Number.isInteger(price) || price <= 0) errors.priceMinor = "Indique un prix supérieur à zéro.";
   else if (input.currency === "CDF" && price % 100 !== 0) errors.priceMinor = "Le prix en francs doit être un nombre entier.";
   else if (input.currency === "USD" || input.currency === "CDF") {
-    if (toUsdMinor(price, input.currency as Currency) > FEES.maxItemValueUsdMinor)
+    if (toUsdMinor(price, input.currency as Currency) > cfg.maxItemValueUsdMinor)
       errors.priceMinor = "Ce prix dépasse le maximum autorisé pour une annonce.";
   }
   if ((input.brand ?? "").length > 40) errors.brand = "La marque est limitée à 40 caractères.";
   if ((input.sizeLabel ?? "").length > 20) errors.sizeLabel = "La taille est limitée à 20 caractères.";
   const photos = input.photos ?? [];
   if (photos.length < 1) errors.photos = "Ajoute au moins une photo.";
-  else if (photos.length > FEES.maxPhotos) errors.photos = `Tu peux ajouter ${FEES.maxPhotos} photos au maximum.`;
+  else if (photos.length > cfg.maxPhotos) errors.photos = `Tu peux ajouter ${cfg.maxPhotos} photos au maximum.`;
   return errors;
 }

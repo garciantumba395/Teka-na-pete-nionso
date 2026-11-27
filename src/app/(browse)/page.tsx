@@ -2,6 +2,7 @@ import Link from "next/link";
 import { EmptyState, ListingCard } from "@/components/ui";
 import { Icon } from "@/components/icons";
 import { getData } from "@/lib/data";
+import { seedId } from "@/lib/data/ids";
 import { APP_NAME } from "@/lib/copy";
 
 export default async function HomePage() {
@@ -19,7 +20,7 @@ export default async function HomePage() {
         {top.map((c) => (
           <Link key={c.id} className="chip" href={`/search?category=${c.id}`}>{c.name}</Link>
         ))}
-        <Link className="chip" href="/search?area=area-com-gombe&radius=10">Près de moi</Link>
+        <Link className="chip" href={`/search?area=${seedId("area-com-gombe")}&radius=10`}>Près de moi</Link>
       </nav>
 
       <section aria-labelledby="latest">

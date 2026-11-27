@@ -5,10 +5,12 @@ import { useRouter } from "next/navigation";
 import { api, ApiError, safeNext } from "./api";
 import { OtpInput } from "./OtpInput";
 import { maskPhone } from "@/lib/phone";
+import { useHydrated } from "./useHydrated";
 
 type Step = "phone" | "code" | "name";
 
 export function SignInForm({ next }: { next: string }) {
+  const hydrated = useHydrated();
   const router = useRouter();
   const [step, setStep] = useState<Step>("phone");
   const [phoneInput, setPhoneInput] = useState("");
@@ -82,7 +84,7 @@ export function SignInForm({ next }: { next: string }) {
             <span id="phone-hint" className="hint">Nous t&apos;envoyons un code par SMS.</span>
             {error && <span id="phone-err" className="error" role="alert">{error}</span>}
           </div>
-          <button className="btn btn-primary btn-lg" type="submit" aria-busy={busy || undefined} disabled={busy}>Recevoir le code</button>
+          <button className="btn btn-primary btn-lg" type="submit" aria-busy={busy || undefined} disabled={busy || !hydrated}>Recevoir le code</button>
         </form>
       )}
 
@@ -125,7 +127,7 @@ export function SignInForm({ next }: { next: string }) {
             <span id="name-hint" className="hint">Ce nom sera visible des acheteurs et des vendeurs.</span>
             {error && <span id="name-err" className="error" role="alert">{error}</span>}
           </div>
-          <button className="btn btn-primary btn-lg" type="submit" disabled={busy} aria-busy={busy || undefined}>Créer mon compte</button>
+          <button className="btn btn-primary btn-lg" type="submit" disabled={busy || !hydrated} aria-busy={busy || undefined}>Créer mon compte</button>
         </form>
       )}
     </div>

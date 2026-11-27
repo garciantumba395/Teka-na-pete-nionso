@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { FEES, payoutFee, protectionFee } from "../fees";
 import { assertTransition } from "../fsm";
 import { coarsen, distanceKm } from "../geo";
@@ -44,6 +44,7 @@ interface ShipmentRec {
 }
 
 const METHODS: PaymentMethod[] = ["mpesa", "orange_money", "airtel_money", "africell_money"];
+const sha256 = (v: string) => createHash("sha256").update(v).digest("hex");
 const norm = (s: string) => s.toLowerCase().normalize("NFD").replace(/\p{M}/gu, "");
 const PHOTO_RE = /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/;
 
@@ -67,6 +68,9 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
   const seenEvents = new Set<string>();
   const otps = new Map<string, { code: string; expiresAt: number; attempts: number; sent: number[] }>();
   const queue: ProviderEvent[] = [];
+  const sessions = new Map<string, { userId: string; expiresAt: number }>();
+  const limits = new Map<string, { start: number; count: number }>();
+  const deleted = new Set<string>();
 
   if (opts.seed !== false) {
     const t = now();
@@ -229,11 +233,11 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
     },
 
     async getUser(id) {
-      return users.get(id) ?? null;
+      return deleted.has(id) ? null : (users.get(id) ?? null);
     },
     async getPublicProfile(id) {
       const u = users.get(id);
-      return u ? publicProfile(u) : null;
+      return u && !deleted.has(id) ? publicProfile(u) : null;
     },
     async updateMe(userId, patch) {
       const u = users.get(userId);
@@ -246,6 +250,73 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
       if (patch.bio !== undefined) u.bio = patch.bio.slice(0, 500);
       if (patch.areaId !== undefined) u.areaId = patch.areaId;
       return u;
+    },
+
+    // ---- sessions, limites, entretien
+    async createSession(userId) {
+      if (!users.has(userId) || deleted.has(userId)) throw notFound("Compte");
+      const token = randomBytes(32).toString("base64url");
+      const expiresAt = now() + 30 * 86400_000;
+      sessions.set(sha256(token), { userId, expiresAt });
+      return { token, expiresAt };
+    },
+    async getSessionUser(token) {
+      const s = sessions.get(sha256(token));
+      if (!s || s.expiresAt < now()) return null;
+      return api.getUser(s.userId);
+    },
+    async deleteSession(token) {
+      sessions.delete(sha256(token));
+    },
+    async deleteAllSessions(userId) {
+      for (const [h, s] of sessions) if (s.userId === userId) sessions.delete(h);
+    },
+    async deleteAccount(userId) {
+      const u = users.get(userId);
+      if (!u || deleted.has(userId)) throw notFound("Compte");
+      const open = [...orders.values()].some(
+        (o) => (o.buyerId === userId || o.sellerId === userId) && !["completed", "refunded", "cancelled", "expired"].includes(o.status),
+      );
+      if (open) throw new AppError("ACCOUNT_HAS_OPEN_ORDERS", "Termine ou annule tes commandes en cours avant de supprimer ton compte.", 409);
+      const w = await api.getWallet(userId);
+      if (w.balances.some((b) => b.availableMinor > 0 || b.pendingMinor > 0))
+        throw new AppError("ACCOUNT_HAS_FUNDS", "Retire l'argent de ton portefeuille avant de supprimer ton compte.", 409);
+      for (const it of items.values()) if (it.sellerId === userId && (it.status === "active" || it.status === "draft")) it.status = "removed";
+      u.displayName = "Membre supprimé";
+      u.bio = "";
+      u.phone = `deleted:${userId}`;
+      u.areaId = null;
+      deleted.add(userId);
+      await api.deleteAllSessions(userId);
+    },
+    async getPhoto() {
+      return null;
+    },
+    async health() {
+      return { ok: true as const };
+    },
+    async rateLimit(key, limit, windowSec) {
+      const t = now();
+      const rec = limits.get(key);
+      if (!rec || t - rec.start >= windowSec * 1000) {
+        limits.set(key, { start: t, count: 1 });
+        return { allowed: true, retryAfterSec: 0 };
+      }
+      rec.count++;
+      return rec.count > limit
+        ? { allowed: false, retryAfterSec: Math.max(1, Math.ceil((rec.start + windowSec * 1000 - t) / 1000)) }
+        : { allowed: true, retryAfterSec: 0 };
+    },
+    async purgeExpired() {
+      const t = now();
+      let otp = 0, s = 0, r = 0;
+      for (const [k, v] of otps) if (v.expiresAt < t) { otps.delete(k); otp++; }
+      for (const [k, v] of sessions) if (v.expiresAt < t) { sessions.delete(k); s++; }
+      for (const [k, v] of limits) if (t - v.start > 86_400_000) { limits.delete(k); r++; }
+      return { otp, sessions: s, rateLimits: r };
+    },
+    async reconcilePendingPayments() {
+      return 0; // le fournisseur factice appelle toujours son webhook
     },
 
     // ---- catalogue
@@ -499,6 +570,10 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
     async handleProviderEvent(ev) {
       const key = `${provider.name}:${ev.eventId}`;
       if (seenEvents.has(key)) return { duplicate: true };
+      const known = ev.type.startsWith("collection.")
+        ? [...payments.values()].some((p) => p.providerRef === ev.providerRef)
+        : [...payouts.values()].some((p) => p.providerRef === ev.providerRef);
+      if (!known) return { duplicate: false, matched: false };
       seenEvents.add(key);
       await api.expireUnpaidOrders();
 

@@ -10,20 +10,29 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "sync:design": "python3 replica/design/build_tokens.py && cp replica/design/tokens.json replica/design/tokens.css replica/design/primitives.css replica/design/tailwind.tokens.ts src/styles/",
-    "e2e": "node e2e/journey.cjs"
+    "e2e": "node e2e/journey.cjs",
+    "db:migrate": "tsx scripts/db.ts migrate",
+    "db:seed": "tsx scripts/db.ts seed",
+    "db:seed-demo": "tsx scripts/db.ts seed-demo",
+    "db:status": "tsx scripts/db.ts status",
+    "test:pg": "bash scripts/test-pg.sh"
   },
   "dependencies": {
     "next": "^16.4.6",
+    "pg": "^8.23.1",
     "react": "^19.3.1",
-    "react-dom": "^19.3.1"
+    "react-dom": "^19.3.1",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@types/node": "^26.6.11",
+    "@types/pg": "^8.23.1",
     "@types/react": "^19.3.3",
     "@types/react-dom": "^19.3.0",
     "autoprefixer": "^10.7.0",
     "postcss": "^8.5.34",
     "tailwindcss": "^3.4.19",
+    "tsx": "^4.23.15",
     "typescript": "^7.0.2",
     "vitest": "^5.1.2"
   }

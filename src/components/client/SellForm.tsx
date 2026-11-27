@@ -7,6 +7,7 @@ import { PhotoPicker } from "./PhotoPicker";
 import { parseMoneyInput } from "@/lib/money";
 import { CONDITIONS, validateListing, type FieldErrors } from "@/lib/validation";
 import type { Area, Category, Currency } from "@/lib/types";
+import { useHydrated } from "./useHydrated";
 
 function Field({ id, label, hint, error, children }: { id: string; label: string; hint?: string; error?: string; children: React.ReactNode }) {
   return (
@@ -20,6 +21,7 @@ function Field({ id, label, hint, error, children }: { id: string; label: string
 }
 
 export function SellForm({ categories, areas, defaultAreaId }: { categories: Category[]; areas: Area[]; defaultAreaId: string | null }) {
+  const hydrated = useHydrated();
   const router = useRouter();
   const [photos, setPhotos] = useState<string[]>([]);
   const [title, setTitle] = useState("");
@@ -140,7 +142,7 @@ export function SellForm({ categories, areas, defaultAreaId }: { categories: Cat
         </select>
       </Field>
 
-      <button className="btn btn-primary btn-lg" type="submit" disabled={busy} aria-busy={busy || undefined}>Publier l&apos;annonce</button>
+      <button className="btn btn-primary btn-lg" type="submit" disabled={busy || !hydrated} aria-busy={busy || undefined}>Publier l&apos;annonce</button>
     </form>
   );
 }

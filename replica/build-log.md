@@ -1,7 +1,8 @@
 # Journal de construction
 
 Jalon : **M0, tranche verticale** (voir `replica/architecture.md`). Date : 2026-11-27.
-Couche de données : **factice** (en mémoire, mêmes signatures que le futur backend). Prochaine étape : `/replica-backend`.
+Couche de données : **PostgreSQL** disponible (`DATA_LAYER=pg`, voir `replica/backend.md`) ; la couche factice reste la valeur par défaut en développement.
+Paiement mobile money et SMS : **toujours factices** (aucun PSP ni fournisseur SMS choisi).
 
 ## Écrans
 
@@ -66,3 +67,11 @@ Voir `replica/features.csv`. Parité : **39,9 / 100**, **10 des 24 must-haves fa
 - **PWA** : pas de manifeste ni de service worker ; budget de performance non mesuré sur appareil réel.
 - **Accessibilité** : parcours d'inscription et de remise faits au clavier seul ; pas encore d'audit avec un lecteur d'écran.
 - **Coordonnées des communes** : centres approximatifs, à vérifier.
+
+## Mise à jour : `/replica-backend` (2026-11-27)
+
+- Couche PostgreSQL complète derrière `DataLayer`, 3 migrations, 131 tests dont **le même contrat de 38 scénarios sur la couche factice et sur PostgreSQL**, parcours E2E de **75 vérifications sur PostgreSQL** (71 sur la couche factice). Détail, décisions et risques : `replica/backend.md`.
+- **Défauts trouvés uniquement par la base réelle, corrigés** : retraits jamais terminés et événement du PSP consommé sans effet ; webhook arrivé avant l'écriture de notre référence ; formulaire soumis avant la fin du chargement (saisie perdue : le bouton d'envoi reste inactif jusqu'à l'hydratation).
+- **Identifiants** : les données de référence et de démonstration utilisent maintenant des UUID déterministes (`seedId`). Les anciens liens `area-com-gombe` etc. n'existent plus.
+- **Écarts avec l'architecture** : authentification maison (OTP SMS + sessions en base) au lieu de Supabase Auth ; accès à la base par le serveur seulement, RLS activée sans politique ; photos en base ; frais lus depuis `settings`. Raisons dans `backend.md`.
+- **Reste à la charge de l'équipe** : PSP, fournisseur SMS, projet de base de données, secrets, avis juridique. Le serveur **refuse de servir** en production tant que ce n'est pas branché.

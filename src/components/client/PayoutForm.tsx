@@ -7,8 +7,10 @@ import { PAYMENT_METHODS } from "@/lib/copy";
 import { FEES, payoutFee } from "@/lib/fees";
 import { formatMoney, parseMoneyInput } from "@/lib/money";
 import type { Currency } from "@/lib/types";
+import { useHydrated } from "./useHydrated";
 
 export function PayoutForm({ balances, defaultPhone }: { balances: { currency: Currency; availableMinor: number }[]; defaultPhone: string }) {
+  const hydrated = useHydrated();
   const router = useRouter();
   const usable = balances.filter((b) => b.availableMinor > 0);
   const [currency, setCurrency] = useState<Currency>(usable[0]?.currency ?? "USD");
@@ -79,7 +81,7 @@ export function PayoutForm({ balances, defaultPhone }: { balances: { currency: C
           <input id="payout-phone" className="input tnum" type="tel" inputMode="tel" autoComplete="tel-national" value={phone} onChange={(e) => setPhone(e.target.value)} />
         </div>
       </div>
-      <button className="btn btn-primary btn-lg" type="submit" disabled={busy} aria-busy={busy || undefined}>Retirer{amount ? ` ${formatMoney(amount, currency)}` : ""}</button>
+      <button className="btn btn-primary btn-lg" type="submit" disabled={busy || !hydrated} aria-busy={busy || undefined}>Retirer{amount ? ` ${formatMoney(amount, currency)}` : ""}</button>
     </form>
   );
 }

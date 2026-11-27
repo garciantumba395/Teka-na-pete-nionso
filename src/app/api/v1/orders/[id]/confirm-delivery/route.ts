@@ -1,12 +1,14 @@
 import { getData } from "@/lib/data";
-import { asString, handle, json, readJson } from "@/lib/http";
+import { handle, json, readJson } from "@/lib/http";
+import { confirmDelivery, parse, parseId } from "@/lib/schemas";
 import { requireUser } from "@/lib/session";
 
 export async function POST(req: Request, { params }: { params: Promise<{ id: string }> }) {
   return handle(async () => {
     const me = await requireUser();
-    const { id } = await params;
-    const b = await readJson(req);
-    return json({ order: await getData().confirmDelivery(id, me.id, asString(b.code, 12)) });
+    const id = parseId((await params).id, "Commande");
+    const b = parse(confirmDelivery, await readJson(req));
+    // Le nombre d'essais est limité PAR COMMANDE dans la couche de données (5 essais, puis verrouillage).
+    return json({ order: await getData().confirmDelivery(id, me.id, b.code) });
   });
 }

@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { api, ApiError, newKey } from "./api";
 import { PAYMENT_METHODS } from "@/lib/copy";
+import { useHydrated } from "./useHydrated";
 
 type Phase = "form" | "pending" | "failed";
 interface PaymentState { orderStatus: string; payment: { status: string; failureCode: string | null } | null }
@@ -35,6 +36,7 @@ function Countdown({ expiresAt, onExpire }: { expiresAt: number; onExpire: () =>
 export function PayForm({
   orderId, totalLabel, defaultPhone, expiresAt, initialPending,
 }: { orderId: string; totalLabel: string; defaultPhone: string; expiresAt: number; initialPending: boolean }) {
+  const hydrated = useHydrated();
   const router = useRouter();
   const [phase, setPhase] = useState<Phase>(initialPending ? "pending" : "form");
   const [method, setMethod] = useState<string>(PAYMENT_METHODS[0].value);
@@ -149,7 +151,7 @@ export function PayForm({
       </div>
 
       <div className="stack">
-        <button className="btn btn-primary btn-lg" type="submit" disabled={busy} aria-busy={busy || undefined}>Payer {totalLabel}</button>
+        <button className="btn btn-primary btn-lg" type="submit" disabled={busy || !hydrated} aria-busy={busy || undefined}>Payer {totalLabel}</button>
         <button className="btn btn-ghost" type="button" onClick={cancel}>Annuler la commande</button>
       </div>
       <p className="hint" style={{ margin: 0, textAlign: "center" }}>Article réservé encore <Countdown expiresAt={expiresAt} onExpire={expire} /></p>

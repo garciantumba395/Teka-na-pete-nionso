@@ -11,7 +11,7 @@ Recherche et filtres (catégorie/taille/marque/prix/état),découverte,must,yes,
 Fil d'accueil / catalogue de résultats,découverte,must,yes,yes,"[IMG] captures 1 à 5 : grille à 2 colonnes, prix, cœur et compteur, carrousels | M0 : S01 et S03"
 Détail d'annonce (galerie / vendeur / frais),découverte,must,yes,yes,"[IMG] capture 5 : galerie à points, cœur, bandeau « Vendu », vendeur avec étoiles | M0 : galerie, vendeur, prix avec protection, états Vendu et Réservé"
 Favoris,découverte,should,yes,no,[IMG] captures 1 à 5 : cœur et compteur sur chaque carte
-Inscription et connexion,compte,must,yes,yes,[IMG] captures 4 et 6 : réseaux sociaux + e-mail. Clone : téléphone + code SMS | M0 : téléphone + code SMS (factice en développement)
+Inscription et connexion,compte,must,yes,yes,"[IMG] captures 4 et 6 : réseaux sociaux + e-mail. Clone : téléphone + code SMS | M0 : téléphone + code SMS (factice en développement) | [BACKEND] Persistant en PostgreSQL, sessions révocables, limites de débit. SMS réel non branché"
 Vérification de compte,compte,should,yes,partial,[SRC] safety (existence confirmée) | Numéro vérifié seulement ; pièce d'identité non construite
 Profil public avec badge vérifié,compte,should,yes,yes,"[SRC] safety | M0 : profil public, mention « numéro vérifié »"
 Messagerie acheteur-vendeur,messagerie,must,yes,no,[SRC] safety
@@ -20,9 +20,9 @@ Offres de prix / négociation,messagerie,should,yes,no,[INF] à confirmer
 Achat via bouton « Acheter » (paiement protégé),paiement,must,yes,yes,"[SRC] how_it_works / refund policy | M0 : réservation atomique, paiement mobile money (factice)"
 Frais de protection ajoutés à l'acheteur,paiement,must,yes,yes,"[SRC] montant non lu. [IMG] captures 4 et 5 : prix « incl. » avec bouclier dès la liste | M0 : 5 % avec minimum, valeurs PLACEHOLDER"
 0 frais vendeur,paiement,must,yes,yes,[SRC] how_it_works | M0
-Fonds séquestrés jusqu'à confirmation,paiement,must,yes,yes,[SRC] safety | M0 : séquestre dans le grand livre en partie double ; le PSP est factice
+Fonds séquestrés jusqu'à confirmation,paiement,must,yes,yes,"[SRC] safety | M0 : séquestre dans le grand livre en partie double ; le PSP est factice | [BACKEND] Grand livre vérifié sur PostgreSQL (somme nulle, séquestre soldé). Fournisseur de paiement factice"
 Libération du paiement après 2 jours sans signalement,paiement,must,yes,partial,[SRC] refund policy | Libération par le code de remise construite. Libération automatique après 48 h : non construite
-Solde vendeur et retrait des gains,paiement,must,yes,yes,"[INF] aucune source lue | M0 : solde, retrait, échec recrédité. Fournisseur factice"
+Solde vendeur et retrait des gains,paiement,must,yes,yes,"[INF] aucune source lue | M0 : solde, retrait, échec recrédité. Fournisseur factice | [BACKEND] Persistant et testé en concurrence (pas de double dépense). Fournisseur factice"
 Étiquette d'expédition prépayée,livraison,must,yes,no,[SRC] how_it_works; à remplacer par logistique locale
 Dépôt en point relais ou collecte à domicile,livraison,should,yes,no,[SRC] how_it_works
 Suivi de colis en temps réel,livraison,must,yes,no,[SRC] how_it_works
@@ -47,7 +47,7 @@ Rapports de transparence DSA,conformité,could,yes,skip,[SRC] safety; obligation
 Vinted Go (casiers automatiques),logistique,could,yes,skip,[SRC] newsroom; matériel et partenariats hors périmètre
 Régie publicitaire B2B,monétisation,could,yes,skip,[SRC] /advertising; hors périmètre initial
 Réseau de membres et catalogue existant,communauté,could,yes,skip,l'audience n'est pas clonable
-Paiement mobile money (M-Pesa / MTN MoMo / Orange Money / Airtel / Wave),paiement,must,no,partial,[AFR] fonction d'adaptation; exclue du score de parité | M0 : 4 opérateurs en bac à sable (fournisseur factice). Aucun PSP réel
+Paiement mobile money (M-Pesa / MTN MoMo / Orange Money / Airtel / Wave),paiement,must,no,partial,"[AFR] fonction d'adaptation; exclue du score de parité | M0 : 4 opérateurs en bac à sable (fournisseur factice). Aucun PSP réel | [BACKEND] Webhooks idempotents, rattrapage d'un webhook perdu, paiement tardif remboursé : testés sur PostgreSQL. Aucun PSP réel"
 Paiement à la livraison (option),paiement,should,no,no,[AFR]
 Remise en main propre avec code de confirmation,livraison,must,no,yes,"[AFR] | M0 : code à 6 chiffres dérivé (HMAC), 5 essais puis verrouillage"
 Livreurs et coursiers locaux (motos) intégrés,livraison,must,no,no,[AFR]
@@ -56,7 +56,7 @@ Mode léger : PWA et images compressées,plateforme,must,no,partial,"[AFR] conne
 Multilingue (FR / EN + langues locales),plateforme,must,no,no,[AFR]
 Multi-devises locales et plafonds adaptés,paiement,must,no,partial,"[AFR] | USD et CDF, plafond par devise. Taux de change PLACEHOLDER (2 800)"
 Partage d'annonce et notifications WhatsApp,engagement,should,no,no,[AFR]
-Vérification par numéro de téléphone (puis pièce d'identité),compte,must,no,partial,[AFR] | Code SMS (factice). Pièce d'identité non construite
+Vérification par numéro de téléphone (puis pièce d'identité),compte,must,no,partial,"[AFR] | Code SMS (factice). Pièce d'identité non construite | [BACKEND] Codes stockés en empreinte, 5 essais puis verrouillage, limites par numéro et par adresse. SMS réel non branché"
 Retrait en personne (option et filtre),découverte,should,yes,partial,[IMG?] captures 6 et 7 (maquettes possibles). Mode par défaut en RDC | Seul mode de remise du MVP. Pas d'option ni de filtre
 Recherche par rayon de distance avec carte,découverte,should,yes,partial,"[IMG?] capture 7. Exige des coordonnées sur les annonces (schéma à compléter) | Rayon autour d'une commune (3 à 25 km), tri par distance. Pas de carte"
 Fil personnalisé (tailles et marques suivies),découverte,should,yes,no,[IMG] capture 4 : bandeau d'invitation à personnaliser

@@ -3,5 +3,12 @@ import { fileURLToPath } from "node:url";
 
 export default defineConfig({
   resolve: { alias: { "@": fileURLToPath(new URL("./src", import.meta.url)) } },
-  test: { environment: "node", include: ["src/**/*.test.ts"] },
+  test: {
+    environment: "node",
+    include: ["src/**/*.test.ts"],
+    // Les tests PostgreSQL partagent une base : un fichier à la fois.
+    fileParallelism: false,
+    testTimeout: 30_000,
+    hookTimeout: 60_000,
+  },
 });

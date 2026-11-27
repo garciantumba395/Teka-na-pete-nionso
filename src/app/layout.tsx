@@ -2,6 +2,7 @@ import type { Metadata, Viewport } from "next";
 import "@/styles/tokens.css";
 import "@/styles/primitives.css";
 import "./globals.css";
+import { Hydrated } from "@/components/client/Hydrated";
 import { MainNav } from "@/components/MainNav";
 import { APP_NAME } from "@/lib/copy";
 import { currentUser } from "@/lib/session";
@@ -19,6 +20,7 @@ export default async function RootLayout({ children }: { children: React.ReactNo
   return (
     <html lang="fr">
       <body>
+        <Hydrated />
         <a href="#main" className="skip-link">Aller au contenu</a>
         <div className="shell">
           <MainNav userName={user?.displayName ?? null} />

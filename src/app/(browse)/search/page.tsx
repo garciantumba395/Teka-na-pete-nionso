@@ -3,6 +3,7 @@ import Link from "next/link";
 import { AppBar, EmptyState, ListingCard } from "@/components/ui";
 import { Icon } from "@/components/icons";
 import { getData } from "@/lib/data";
+import { seedId } from "@/lib/data/ids";
 
 export const metadata: Metadata = { title: "Chercher" };
 
@@ -20,7 +21,7 @@ export default async function SearchPage({ searchParams }: { searchParams: Promi
   const data = getData();
   const [cats, communes, items] = await Promise.all([
     data.listCategories(),
-    data.listAreas("area-prov-kinshasa"),
+    data.listAreas(seedId("area-prov-kinshasa")),
     data.listItems({
       q: q || undefined,
       categoryId: category || undefined,

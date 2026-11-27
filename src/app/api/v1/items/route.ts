@@ -1,13 +1,14 @@
 import { getData } from "@/lib/data";
-import { asNumber, asString, handle, json, num, readJson } from "@/lib/http";
+import { handle, json, num, readJson } from "@/lib/http";
+import { enforce } from "@/lib/ratelimit";
+import { itemCreate, parse } from "@/lib/schemas";
 import { requireUser } from "@/lib/session";
-import type { ListingInput } from "@/lib/validation";
 
 export async function GET(req: Request) {
   return handle(async () => {
     const p = new URL(req.url).searchParams;
     const items = await getData().listItems({
-      q: p.get("q") ?? undefined,
+      q: p.get("q")?.slice(0, 100) ?? undefined,
       categoryId: p.get("category") ?? undefined,
       areaId: p.get("area") ?? undefined,
       lat: num(p.get("lat")),
@@ -25,20 +26,14 @@ export async function GET(req: Request) {
 export async function POST(req: Request) {
   return handle(async () => {
     const me = await requireUser();
-    const b = await readJson(req);
-    const input: ListingInput = {
-      title: asString(b.title, 200),
-      description: asString(b.description, 5000),
-      categoryId: asString(b.categoryId, 60),
-      condition: asString(b.condition, 30),
-      sizeLabel: asString(b.sizeLabel, 40) || null,
-      brand: asString(b.brand, 80) || null,
-      priceMinor: asNumber(b.priceMinor),
-      currency: asString(b.currency, 3),
-      areaId: asString(b.areaId, 60) || null,
-      photos: Array.isArray(b.photos) ? b.photos.filter((x): x is string => typeof x === "string") : [],
-    };
-    const item = await getData().createDraft(me.id, input);
+    await enforce(`items:user:${me.id}`, 30, 3600);
+    const input = parse(itemCreate, await readJson(req));
+    const item = await getData().createDraft(me.id, {
+      ...input,
+      sizeLabel: input.sizeLabel || null,
+      brand: input.brand || null,
+      areaId: input.areaId ?? null,
+    });
     return json({ item: { id: item.id, status: item.status } }, 201);
   });
 }

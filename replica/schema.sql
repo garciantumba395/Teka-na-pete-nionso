@@ -1,4 +1,5 @@
--- replica/schema.sql
+-- replica/schema.sql : SOURCE DE CONCEPTION (testée dans replica/db/).
+-- Le schéma DÉPLOYÉ est dans db/migrations/ (0001_core dérive de ce fichier ; sans dépendance à Supabase Auth).
 -- Marketplace de seconde main, pilote RDC. PostgreSQL 15+ (cible : Supabase).
 -- Règles : temps en timestamptz (UTC), argent en entiers (unités mineures ISO 4217)
 -- + devise, statuts en text + check, FK avec règle on delete explicite.

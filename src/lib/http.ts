@@ -11,7 +11,9 @@ export async function handle(fn: () => Promise<Response>): Promise<Response> {
     return await fn();
   } catch (e) {
     if (isAppError(e)) {
-      return json({ error: { code: e.code, message: e.message, details: e.details } }, e.status);
+      const headers: Record<string, string> = {};
+      if (e.code === "RATE_LIMITED" && e.details?.retryAfter) headers["Retry-After"] = e.details.retryAfter;
+      return json({ error: { code: e.code, message: e.message, details: e.code === "RATE_LIMITED" ? undefined : e.details } }, e.status, headers);
     }
     // Jamais de détail interne dans la réponse.
     console.error("[api] erreur inattendue", e);

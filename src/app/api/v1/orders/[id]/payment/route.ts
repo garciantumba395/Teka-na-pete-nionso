@@ -1,12 +1,13 @@
 import { getData } from "@/lib/data";
 import { handle, json } from "@/lib/http";
+import { parseId } from "@/lib/schemas";
 import { requireUser } from "@/lib/session";
 
 // Interrogé régulièrement par l'écran de paiement (le webhook peut arriver avant ou après).
 export async function GET(_req: Request, { params }: { params: Promise<{ id: string }> }) {
   return handle(async () => {
     const me = await requireUser();
-    const { id } = await params;
+    const id = parseId((await params).id, "Commande");
     const data = getData();
     const order = await data.getOrder(id, me.id);
     const p = await data.getPayment(id, me.id);

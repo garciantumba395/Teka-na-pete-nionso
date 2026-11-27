@@ -32,6 +32,26 @@ export interface DataLayer {
   getPublicProfile(id: string): Promise<PublicProfile | null>;
   updateMe(userId: string, patch: { displayName?: string; bio?: string; areaId?: string | null }): Promise<User>;
 
+  // Sessions : jeton opaque (seule son empreinte est stockée), révocable.
+  createSession(userId: string, meta?: { ip?: string; userAgent?: string }): Promise<{ token: string; expiresAt: number }>;
+  getSessionUser(token: string): Promise<User | null>;
+  deleteSession(token: string): Promise<void>;
+  deleteAllSessions(userId: string): Promise<void>;
+  /** Suppression de compte : anonymise le profil (les commandes passées restent pour la comptabilité). Refuse s'il reste une commande ouverte ou de l'argent. */
+  deleteAccount(userId: string): Promise<void>;
+
+  /** Photo stockée côté serveur (null si l'implémentation garde les photos dans l'annonce). */
+  getPhoto(id: string): Promise<{ mime: string; bytes: Buffer } | null>;
+
+  /** Santé du service : la base répond. Sert au point de contrôle /api/health (supervision). */
+  health(): Promise<{ ok: true }>;
+
+  // Limitation de débit (fenêtre fixe) et entretien
+  rateLimit(key: string, limit: number, windowSec: number): Promise<{ allowed: boolean; retryAfterSec: number }>;
+  purgeExpired(): Promise<{ otp: number; sessions: number; rateLimits: number }>;
+  /** Interroge le PSP pour les paiements restés « en attente » sans webhook. Retourne le nombre de paiements résolus. */
+  reconcilePendingPayments(): Promise<number>;
+
   // Catalogue
   listCategories(): Promise<Category[]>;
   listAreas(parentId?: string | null): Promise<Area[]>;
@@ -57,7 +77,11 @@ export interface DataLayer {
   confirmDelivery(orderId: string, sellerId: string, code: string): Promise<OrderView>;
   acceptOrder(orderId: string, buyerId: string): Promise<OrderView>;
   cancelOrder(orderId: string, actorId: string): Promise<OrderView>;
-  handleProviderEvent(event: ProviderEvent): Promise<{ duplicate: boolean }>;
+  /**
+   * Traite un événement du PSP, de façon idempotente. `matched: false` = référence inconnue : l'événement n'est PAS
+   * enregistré (le PSP peut arriver avant que notre référence soit écrite, il doit pouvoir le rejouer).
+   */
+  handleProviderEvent(event: ProviderEvent): Promise<{ duplicate: boolean; matched?: boolean }>;
   expireUnpaidOrders(): Promise<number>;
 
   // Portefeuille
