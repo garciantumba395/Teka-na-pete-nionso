@@ -3,6 +3,7 @@
 #   scripts/e2e-server.sh fake [commande…]     (défaut : npx playwright test)
 #   scripts/e2e-server.sh pg   [commande…]     base PostgreSQL JETABLE créée puis supprimée
 #   E2E_DATABASE_URL_BASE=postgres://… scripts/e2e-server.sh pg …   utilise un serveur PostgreSQL existant (crée app_e2e)
+#   PORT=3101 PG_TEST_PORT=5571 scripts/e2e-server.sh …   ports distincts pour tester en parallèle depuis plusieurs copies de travail
 # `next start` (production) refuse volontairement les fournisseurs factices : on utilise donc `next dev`.
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -11,13 +12,19 @@ CMD=("$@"); [[ ${#CMD[@]} -eq 0 ]] && CMD=(npx playwright test)
 PORT="${PORT:-3100}"; PG_BIN="${PG_BIN:-/usr/lib/postgresql/16/bin}"; PGPORT="${PG_TEST_PORT:-5566}"
 TMPD=""; SERVER_PID=""
 
+# Libère SEULEMENT le port de ce serveur : plusieurs copies de travail peuvent tester en parallèle (un port et un PG_TEST_PORT chacune).
+free_port() {
+  local pids; pids="$(lsof -ti "tcp:$PORT" -sTCP:LISTEN 2>/dev/null || true)"
+  [[ -n "$pids" ]] && kill $pids 2>/dev/null; return 0
+}
+
 cleanup() {
-  [[ -n "$SERVER_PID" ]] && pkill -P "$SERVER_PID" 2>/dev/null; pkill -f "next dev" 2>/dev/null; pkill -f next-server 2>/dev/null
+  [[ -n "$SERVER_PID" ]] && { pkill -P "$SERVER_PID" 2>/dev/null; kill "$SERVER_PID" 2>/dev/null; }; free_port
   if [[ -n "$TMPD" ]]; then su postgres -c "$PG_BIN/pg_ctl -D $TMPD/data -m immediate stop" >/dev/null 2>&1; rm -rf "$TMPD"; fi
 }
 trap cleanup EXIT
 
-pkill -f "next dev" 2>/dev/null; pkill -f next-server 2>/dev/null; pkill -9 -f chrom 2>/dev/null
+free_port
 for i in $(seq 1 20); do curl -s -o /dev/null --max-time 1 "http://localhost:$PORT/" || break; sleep 0.5; done
 rm -rf .next/dev
 
