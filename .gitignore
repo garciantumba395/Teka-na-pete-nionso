@@ -12,3 +12,6 @@ playwright-report/
 
 # images de diff : elles reprennent des captures de l'original
 replica/diffs/*.png
+
+# copies de travail temporaires des agents parallèles
+.claude/worktrees/
