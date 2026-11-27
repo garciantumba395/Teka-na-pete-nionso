@@ -62,6 +62,8 @@ Une seule base, pas de microservices. Le clone n'a pas besoin de l'architecture 
 | Confiance | `disputes`, `dispute_evidence`, `reviews`, `reports`, `sanctions` |
 | Système | `notifications`, `devices`, `webhook_events`, `audit_log` |
 
+**Recherche par rayon** : `items.lat` et `items.lng` stockent une position **approximative**, arrondie côté serveur à 0,01° (≈ 1 km) pour ne jamais exposer l'emplacement exact du vendeur. La fonction `distance_km()` (haversine, sans PostGIS) tranche après un préfiltre par boîte englobante sur l'index `items_geo_idx`.
+
 Les lots (S06) n'ont pas de table propre : une commande de plusieurs articles du même vendeur est un lot.
 
 ### Contraintes dures (la base tranche, pas l'interface)
@@ -112,7 +114,7 @@ Seules les API officielles et publiques des fournisseurs, avec nos propres clés
 | GET /members/{id}/reviews | Avis reçus | anon | curseur | liste | F06 |
 | GET /categories | Arbre des catégories | anon | | arbre | F01, F02 |
 | GET /areas | Zones (pays, province, commune) | anon | parent | liste | F01, F02 |
-| GET /items | Recherche et filtres | anon | q, catégorie, taille, marque, prix, état, zone, tri, curseur | liste | F02 |
+| GET /items | Recherche et filtres, y compris par rayon (`lat`, `lng`, `radius_km`) | anon | q, catégorie, taille, marque, prix, état, zone, rayon, tri, curseur | liste | F02 |
 | GET /items/{id} | Détail d'une annonce | anon | | annonce, photos, vendeur | F02 |
 | POST /items | Crée un brouillon | membre | champs | annonce | F01 |
 | PATCH /items/{id} | Modifie une annonce (active : validation serveur) | vendeur | champs | annonce | F01 |

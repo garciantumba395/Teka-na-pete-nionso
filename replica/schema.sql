@@ -107,6 +107,10 @@ create table items (
   hidden_reason text,
   fix_deadline timestamptz,               -- annonce masquée : délai pour corriger
   area_id uuid references areas(id) on delete set null,
+  -- Position APPROXIMATIVE pour la recherche par rayon. Arrondie côté serveur à 0,01° (≈ 1 km) :
+  -- on ne stocke jamais l'emplacement exact du vendeur.
+  lat numeric(8,5) check (lat between -90 and 90),
+  lng numeric(8,5) check (lng between -180 and 180),
   search tsvector,
   published_at timestamptz,
   created_at timestamptz not null default now(),
@@ -119,6 +123,17 @@ create index on items (status, published_at desc);
 create index items_search_idx on items using gin (search);
 create index items_title_trgm_idx on items using gin (title gin_trgm_ops);
 create index on items (fix_deadline) where status = 'hidden';
+create index items_geo_idx on items (lat, lng) where status = 'active' and lat is not null;
+
+-- Distance en km (haversine), sans PostGIS. Utiliser une boîte englobante sur (lat, lng) pour
+-- préfiltrer via l'index, puis distance_km() pour trancher.
+create or replace function distance_km(lat1 double precision, lng1 double precision,
+                                       lat2 double precision, lng2 double precision)
+returns double precision language sql immutable parallel safe as $$
+  select 2 * 6371.0088 * asin(sqrt(
+    power(sin(radians(lat2 - lat1) / 2), 2) +
+    cos(radians(lat1)) * cos(radians(lat2)) * power(sin(radians(lng2 - lng1) / 2), 2)))
+$$;
 
 create or replace function items_search_update() returns trigger
 language plpgsql as $$

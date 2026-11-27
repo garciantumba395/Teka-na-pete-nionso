@@ -72,6 +72,20 @@ do $$ begin
   raise notice 'FAIL H: payment without target accepted';
 exception when check_violation then raise notice 'PASS H: payment needs exactly one target'; end $$;
 
+-- O. recherche par rayon : Gombe (centre) -> Limete (~6 km) oui, Lubumbashi (~1 400 km) non
+insert into items(id,seller_id,category_id,title,description,condition,price_minor,currency,status,lat,lng)
+ select '00000000-0000-0000-0000-0000000000c2','00000000-0000-0000-0000-0000000000a1',id,'Article Limete','','good',1000,'USD','active',-4.34000,15.35000 from categories;
+insert into items(id,seller_id,category_id,title,description,condition,price_minor,currency,status,lat,lng)
+ select '00000000-0000-0000-0000-0000000000c3','00000000-0000-0000-0000-0000000000a1',id,'Article Lubumbashi','','good',1000,'USD','active',-11.66000,27.48000 from categories;
+select 'O_within_10km(expect 1: Limete)', count(*) from items
+ where status='active' and lat is not null and distance_km(-4.30300, 15.30700, lat::float8, lng::float8) <= 10;
+select 'O_distance_km_Gombe_Limete(expect ~5-7)', round(distance_km(-4.30300,15.30700,-4.34000,15.35000)::numeric,1);
+do $$ begin
+  insert into items(seller_id,category_id,title,condition,price_minor,currency,lat,lng)
+   select '00000000-0000-0000-0000-0000000000a1',id,'Hors plage','good',100,'USD',123.0,0 from categories;
+  raise notice 'FAIL O2: latitude 123 accepted';
+exception when check_violation or numeric_value_out_of_range then raise notice 'PASS O2: invalid latitude rejected'; end $$;
+
 -- I. RLS
 set local role authenticated;
 select set_config('request.jwt.claim.sub','00000000-0000-0000-0000-0000000000b1',true);
