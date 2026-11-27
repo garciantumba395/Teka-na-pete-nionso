@@ -1,5 +1,5 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { FEES, payoutFee, protectionFee } from "../fees";
+import { FEES, payoutFee, protectionFee, shippingFee, shippingZone } from "../fees";
 import { assertTransition } from "../fsm";
 import { coarsen, distanceKm } from "../geo";
 import { codesEqual, checkAttempt, deriveHandoverCode, hashCode, type AttemptState } from "../handover";
@@ -14,6 +14,7 @@ import {
   AppError, type Area, type Category, type ChatMessage, type ConversationSummary, type Currency, type DisputeNote, type DisputeOutcome, type DisputeReason, type DisputeStatus, type DisputeSummary, type DisputeView, type ReportAction, type ReportReason, type ReportStatus, type ReportTarget, type ReportView, type Review, type UserRole, type Item, type ItemCard, type ItemDetail, type ItemQuery,
   type LedgerEntry, type Order, type OrderAction, type OrderView, type Payment, type PaymentMethod, type Payout,
   type ProviderEvent, type PublicProfile, type User, type Wallet,
+  type ShipmentEventKind, type ShipmentStatus, type ShipmentView, type ShippingQuote,
 } from "../types";
 import { CONDITIONS, validateListing, type ListingInput } from "../validation";
 import type { DataLayer } from "./types";
@@ -38,12 +39,18 @@ export interface FakeData extends DataLayer {
 
 interface ShipmentRec {
   orderId: string;
-  status: "pending" | "delivered";
+  status: ShipmentStatus;
   attempt: AttemptState;
   codeHash: string;
-  confirmedBy: "buyer_code" | "courier" | "auto" | null;
+  confirmedBy: "buyer_code" | "buyer" | "courier" | "auto" | null;
+  // ---- agent D : livraison par coursier
+  courierName: string | null;
+  courierPhone: string | null;
+  trackingRef: string | null;
+  events: { id: string; kind: ShipmentEventKind; at: number; note: string | null }[];
 }
 
+const LOST_DEFAULT_TEXT = "Colis signalé perdu : il n'est pas arrivé à destination.";
 const METHODS: PaymentMethod[] = ["mpesa", "orange_money", "airtel_money", "africell_money"];
 const sha256 = (v: string) => createHash("sha256").update(v).digest("hex");
 const norm = (s: string) => s.toLowerCase().normalize("NFD").replace(/\p{M}/gu, "");
@@ -155,6 +162,19 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
     };
   }
 
+  // ---- agent D : livraison par coursier
+  function logShipment(ship: ShipmentRec, kind: ShipmentEventKind, note: string | null = null) {
+    ship.events.push({ id: randomUUID(), kind, at: now(), note });
+  }
+  function shipmentView(order: Order): ShipmentView | null {
+    const ship = order.deliveryMethod === "courier" ? shipments.get(order.id) : undefined;
+    if (!ship) return null;
+    return {
+      status: ship.status, courierName: ship.courierName, courierPhone: ship.courierPhone, trackingRef: ship.trackingRef,
+      events: ship.events.map((e) => ({ ...e })),
+    };
+  }
+
   function view(order: Order, viewerId: string): OrderView {
     if (viewerId !== order.buyerId && viewerId !== order.sellerId) throw notFound("Commande");
     const role = viewerId === order.buyerId ? "buyer" : "seller";
@@ -163,13 +183,29 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
     const ship = shipments.get(order.id);
     const actions: OrderAction[] = [];
     const live = order.status === "paid" || order.status === "in_delivery";
+    const courier = order.deliveryMethod === "courier";
     if (role === "buyer") {
       if (order.status === "pending_payment") actions.push("pay", "cancel");
-      if (live) actions.push("reveal_code", "cancel", "issue");
-      if (order.status === "delivered") actions.push("accept", "issue");
+      if (live && !courier) actions.push("reveal_code", "cancel", "issue");
+      // ---- agent D : livraison par coursier (pas de code ; le colis remis, l'acheteur ne peut plus annuler seul)
+      if (live && courier) {
+        if (order.status === "paid") actions.push("cancel", "issue");
+        else actions.push("confirm_received", "report_lost", "issue");
+      }
+      if (order.status === "delivered") {
+        actions.push("accept");
+        if (order.autoReleaseAt == null || now() < order.autoReleaseAt) actions.push("issue");
+      }
     } else {
       if (order.status === "pending_payment") actions.push("cancel");
-      if (live) actions.push("confirm_delivery", "cancel", "issue");
+      if (live && !courier) actions.push("confirm_delivery", "cancel", "issue");
+      if (live && courier) {
+        if (order.status === "paid") actions.push("ship", "cancel", "issue");
+        else {
+          if (ship?.status === "handed_to_courier") actions.push("mark_in_transit");
+          actions.push("report_lost", "issue");
+        }
+      }
     }
     if (order.status === "completed" && !reviews.some((r) => r.orderId === order.id && r.authorId === viewerId)) actions.push("review");
     const dsp = [...disputes.values()].filter((d) => d.orderId === order.id).sort((a, b) => b.openedAt - a.openedAt)[0];
@@ -181,7 +217,8 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
       }),
       counterpart: profileOf(role === "buyer" ? order.sellerId : order.buyerId),
       payment: pay ? { id: pay.id, status: pay.status, method: pay.method, failureCode: pay.failureCode } : null,
-      handover: role === "seller" && live && ship
+      shipment: shipmentView(order),
+      handover: role === "seller" && live && ship && !courier
         ? { attemptsLeft: Math.max(0, FEES.handoverMaxAttempts - ship.attempt.attempts), lockedUntil: ship.attempt.lockedUntil && ship.attempt.lockedUntil > now() ? ship.attempt.lockedUntil : null }
         : null,
       actions,
@@ -503,8 +540,8 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
     async createOrder(buyerId, input) {
       await api.expireUnpaidOrders();
       if (!users.has(buyerId)) throw notFound("Compte");
-      if (input.deliveryMethod !== "hand_delivery")
-        throw new AppError("NOT_SUPPORTED", "Seule la remise en main propre est disponible pour l'instant.", 400);
+      if (input.deliveryMethod === "relay_point")
+        throw new AppError("NOT_SUPPORTED", "La livraison en point relais n'est pas encore disponible.", 400);
       const ids = [...new Set(input.itemIds)];
       if (!ids.length) throw new AppError("VALIDATION", "Choisis au moins un article.", 422);
       const list = ids.map((id) => items.get(id));
@@ -520,9 +557,19 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
       const currency = its[0].currency;
       const itemsMinor = its.reduce((s, i) => s + i.priceMinor, 0);
       const fee = protectionFee(itemsMinor, currency);
+      // ---- agent D : livraison par coursier (commune de l'acheteur + repère obligatoires, frais selon la grille)
+      let shippingMinor = 0;
+      if (input.deliveryMethod === "courier") {
+        const landmark = input.deliveryLandmark?.trim() ?? "";
+        if (!input.deliveryAreaId || !areas.some((a) => a.id === input.deliveryAreaId && a.kind === "commune"))
+          throw new AppError("VALIDATION", "Choisis ta commune pour la livraison.", 422, { deliveryAreaId: "Choisis ta commune pour la livraison." });
+        if (landmark.length < 3)
+          throw new AppError("VALIDATION", "Décris un repère pour le coursier (3 caractères au moins).", 422, { deliveryLandmark: "Décris un repère pour le coursier (3 caractères au moins)." });
+        shippingMinor = shippingFee(shippingZone(its[0].areaId ?? users.get(its[0].sellerId)?.areaId, input.deliveryAreaId, areas), currency);
+      }
       const order: Order = {
         id: randomUUID(), buyerId, sellerId: its[0].sellerId, status: "pending_payment", currency,
-        itemsMinor, shippingMinor: 0, protectionFeeMinor: fee, totalMinor: itemsMinor + fee,
+        itemsMinor, shippingMinor, protectionFeeMinor: fee, totalMinor: itemsMinor + shippingMinor + fee, autoReleaseAt: null,
         deliveryMethod: input.deliveryMethod, deliveryAreaId: input.deliveryAreaId ?? null,
         deliveryLandmark: input.deliveryLandmark?.trim().slice(0, 200) || null, itemIds: ids,
         paymentExpiresAt: now() + FEES.orderPaymentTtlMs, paidAt: null, deliveredAt: null, completedAt: null, cancelledAt: null, createdAt: now(),
@@ -587,6 +634,7 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
     async getHandoverCode(orderId, buyerId) {
       const order = loadOrder(orderId);
       if (order.buyerId !== buyerId) throw notFound("Commande");
+      if (order.deliveryMethod === "courier") throw new AppError("INVALID_STATE", "La livraison par coursier n'utilise pas de code de remise.", 409);
       if (order.status !== "paid" && order.status !== "in_delivery" && order.status !== "delivered")
         throw new AppError("INVALID_STATE", "Le code est disponible une fois la commande payée.", 409);
       return deriveHandoverCode(orderId);
@@ -596,6 +644,7 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
       const order = loadOrder(orderId);
       if (order.sellerId !== sellerId) throw notFound("Commande");
       if (order.status !== "paid" && order.status !== "in_delivery") throw new AppError("INVALID_STATE", "Cette commande n'attend pas de remise.", 409);
+      if (order.deliveryMethod === "courier") throw new AppError("INVALID_STATE", "Cette commande est livrée par coursier : l'acheteur confirme la réception.", 409);
       const ship = shipments.get(orderId);
       if (!ship) throw new AppError("INVALID_STATE", "Aucune remise en cours pour cette commande.", 409);
       const ok = codesEqual(deriveHandoverCode(orderId), (code ?? "").trim());
@@ -634,6 +683,9 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
         setOrderStatus(order, "cancelled");
         order.cancelledAt = now();
       } else if (order.status === "paid" || order.status === "in_delivery") {
+        // ---- agent D : colis remis au coursier, l'acheteur ne peut plus annuler seul (colis perdu ou litige à la place)
+        if (order.status === "in_delivery" && order.deliveryMethod === "courier" && actorId === order.buyerId)
+          throw new AppError("INVALID_STATE", "Le colis est parti : signale-le comme non reçu ou ouvre un litige.", 409);
         // Non remis : remboursement intégral de l'acheteur.
         await refundEscrow(order);
         setOrderStatus(order, "cancelled");
@@ -670,7 +722,12 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
           order.paidAt = now();
           post(holdEntries(ctx("payment", pay.id, order.currency), order.totalMinor));
           const code = deriveHandoverCode(order.id);
-          shipments.set(order.id, { orderId: order.id, status: "pending", attempt: { attempts: 0, lockedUntil: null }, codeHash: hashCode(code), confirmedBy: null });
+          const ship: ShipmentRec = {
+            orderId: order.id, status: "pending", attempt: { attempts: 0, lockedUntil: null }, codeHash: order.deliveryMethod === "courier" ? "" : hashCode(code), confirmedBy: null,
+            courierName: null, courierPhone: null, trackingRef: null, events: [],
+          };
+          if (order.deliveryMethod === "courier") logShipment(ship, "paid");
+          shipments.set(order.id, ship);
         } else {
           // Paiement arrivé APRÈS expiration ou annulation : on ne garde jamais l'argent, remboursement automatique.
           post(holdEntries(ctx("payment", pay.id, order.currency), pay.amountMinor));
@@ -742,7 +799,11 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
       const order = loadOrder(orderId);
       if (order.buyerId !== userId && order.sellerId !== userId) throw notFound("Commande");
       if (order.status === "disputed") throw new AppError("DISPUTE_EXISTS", "Un litige est déjà ouvert sur cette commande.", 409);
-      if (order.status !== "paid" && order.status !== "in_delivery") throw new AppError("INVALID_STATE", "Un litige ne peut être ouvert que sur une commande payée et pas encore remise.", 409);
+      if (order.status === "delivered") {
+        // ---- agent D : après « reçu » (livraison par coursier), litige possible pour l'acheteur seul, pendant la fenêtre de réclamation
+        if (order.buyerId !== userId) throw new AppError("INVALID_STATE", "Après la livraison, seul l'acheteur peut ouvrir un litige.", 409);
+        if (order.autoReleaseAt == null || now() >= order.autoReleaseAt) throw new AppError("INVALID_STATE", "La fenêtre de réclamation est terminée.", 409);
+      } else if (order.status !== "paid" && order.status !== "in_delivery") throw new AppError("INVALID_STATE", "Un litige ne peut être ouvert que sur une commande payée et pas encore remise.", 409);
       const text = input.description.trim();
       if (text.length < 10) throw new AppError("VALIDATION", "Décris le problème en quelques mots (10 caractères au moins).", 422, { description: "Décris le problème en quelques mots (10 caractères au moins)." });
       if (text.length > 2000) throw new AppError("VALIDATION", "La description est limitée à 2 000 caractères.", 422, { description: "La description est limitée à 2 000 caractères." });
@@ -814,7 +875,8 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
     async expireStalePaidOrders() {
       let n = 0;
       for (const o of orders.values()) {
-        if ((o.status === "paid" || o.status === "in_delivery") && o.paidAt != null && now() - o.paidAt >= FEES.unhandedOrderMs) {
+        // Un colis déjà remis au coursier relève de refundStaleCourierOrders (délai propre), pas de ce filet.
+        if ((o.status === "paid" || o.status === "in_delivery") && !(o.status === "in_delivery" && o.deliveryMethod === "courier") && o.paidAt != null && now() - o.paidAt >= FEES.unhandedOrderMs) {
           await refundEscrow(o);
           setOrderStatus(o, "cancelled");
           o.cancelledAt = now();
@@ -952,6 +1014,108 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
 
     async listPayouts(userId) {
       return [...payouts.values()].filter((p) => p.userId === userId).sort((a, b) => b.requestedAt - a.requestedAt);
+    },
+
+    // ---- agent D : livraison par coursier
+    async quoteShipping(itemId, destAreaId): Promise<ShippingQuote> {
+      const it = items.get(itemId);
+      if (!it || (it.status !== "active" && it.status !== "reserved")) throw notFound("Annonce");
+      if (!areas.some((a) => a.id === destAreaId && a.kind === "commune"))
+        throw new AppError("VALIDATION", "Choisis ta commune pour la livraison.", 422, { areaId: "Choisis ta commune pour la livraison." });
+      const zone = shippingZone(it.areaId ?? users.get(it.sellerId)?.areaId, destAreaId, areas);
+      return { shippingMinor: shippingFee(zone, it.currency), currency: it.currency, zone };
+    },
+
+    async shipOrder(orderId, sellerId, input) {
+      const order = loadOrder(orderId);
+      if (order.sellerId !== sellerId) throw notFound("Commande");
+      if (order.deliveryMethod !== "courier") throw new AppError("INVALID_STATE", "Cette commande est en remise en main propre.", 409);
+      if (order.status !== "paid") throw new AppError("INVALID_STATE", "Tu pourras remettre le colis au coursier une fois la commande payée.", 409);
+      const name = input.courierName.trim();
+      if (name.length < 2 || name.length > 80) throw new AppError("VALIDATION", "Indique le nom du coursier.", 422, { courierName: "Indique le nom du coursier." });
+      const phone = normalizeDrcPhone(input.courierPhone);
+      if (!phone) throw new AppError("VALIDATION", "Numéro du coursier invalide.", 422, { courierPhone: "Numéro du coursier invalide." });
+      const ship = shipments.get(orderId);
+      if (!ship) throw new AppError("INVALID_STATE", "Aucune expédition pour cette commande.", 409);
+      ship.courierName = name;
+      ship.courierPhone = phone;
+      ship.trackingRef = input.trackingRef?.trim().slice(0, 60) || null;
+      ship.status = "handed_to_courier";
+      logShipment(ship, "handed_to_courier");
+      setOrderStatus(order, "in_delivery");
+      return view(order, sellerId);
+    },
+
+    async markInTransit(orderId, sellerId) {
+      const order = loadOrder(orderId);
+      if (order.sellerId !== sellerId) throw notFound("Commande");
+      const ship = shipments.get(orderId);
+      if (order.deliveryMethod !== "courier" || !ship || order.status !== "in_delivery" || ship.status !== "handed_to_courier")
+        throw new AppError("INVALID_STATE", "Le colis doit d'abord être remis au coursier.", 409);
+      ship.status = "in_transit";
+      logShipment(ship, "in_transit");
+      return view(order, sellerId);
+    },
+
+    async confirmReceived(orderId, buyerId) {
+      const order = loadOrder(orderId);
+      if (order.buyerId !== buyerId) throw notFound("Commande");
+      const ship = shipments.get(orderId);
+      if (order.deliveryMethod !== "courier" || !ship) throw new AppError("INVALID_STATE", "Cette commande n'est pas livrée par coursier.", 409);
+      if (order.status !== "in_delivery") throw new AppError("INVALID_STATE", "Le colis n'est pas encore parti : tu pourras confirmer la réception ensuite.", 409);
+      ship.status = "delivered";
+      ship.confirmedBy = "buyer";
+      setOrderStatus(order, "delivered");
+      order.deliveredAt = now();
+      order.autoReleaseAt = now() + FEES.claimWindowMs;
+      logShipment(ship, "received");
+      return view(order, buyerId);
+    },
+
+    async reportParcelLost(orderId, userId, input) {
+      const order = loadOrder(orderId);
+      if (order.buyerId !== userId && order.sellerId !== userId) throw notFound("Commande");
+      const ship = shipments.get(orderId);
+      if (order.deliveryMethod !== "courier" || !ship) throw new AppError("INVALID_STATE", "Cette commande n'est pas livrée par coursier.", 409);
+      if (order.status !== "in_delivery") throw new AppError("INVALID_STATE", "Le colis ne peut être signalé perdu qu'une fois remis au coursier et tant qu'il n'est pas reçu.", 409);
+      const text = (input?.description ?? "").trim() || LOST_DEFAULT_TEXT;
+      const d = await api.openDispute(orderId, userId, { reason: "not_received", description: text });
+      ship.status = "lost_suspected";
+      logShipment(ship, "lost_reported");
+      return d;
+    },
+
+    async releaseDeliveredOrders(o) {
+      const t = o?.at ?? now();
+      let n = 0;
+      for (const order of orders.values()) {
+        if (order.status !== "delivered" || order.deliveryMethod !== "courier" || order.autoReleaseAt == null || order.autoReleaseAt > t) continue;
+        setOrderStatus(order, "completed");
+        order.completedAt = now();
+        release(order);
+        const ship = shipments.get(order.id);
+        if (ship) logShipment(ship, "auto_released");
+        n++;
+      }
+      return n;
+    },
+
+    async refundStaleCourierOrders(o) {
+      const t = o?.at ?? now();
+      let n = 0;
+      for (const order of orders.values()) {
+        if (order.status !== "in_delivery" || order.deliveryMethod !== "courier") continue;
+        const ship = shipments.get(order.id);
+        const handedAt = ship?.events.find((e) => e.kind === "handed_to_courier")?.at;
+        if (!ship || handedAt == null || t - handedAt < FEES.courierStaleMs) continue;
+        await refundEscrow(order);
+        setOrderStatus(order, "cancelled");
+        order.cancelledAt = now();
+        ship.status = "lost_suspected";
+        logShipment(ship, "auto_refunded");
+        n++;
+      }
+      return n;
     },
   };
 

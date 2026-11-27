@@ -167,9 +167,40 @@ export interface Order {
   completedAt: number | null;
   cancelledAt: number | null;
   createdAt: number;
+  /** Livraison par coursier : fin de la fenêtre de réclamation après « reçu ». Libération automatique à cette date, sauf litige. */
+  autoReleaseAt: number | null;
 }
 
-export type OrderAction = "pay" | "cancel" | "reveal_code" | "confirm_delivery" | "accept" | "issue" | "review";
+export type OrderAction =
+  | "pay" | "cancel" | "reveal_code" | "confirm_delivery" | "accept" | "issue" | "review"
+  // livraison par coursier
+  | "ship" | "mark_in_transit" | "confirm_received" | "report_lost";
+
+// ------------------------------------------------------------------------------------------------ livraison par coursier
+export interface ShippingQuote {
+  shippingMinor: number;
+  currency: Currency;
+  zone: "sameCommune" | "sameCity" | "otherCity";
+}
+
+export type ShipmentStatus = "pending" | "handed_to_courier" | "in_transit" | "delivered" | "lost_suspected";
+export type ShipmentEventKind = "paid" | "handed_to_courier" | "in_transit" | "received" | "lost_reported" | "auto_released" | "auto_refunded";
+
+export interface ShipmentEventView {
+  id: string;
+  kind: ShipmentEventKind;
+  at: number;
+  note: string | null;
+}
+
+/** Suivi d'une livraison par coursier. Les coordonnées du coursier n'existent qu'après paiement (l'expédition naît au paiement). */
+export interface ShipmentView {
+  status: ShipmentStatus;
+  courierName: string | null;
+  courierPhone: string | null;
+  trackingRef: string | null;
+  events: ShipmentEventView[];
+}
 
 export interface OrderView extends Order {
   viewerRole: "buyer" | "seller";
@@ -180,6 +211,8 @@ export interface OrderView extends Order {
   actions: OrderAction[];
   /** Litige ouvert ou clos sur cette commande, s'il y en a un. */
   dispute: { id: string; status: DisputeStatus } | null;
+  /** Suivi du colis : seulement pour la livraison par coursier, et seulement après paiement. */
+  shipment: ShipmentView | null;
 }
 
 export interface Payment {
