@@ -39,6 +39,9 @@ export function defineA11y(label: string) {
       await check("S05 vente (erreurs)", bp, "/sell", async () => { await bp.getByRole("button", { name: "Publier l'annonce" }).click(); await bp.locator(".error[role=alert]").first().waitFor(); });
       await check("S08 paiement", bp, `/orders/${pendingId}/pay`);
       await check("S09 commande payée (acheteur, code affiché)", bp, `/orders/${paidId}`, async () => { await bp.getByRole("button", { name: "Afficher mon code" }).click(); await bp.getByRole("img", { name: /Code de remise/ }).waitFor(); });
+      await check("S09 commande payée (acheteur, confirmation de demande d'annulation)", bp, `/orders/${paidId}`, async () => { await bp.getByRole("button", { name: "Demander l'annulation" }).click(); await bp.getByRole("alertdialog").waitFor(); });
+      expect((await buyer.request.post(`/api/v1/orders/${paidId}/cancel-request`, { data: {} })).status()).toBe(200);
+      await check("S09 commande payée (acheteur, demande d'annulation envoyée)", bp, `/orders/${paidId}`);
       await check("S09 commande en attente de paiement", bp, `/orders/${pendingId}`);
       await check("S15 mon profil", bp, "/me");
       await check("S16 portefeuille vide", bp, "/wallet");
@@ -53,7 +56,8 @@ export function defineA11y(label: string) {
       await check("S03 recherche avec marque, taille et état", bp, "/search?brand=zephyr&size=M&condition=good&condition=new");
       // vendeur
       const sp = seller.page;
-      await check("S09 commande payée (vendeur, saisie du code)", sp, `/orders/${paidId}`);
+      await check("S09 commande payée (vendeur, demande d'annulation à traiter + saisie du code)", sp, `/orders/${paidId}`);
+      await check("S09 commande payée (vendeur, confirmation d'acceptation)", sp, `/orders/${paidId}`, async () => { await sp.getByRole("button", { name: "Accepter l'annulation" }).click(); await sp.getByRole("alertdialog").first().waitFor(); });
       await check("S04 fiche (propriétaire)", sp, `/items/${item.id}`);
       await sp.request.post(`/api/v1/orders/${paidId}/confirm-delivery`, { data: { code } });
       await check("S16 portefeuille (avec solde)", sp, "/wallet");

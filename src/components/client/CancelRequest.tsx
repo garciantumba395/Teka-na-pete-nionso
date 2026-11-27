@@ -1,7 +1,7 @@
 "use client";
 
 // Annulation encadrée après paiement (agent A). Côté acheteur : demander / suivre / retirer. Côté vendeur : accepter / refuser.
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { api, ApiError } from "./api";
 import { useHydrated } from "./useHydrated";
@@ -18,8 +18,10 @@ function useCancelAction(orderId: string) {
   const router = useRouter();
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const inFlight = useRef(false); // verrou synchrone : un double clic part avant que « busy » ait eu le temps d'être rendu
   async function run(path: Path, then?: () => void) {
-    if (busy) return;
+    if (inFlight.current) return;
+    inFlight.current = true;
     setBusy(path);
     setError(null);
     try {
@@ -29,6 +31,7 @@ function useCancelAction(orderId: string) {
     } catch (e) {
       setError(e instanceof ApiError ? e.message : "Erreur inattendue.");
     } finally {
+      inFlight.current = false;
       setBusy(null);
     }
   }

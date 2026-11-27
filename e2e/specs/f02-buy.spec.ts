@@ -171,22 +171,32 @@ test.describe("F02 Acheter un article", () => {
     expect((await (await buyer.request.get(`/api/v1/items/${item.id}`)).json()).item.status).toBe("active");
   });
 
-  test("F02-E12 l'acheteur annule après paiement, avant la remise : remboursement intégral", async ({ makeActor }) => {
+  test("F02-E12 l'acheteur ne peut plus annuler seul après paiement : il doit demander l'annulation, rien n'est remboursé tant que le vendeur n'a pas accepté", async ({ makeActor }) => {
     const { buyer, item } = await duo(makeActor);
     const orderId = await apiBuyAndPay(buyer.request, item.id);
+    // côté API : refus net avec un message qui explique la marche à suivre
+    const direct = await buyer.request.post(`/api/v1/orders/${orderId}/cancel`, { data: {} });
+    expect(direct.status()).toBe(409);
+    const err = (await direct.json()).error;
+    expect(err.code).toBe("CANCEL_REQUEST_REQUIRED");
+    expect(err.message).toMatch(/demande l'annulation/);
+    expect(await orderStatus(buyer.request, orderId)).toBe("paid");
+    // côté écran : plus de bouton d'annulation directe, un bouton « Demander l'annulation » avec une explication honnête
     await open(buyer.page, `/orders/${orderId}`);
-    await buyer.page.getByRole("button", { name: "Annuler la commande" }).click();
-    await buyer.page.getByRole("button", { name: /Oui, annuler et me faire rembourser/ }).click();
-    await expect(buyer.page.getByText("Tu as été remboursé en totalité")).toBeVisible();
-    expect((await (await buyer.request.get(`/api/v1/items/${item.id}`)).json()).item.status).toBe("active");
+    await expect(buyer.page.getByRole("button", { name: "Annuler la commande" })).toHaveCount(0);
+    await buyer.page.getByRole("button", { name: "Demander l'annulation" }).click();
+    await expect(buyer.page.getByText(/le vendeur doit accepter/)).toBeVisible();
+    await expect(buyer.page.getByText(/ouvrir un litige/).first()).toBeVisible();
+    await buyer.page.getByRole("button", { name: "Non, ne rien envoyer" }).click();
+    expect(await orderStatus(buyer.request, orderId)).toBe("paid");
     if (isPg()) {
-      // seulement les écritures de CETTE commande : la base est partagée avec les autres tests en cours
+      // l'argent est toujours en séquestre : seulement les écritures de CETTE commande (la base est partagée avec les autres tests en cours)
       const r = await db()!.query(`select coalesce(sum(amount_minor),0)::int as s from ledger_entries where account = 'order_escrow' and (ref_id = $1 or ref_id in (select id from payments where order_id = $1))`, [orderId]);
-      expect(r.rows[0].s).toBe(0);
+      expect(r.rows[0].s).toBe(-2625);
     }
   });
 
-  test("F02-E13 5 mauvais codes : verrouillage, même le bon code refusé, l'acheteur peut encore annuler", async ({ makeActor }) => {
+  test("F02-E13 5 mauvais codes : verrouillage, même le bon code refusé, l'acheteur peut encore demander l'annulation", async ({ makeActor }) => {
     const { seller, buyer, item } = await duo(makeActor);
     const orderId = await apiBuyAndPay(buyer.request, item.id);
     const code = await apiCode(buyer.request, orderId);
@@ -199,7 +209,7 @@ test.describe("F02 Acheter un article", () => {
     await expect(seller.page.getByText(/bloquée un moment|Trop d'essais/).first()).toBeVisible();
     const good = await seller.request.post(`/api/v1/orders/${orderId}/confirm-delivery`, { data: { code } });
     expect(good.status()).toBe(429);
-    const cancel = await buyer.request.post(`/api/v1/orders/${orderId}/cancel`, { data: {} });
+    const cancel = await buyer.request.post(`/api/v1/orders/${orderId}/cancel-request`, { data: {} });
     expect(cancel.status()).toBe(200);
   });
 
