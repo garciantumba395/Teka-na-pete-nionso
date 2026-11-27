@@ -19,7 +19,8 @@ free_port() {
 }
 
 cleanup() {
-  [[ -n "$SERVER_PID" ]] && { pkill -P "$SERVER_PID" 2>/dev/null; kill "$SERVER_PID" 2>/dev/null; }; free_port
+  # Le serveur tourne dans son propre groupe de processus (setsid) : on l'arrête en entier, parent « next dev » compris.
+  [[ -n "$SERVER_PID" ]] && { kill -TERM -- "-$SERVER_PID" 2>/dev/null; sleep 0.5; kill -KILL -- "-$SERVER_PID" 2>/dev/null; }; free_port
   if [[ -n "$TMPD" ]]; then su postgres -c "$PG_BIN/pg_ctl -D $TMPD/data -m immediate stop" >/dev/null 2>&1; rm -rf "$TMPD"; fi
 }
 trap cleanup EXIT
@@ -45,7 +46,8 @@ else
   export DATA_LAYER=fake; unset E2E_DATABASE_URL
 fi
 
-(nohup npx next dev -p "$PORT" > /tmp/e2e-server.log 2>&1 & echo $! > /tmp/e2e-server.pid); SERVER_PID="$(cat /tmp/e2e-server.pid)"
+LOG="/tmp/e2e-server-$PORT.log"; PIDF="/tmp/e2e-server-$PORT.pid"
+(setsid nohup npx next dev -p "$PORT" > "$LOG" 2>&1 & echo $! > "$PIDF"); SERVER_PID="$(cat "$PIDF")"
 for i in $(seq 1 90); do curl -s -o /dev/null -w "%{http_code}" "http://localhost:$PORT/api/health" 2>/dev/null | grep -q 200 && break; sleep 1; done
 # préchauffage : le mode dev compile à la demande, la première requête de chaque route est lente
 for p in / /search /signin /sell /wallet /me /orders/x /items/x /members/x /inbox /api/v1/categories /api/v1/areas; do curl -s -o /dev/null "http://localhost:$PORT$p"; done; sleep 2
