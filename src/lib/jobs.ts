@@ -12,6 +12,8 @@ export const JOBS = {
   refund_unhanded_orders: async () => ({ refunded: await getData().expireStalePaidOrders() }),
   reconcile_pending_payments: async () => ({ resolved: await getData().reconcilePendingPayments() }),
   purge_expired: async () => getData().purgeExpired(),
+  /** Supprime les notifications lues depuis plus de 90 jours (quotidienne). */
+  purge_old_notifications: async () => ({ purged: await getData().purgeOldNotifications() }),
 } as const;
 
 export type JobName = keyof typeof JOBS;

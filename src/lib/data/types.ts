@@ -30,6 +30,7 @@ import type {
   Currency,
   DeliveryMethod,
 } from "../types";
+import type { NotificationList, SmsPreferences } from "../notifications";
 import type { ListingInput } from "../validation";
 
 /**
@@ -132,4 +133,22 @@ export interface DataLayer {
     input: { amountMinor: number; currency: Currency; method: PaymentMethod; msisdn: string; idempotencyKey: string },
   ): Promise<Payout>;
   listPayouts(userId: string): Promise<Payout[]>;
+
+  // ---- agent C : notifications
+  // Notifications internes (centre de notifications). Un membre ne voit QUE les siennes ; une notification d'un tiers = 404.
+  // Les événements (message, commande, litige, avis, signalement, suspension) les créent DANS les méthodes ci-dessus,
+  // dans la même transaction que l'événement, sans jamais notifier l'auteur de l'action.
+  /** Non lues d'abord, puis les plus récentes. `unreadCount` compte TOUTES les non lues, pas seulement la page renvoyée. */
+  listNotifications(userId: string, opts?: { limit?: number }): Promise<NotificationList>;
+  countUnreadNotifications(userId: string): Promise<number>;
+  /** Idempotent. 404 si la notification n'existe pas ou n'est pas à ce membre. */
+  markNotificationRead(userId: string, notificationId: string): Promise<void>;
+  /** Retourne le nombre de notifications passées de non lue à lue. */
+  markAllNotificationsRead(userId: string): Promise<number>;
+  /** Préférences SMS par catégorie (les notifications internes ne se désactivent pas). */
+  getNotificationPreferences(userId: string): Promise<SmsPreferences>;
+  updateNotificationPreferences(userId: string, patch: Partial<SmsPreferences>): Promise<SmsPreferences>;
+  /** Supprime les notifications LUES depuis plus de 90 jours. Retourne leur nombre. */
+  purgeOldNotifications(): Promise<number>;
+  // ---- fin agent C : notifications
 }
