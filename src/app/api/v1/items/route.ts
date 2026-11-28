@@ -2,7 +2,8 @@ import { getData } from "@/lib/data";
 import { asString, handle, json, num, readJson } from "@/lib/http";
 import { enforce } from "@/lib/ratelimit";
 import { itemCreate, parse } from "@/lib/schemas";
-import { requireUser } from "@/lib/session";
+import { parseItemSort } from "@/lib/discovery";
+import { currentUser, requireUser } from "@/lib/session";
 import { CONDITIONS } from "@/lib/validation";
 
 const CONDITION_VALUES = CONDITIONS.map((c) => c.value);
@@ -15,7 +16,11 @@ function conditionsParam(raw: string | null) {
 export async function GET(req: Request) {
   return handle(async () => {
     const p = new URL(req.url).searchParams;
+    const viewer = await currentUser(); // agent H : état « favori » des cartes ; un visiteur reçoit favourited = false
     const items = await getData().listItems({
+      sort: parseItemSort(p.get("sort")), // valeur inconnue ignorée
+      offset: Math.min(Math.max(num(p.get("offset")) ?? 0, 0), 10_000),
+      viewerId: viewer?.id ?? null,
       q: asString(p.get("q"), 100) || undefined,
       categoryId: p.get("category") ?? undefined,
       areaId: p.get("area") ?? undefined,
@@ -30,7 +35,7 @@ export async function GET(req: Request) {
       conditions: conditionsParam(p.get("condition")),
       limit: Math.min(num(p.get("limit")) ?? 60, 100),
     });
-    return json({ items });
+    return json({ items }, 200, viewer ? { Vary: "Cookie", "Cache-Control": "private, no-store" } : { Vary: "Cookie" });
   });
 }
 

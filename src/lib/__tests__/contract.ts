@@ -2624,5 +2624,243 @@ export function defineContract(label: string, factory: () => Promise<ContractEnv
       });
     });
     // ---- fin agent J
+
+    // ---- agent H : découverte (favoris, tri, marques et tailles suivies)
+    describe("découverte : favoris, tri, suivis", () => {
+      const moderator = () => S("user-support-2");
+      /** Annonces d'un test, isolées des données de démonstration par un mot-clé unique. */
+      const word = "zorglub";
+
+      describe("favoris", () => {
+        it("idempotent : une seule ligne par membre, compteur exact, état propre à chaque membre", async () => {
+          const seller = await signup("0811000401", "Vendeuse Fav");
+          const a = await signup("0821000402", "Membre Fav A");
+          const b = await signup("0821000403", "Membre Fav B");
+          const item = await listing(seller.id, { title: `Robe ${word} un` });
+          expect(await data.addFavourite(a.id, item.id)).toEqual({ favourited: true, favouriteCount: 1 });
+          expect(await data.addFavourite(a.id, item.id)).toEqual({ favourited: true, favouriteCount: 1 });
+          expect((await data.getItem(item.id, a.id))).toMatchObject({ favourited: true, favouriteCount: 1, own: false });
+          expect((await data.getItem(item.id, b.id))).toMatchObject({ favourited: false, favouriteCount: 1 });
+          expect((await data.getItem(item.id, null))).toMatchObject({ favourited: false, favouriteCount: 1 });
+          expect((await data.getItem(item.id, seller.id))).toMatchObject({ favourited: false, own: true });
+          expect(await data.addFavourite(b.id, item.id)).toEqual({ favourited: true, favouriteCount: 2 });
+          const card = (viewerId: string | null) => data.listItems({ q: word, viewerId }).then((l) => l.find((c) => c.id === item.id)!);
+          expect(await card(a.id)).toMatchObject({ favourited: true, favouriteCount: 2, own: false });
+          expect(await card(null)).toMatchObject({ favourited: false, favouriteCount: 2 });
+          expect(await card(seller.id)).toMatchObject({ own: true });
+          expect(await data.removeFavourite(a.id, item.id)).toEqual({ favourited: false, favouriteCount: 1 });
+          expect(await data.removeFavourite(a.id, item.id)).toEqual({ favourited: false, favouriteCount: 1 }); // idempotent
+          expect((await card(a.id)).favourited).toBe(false);
+        });
+
+        it("sa propre annonce : 409 ; annonce inconnue ou identifiant invalide : 404", async () => {
+          const seller = await signup("0811000404", "Vendeur Propre");
+          const item = await listing(seller.id);
+          const e = await rejects(data.addFavourite(seller.id, item.id));
+          expect([e.code, e.status]).toEqual(["CANNOT_FAVOURITE_OWN", 409]);
+          expect(code(await rejects(data.addFavourite(seller.id, S("annonce-inconnue"))))).toBe("NOT_FOUND");
+          expect(code(await rejects(data.addFavourite(seller.id, "pas-un-uuid")))).toBe("NOT_FOUND");
+          expect(await data.listFavourites(seller.id)).toEqual([]);
+        });
+
+        it("un membre ne voit que SES favoris, les plus récents d'abord", async () => {
+          const seller = await signup("0811000405", "Vendeuse Liste");
+          const a = await signup("0821000406", "Lectrice A");
+          const b = await signup("0821000407", "Lecteur B");
+          const i1 = await listing(seller.id, { title: "Robe liste 1" });
+          const i2 = await listing(seller.id, { title: "Robe liste 2" });
+          const i3 = await listing(seller.id, { title: "Robe liste 3" });
+          await data.addFavourite(a.id, i1.id);
+          env.advance(1000);
+          await data.addFavourite(a.id, i3.id);
+          env.advance(1000);
+          await data.addFavourite(b.id, i2.id);
+          expect((await data.listFavourites(a.id)).map((c) => c.id)).toEqual([i3.id, i1.id]);
+          expect((await data.listFavourites(b.id)).map((c) => c.id)).toEqual([i2.id]);
+          expect((await data.listFavourites(a.id)).every((c) => c.favourited)).toBe(true);
+          expect(await data.listFavourites(seller.id)).toEqual([]);
+        });
+
+        it("annonce masquée par la modération : disparaît des favoris, ne peut plus être ajoutée, mais se retire quand même", async () => {
+          const seller = await signup("0811000408", "Vendeur Masqué");
+          const a = await signup("0821000409", "Lectrice Masque");
+          const reporter = await signup("0821000410", "Signaleuse Masque");
+          const keep = await listing(seller.id, { title: "Robe gardée" });
+          const hide = await listing(seller.id, { title: "Robe masquée" });
+          await data.addFavourite(a.id, keep.id);
+          await data.addFavourite(a.id, hide.id);
+          expect((await data.listFavourites(a.id)).map((c) => c.id).sort()).toEqual([keep.id, hide.id].sort());
+          const r = await data.createReport(reporter.id, { targetType: "item", targetId: hide.id, reason: "prohibited", details: "" });
+          await data.handleReport(moderator(), r.id, "hide_item");
+          expect((await data.listFavourites(a.id)).map((c) => c.id)).toEqual([keep.id]);
+          expect(code(await rejects(data.addFavourite(reporter.id, hide.id)))).toBe("NOT_FOUND");
+          expect((await data.removeFavourite(a.id, hide.id)).favourited).toBe(false);
+        });
+
+        it("annonce vendue : reste dans les favoris, avec son statut", async () => {
+          const { seller, item, order } = await paidOrder("Acheteur Fav", "+243821000411");
+          const fan = await signup("0821000412", "Admiratrice");
+          await data.addFavourite(fan.id, item.id);
+          expect((await data.listFavourites(fan.id))[0]).toMatchObject({ id: item.id, status: "reserved" });
+          await data.confirmDelivery(order.id, seller.id, deriveHandoverCode(order.id));
+          expect((await data.listFavourites(fan.id))[0]).toMatchObject({ id: item.id, status: "sold" });
+        });
+
+        it("suppression de compte : les favoris du membre disparaissent et le compteur des annonces redescend", async () => {
+          const seller = await signup("0811000413", "Vendeuse Compteur");
+          const leaver = await signup("0821000414", "Partante");
+          const stayer = await signup("0821000415", "Restante");
+          const item = await listing(seller.id);
+          await data.addFavourite(leaver.id, item.id);
+          await data.addFavourite(stayer.id, item.id);
+          expect((await data.getItem(item.id))!.favouriteCount).toBe(2);
+          await data.deleteAccount(leaver.id);
+          expect((await data.getItem(item.id))!.favouriteCount).toBe(1);
+          expect(await data.listFavourites(leaver.id)).toEqual([]);
+          expect((await data.listFavourites(stayer.id)).map((c) => c.id)).toEqual([item.id]);
+        });
+      });
+
+      describe("tri de la recherche", () => {
+        // Prix en dollars équivalents (1 USD = 2 800 FC) : 8 $ < 12,50 $ (35 000 FC) < 15 $ < 20 $ (56 000 FC) < 25 $.
+        async function mixed() {
+          const seller = await signup("0811000420", "Vendeur Tri");
+          const make = async (n: string, priceMinor: number, currency: "USD" | "CDF") => {
+            env.advance(1000);
+            return (await listing(seller.id, { title: `Robe ${word} ${n}`, priceMinor, currency })).id;
+          };
+          const p15 = await make("quinze", 1500, "USD");
+          const p12 = await make("douze", 3_500_000, "CDF");
+          const p8 = await make("huit", 800, "USD");
+          const p20 = await make("vingt", 5_600_000, "CDF");
+          const p25 = await make("vingt-cinq", 2500, "USD");
+          return { seller, p15, p12, p8, p20, p25 };
+        }
+        const ids = async (sort?: "recent" | "price_asc" | "price_desc" | "favourites", extra: Record<string, unknown> = {}) =>
+          (await data.listItems({ q: word, sort, ...extra })).map((c) => c.id);
+
+        it("prix croissant et décroissant : ordre exact, USD et CDF mélangés", async () => {
+          const m = await mixed();
+          expect(await ids("price_asc")).toEqual([m.p8, m.p12, m.p15, m.p20, m.p25]);
+          expect(await ids("price_desc")).toEqual([m.p25, m.p20, m.p15, m.p12, m.p8]);
+        });
+
+        it("plus récent est le tri par défaut ; un tri inconnu côté appelant (undefined) vaut le défaut", async () => {
+          const m = await mixed();
+          const newestFirst = [m.p25, m.p20, m.p8, m.p12, m.p15];
+          expect(await ids()).toEqual(newestFirst);
+          expect(await ids("recent")).toEqual(newestFirst);
+        });
+
+        it("les plus aimés d'abord, puis les plus récents", async () => {
+          const m = await mixed();
+          const fans = [await signup("0821000421", "Fan Un"), await signup("0821000422", "Fan Deux"), await signup("0821000423", "Fan Trois")];
+          for (const f of fans) await data.addFavourite(f.id, m.p12);
+          await data.addFavourite(fans[0].id, m.p8);
+          await data.addFavourite(fans[1].id, m.p8);
+          await data.addFavourite(fans[0].id, m.p25);
+          // 3 favoris : douze ; 2 : huit ; 1 : vingt-cinq ; 0 : vingt puis quinze (le plus récent d'abord)
+          expect(await ids("favourites")).toEqual([m.p12, m.p8, m.p25, m.p20, m.p15]);
+        });
+
+        it("pagination stable : pages successives = liste complète, appels répétés identiques, ex æquo départagés par date puis identifiant", async () => {
+          const seller = await signup("0811000424", "Vendeur Stable");
+          // Trois annonces au même prix ET à la même seconde : seul l'identifiant les départage.
+          const same = [] as string[];
+          for (let n = 0; n < 3; n++) same.push((await listing(seller.id, { title: `Robe ${word} jumelle ${n}`, priceMinor: 1000 })).id);
+          env.advance(1000);
+          const newer = (await listing(seller.id, { title: `Robe ${word} jumelle récente`, priceMinor: 1000 })).id;
+          for (const sort of ["recent", "price_asc", "price_desc", "favourites"] as const) {
+            const full = await ids(sort);
+            expect(full).toHaveLength(4);
+            expect(full[0]).toBe(newer); // même prix, même nombre de favoris : le plus récent d'abord
+            expect(full.slice(1)).toEqual([...same].sort().reverse()); // puis l'identifiant décroissant
+            expect(await ids(sort)).toEqual(full);
+            const pages = [...(await ids(sort, { limit: 2, offset: 0 })), ...(await ids(sort, { limit: 2, offset: 2 }))];
+            expect(pages).toEqual(full);
+          }
+        });
+
+        it("le tri se combine aux filtres (prix maximum en dollars) et à l'état favori du membre", async () => {
+          const m = await mixed();
+          const fan = await signup("0821000425", "Fan Filtre");
+          await data.addFavourite(fan.id, m.p12);
+          const list = await data.listItems({ q: word, sort: "price_desc", maxPriceUsdMinor: 1600, viewerId: fan.id });
+          expect(list.map((c) => c.id)).toEqual([m.p15, m.p12, m.p8]);
+          expect(list.map((c) => c.favourited)).toEqual([false, true, false]);
+        });
+      });
+
+      describe("marques et tailles suivies", () => {
+        it("ajout idempotent sans accent ni casse, texte nettoyé, retrait idempotent", async () => {
+          const me = await signup("0821000430", "Suiveuse");
+          expect(await data.getFollows(me.id)).toEqual({ brands: [], sizes: [] });
+          await data.addFollow(me.id, "brand", "  Zéphyr \u0000 Paris ");
+          await data.addFollow(me.id, "brand", "zephyr paris");
+          const f = await data.addFollow(me.id, "brand", "ZÉPHYR   PARIS");
+          expect(f).toEqual({ brands: ["Zéphyr Paris"], sizes: [] });
+          await data.addFollow(me.id, "size", "m");
+          expect(await data.getFollows(me.id)).toEqual({ brands: ["Zéphyr Paris"], sizes: ["m"] });
+          await data.removeFollow(me.id, "brand", "ZEPHYR paris");
+          expect(await data.removeFollow(me.id, "brand", "ZEPHYR paris")).toEqual({ brands: [], sizes: ["m"] });
+        });
+
+        it("vide ou trop long : 422 ; 10 marques et 10 tailles au plus, indépendamment, un retrait libère une place", async () => {
+          const me = await signup("0821000431", "Suiveuse Limite");
+          expect(code(await rejects(data.addFollow(me.id, "brand", "   ")))).toBe("VALIDATION");
+          expect(code(await rejects(data.addFollow(me.id, "brand", "x".repeat(41))))).toBe("VALIDATION");
+          expect(code(await rejects(data.addFollow(me.id, "size", "x".repeat(21))))).toBe("VALIDATION");
+          for (let i = 1; i <= 10; i++) await data.addFollow(me.id, "brand", `Marque ${i}`);
+          const e = await rejects(data.addFollow(me.id, "brand", "Marque 11"));
+          expect([e.code, e.status]).toEqual(["FOLLOW_LIMIT", 422]);
+          await data.addFollow(me.id, "brand", "marque 3"); // déjà suivie : pas un nouvel ajout, donc pas de refus
+          for (let i = 1; i <= 10; i++) await data.addFollow(me.id, "size", `T${i}`); // les tailles ont leur propre plafond
+          expect(code(await rejects(data.addFollow(me.id, "size", "T11")))).toBe("FOLLOW_LIMIT");
+          await data.removeFollow(me.id, "brand", "Marque 1");
+          expect((await data.addFollow(me.id, "brand", "Marque 11")).brands).toHaveLength(10);
+        });
+
+        it("« Pour toi » : marque OU taille, sans accent ni casse, jamais mes annonces ni les annonces inactives, 12 au plus, récentes d'abord", async () => {
+          const seller = await signup("0811000432", "Vendeuse Pour Toi");
+          const me = await signup("0821000433", "Lectrice Pour Toi");
+          expect(await data.listForYou(me.id)).toEqual([]); // rien de suivi
+          const mk = async (title: string, over: Record<string, unknown>, who = seller.id) => {
+            env.advance(1000);
+            return (await listing(who, { title, ...over })).id;
+          };
+          const byBrand = await mk("Robe marque", { brand: "Zéphyrine", sizeLabel: "XL" });
+          const bySize = await mk("Robe taille", { brand: "Autre", sizeLabel: "zq9" });
+          const none = await mk("Robe hors suivi", { brand: "Autre", sizeLabel: "S" });
+          const mine = await mk("Ma robe", { brand: "Zephyrine", sizeLabel: "ZQ9" }, me.id);
+          const hiddenRep = await signup("0821000434", "Signaleuse Pour Toi");
+          const hidden = await mk("Robe masquée", { brand: "ZEPHYRINE" });
+          await data.handleReport(moderator(), (await data.createReport(hiddenRep.id, { targetType: "item", targetId: hidden, reason: "prohibited", details: "" })).id, "hide_item");
+          await data.addFollow(me.id, "brand", "zephyrine");
+          await data.addFollow(me.id, "size", "ZQ9 ");
+          const feed = (await data.listForYou(me.id)).map((c) => c.id);
+          expect(feed).toEqual([bySize, byBrand]); // plus récent d'abord
+          expect(feed).not.toContain(none);
+          expect(feed).not.toContain(mine);
+          expect(feed).not.toContain(hidden);
+          // Les suivis d'un autre membre ne changent rien.
+          expect(await data.listForYou(seller.id)).toEqual([]);
+          // Plafond de 12.
+          for (let i = 0; i < 14; i++) await mk(`Robe suivie ${i}`, { brand: "Zephyrine" });
+          const many = await data.listForYou(me.id);
+          expect(many).toHaveLength(12);
+          expect(many.every((c) => c.status === "active" && !c.own)).toBe(true);
+        });
+
+        it("suppression de compte : les suivis disparaissent", async () => {
+          const me = await signup("0821000435", "Suiveuse Partante");
+          await data.addFollow(me.id, "brand", "Nike");
+          await data.addFollow(me.id, "size", "42");
+          await data.deleteAccount(me.id);
+          expect(await data.getFollows(me.id)).toEqual({ brands: [], sizes: [] });
+          expect(await data.listForYou(me.id)).toEqual([]);
+        });
+      });
+    });
+    // ---- fin agent H
   });
 }

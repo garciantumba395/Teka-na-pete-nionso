@@ -9,6 +9,8 @@ import {
   releaseEntries, type NewEntry,
 } from "../../ledger";
 import { USD_CDF_PLACEHOLDER } from "../../money";
+import { cleanFollowValue, followKey, followLimitError, FOLLOW_MAX, FOR_YOU_MAX, type Follows } from "../../discovery";
+import { cleanLine } from "../../text";
 import { FakeMobileMoneyProvider } from "../../payments/fake-provider";
 import type { PaymentProvider } from "../../payments/provider";
 import { detectOffPlatform, MESSAGE_MAX } from "../../messaging";
@@ -344,8 +346,22 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
       protectedPriceMinor: r.price_minor + protectionFee(r.price_minor, r.currency, fees),
       status: r.status, photo: r.first_photo ? photoUrl(r.first_photo) : null, meta, areaName: r.area_name ?? null,
       distanceKm: dist === null ? null : Math.round(dist * 10) / 10,
+      favouriteCount: Number(r.fav_count ?? 0), favourited: !!r.fav, own: !!r.own,
     };
   }
+  // ---- agent H : colonnes communes des cartes (photo, lieu, nombre de favoris, état favori du membre `viewerParam`)
+  const CARD_COLS = (viewerParam: string) => `i.*, a.name as area_name,
+    (select storage_path from item_photos where item_id = i.id order by position limit 1) as first_photo,
+    (select count(*)::int from favourites f where f.item_id = i.id) as fav_count,
+    exists(select 1 from favourites f where f.item_id = i.id and f.user_id = ${viewerParam}::uuid) as fav,
+    coalesce(i.seller_id = ${viewerParam}::uuid, false) as own`;
+  const FAVOURABLE = ["active", "reserved", "sold"];
+  async function followsOf(q: Queryable, userId: string): Promise<Follows> {
+    const r = await q.query(`select kind, label from member_follows where user_id = $1 order by seq`, [userId]);
+    return { brands: r.rows.filter((x) => x.kind === "brand").map((x) => x.label as string), sizes: r.rows.filter((x) => x.kind === "size").map((x) => x.label as string) };
+  }
+  const RECENT_ORDER = "i.published_at desc nulls last, i.created_at desc, i.id desc";
+  // ---- fin agent H
 
   const itemOf = (r: Row, photos: string[]): Item => ({
     id: r.id, sellerId: r.seller_id, categoryId: r.category_id, title: r.title, description: r.description, condition: r.condition as Condition,
@@ -634,6 +650,7 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
         await c.query(`delete from sessions where user_id = $1`, [userId]);
         await c.query(`delete from favourites where user_id = $1`, [userId]);
         await c.query(`delete from cart_items where user_id = $1`, [userId]); // ---- agent J
+        await c.query(`delete from member_follows where user_id = $1`, [userId]); // agent H
         await c.query(`delete from devices where user_id = $1`, [userId]);
         await c.query(`delete from notifications where user_id = $1`, [userId]);
         await c.query(`delete from notification_preferences where user_id = $1`, [userId]);
@@ -746,7 +763,12 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
       if (q.minPriceUsdMinor != null) where.push(`${usd} >= ${p(q.minPriceUsdMinor)}`);
       if (q.maxPriceUsdMinor != null) where.push(`${usd} <= ${p(q.maxPriceUsdMinor)}`);
       let distSql = "null::float8";
-      let order = "i.published_at desc nulls last, i.created_at desc";
+      let order = RECENT_ORDER;
+      // agent H : tri choisi. Prix comparé en centimes de FC sans arrondi (même taux que le filtre) ; départage : plus récent puis id.
+      const priceKey = `(case when i.currency = 'USD' then i.price_minor * ${USD_CDF_PLACEHOLDER} else i.price_minor end)`;
+      const sortOrder = q.sort === "price_asc" ? `${priceKey} asc, ${RECENT_ORDER}` : q.sort === "price_desc" ? `${priceKey} desc, ${RECENT_ORDER}`
+        : q.sort === "favourites" ? `fav_count desc, ${RECENT_ORDER}` : null;
+      const viewer = p(q.viewerId && isUuid(q.viewerId) ? q.viewerId : null);
       if (q.radiusKm != null && from) {
         const dLat = q.radiusKm / 111;
         const dLng = q.radiusKm / (111 * Math.max(0.1, Math.cos((from.lat * Math.PI) / 180)));
@@ -754,16 +776,17 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
         const la = p(from.lat), lo = p(from.lng);
         distSql = `distance_km(${la}::float8, ${lo}::float8, i.lat::float8, i.lng::float8)`;
         where.push(`${distSql} <= ${p(q.radiusKm)}`);
-        order = "dist asc";
+        order = q.sort === "recent" ? RECENT_ORDER : `dist asc, ${RECENT_ORDER}`;
       } else if (from) {
         distSql = `distance_km(${p(from.lat)}::float8, ${p(from.lng)}::float8, i.lat::float8, i.lng::float8)`;
       }
+      if (sortOrder) order = sortOrder;
       const limit = Math.min(Math.max(q.limit ?? 60, 1), 100);
+      const offset = Math.max(Math.floor(q.offset ?? 0), 0);
       const r = await pool.query(
-        `select i.*, a.name as area_name, ${distSql} as dist,
-           (select storage_path from item_photos where item_id = i.id order by position limit 1) as first_photo
+        `select ${CARD_COLS(viewer)}, ${distSql} as dist
          from items i left join areas a on a.id = i.area_id
-         where ${where.join(" and ")} order by ${order} limit ${limit}`,
+         where ${where.join(" and ")} order by ${order} limit ${limit} offset ${offset}`,
         params,
       );
       return r.rows.map((x) => cardOf(x, fees, q.radiusKm != null && x.dist != null ? x.dist : null));
@@ -774,9 +797,12 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
       const r = await pool.query(
         `select i.*, a.name as area_name, c.name->>'fr' as category_name, p.id as p_id, p.display_name, p.bio, p.area_id as p_area, p.verification_level,
            p.rating_avg, p.rating_count, p.deleted_at,
-           (select storage_path from item_photos where item_id = i.id order by position limit 1) as first_photo
+           (select storage_path from item_photos where item_id = i.id order by position limit 1) as first_photo,
+           (select count(*)::int from favourites f where f.item_id = i.id) as fav_count,
+           exists(select 1 from favourites f where f.item_id = i.id and f.user_id = $2::uuid) as fav,
+           coalesce(i.seller_id = $2::uuid, false) as own
          from items i left join areas a on a.id = i.area_id left join categories c on c.id = i.category_id join profiles p on p.id = i.seller_id
-         where i.id = $1`, [id]);
+         where i.id = $1`, [id, viewerId && isUuid(viewerId) ? viewerId : null]);
       const x = r.rows[0];
       if (!x) return null;
       if (["draft", "hidden", "removed"].includes(x.status) && x.seller_id !== viewerId) return null;
@@ -1757,6 +1783,83 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
       return cartOf(pool, userId);
     },
     // ---- fin agent J
+
+    // ---- agent H : découverte
+    async addFavourite(userId, itemId) {
+      if (!isUuid(userId)) throw notFound("Compte");
+      if (!isUuid(itemId)) throw notFound("Annonce");
+      return withTx(pool, async (c) => {
+        const me = (await c.query(`select 1 from profiles where id = $1 and deleted_at is null`, [userId])).rows[0];
+        if (!me) throw notFound("Compte");
+        const it = (await c.query(`select seller_id, status from items where id = $1`, [itemId])).rows[0];
+        if (!it || !FAVOURABLE.includes(it.status)) throw notFound("Annonce");
+        if (it.seller_id === userId) throw new AppError("CANNOT_FAVOURITE_OWN", "Tu ne peux pas mettre ta propre annonce en favori.", 409);
+        await c.query(`insert into favourites (user_id, item_id, created_at) values ($1, $2, $3) on conflict do nothing`, [userId, itemId, ts(now())]);
+        const n = (await c.query(`select count(*)::int as n from favourites where item_id = $1`, [itemId])).rows[0].n as number;
+        return { favourited: true as const, favouriteCount: n };
+      });
+    },
+    async removeFavourite(userId, itemId) {
+      if (!isUuid(userId) || !isUuid(itemId)) return { favourited: false as const, favouriteCount: 0 };
+      await pool.query(`delete from favourites where user_id = $1 and item_id = $2`, [userId, itemId]);
+      const n = (await pool.query(`select count(*)::int as n from favourites where item_id = $1`, [itemId])).rows[0].n as number;
+      return { favourited: false as const, favouriteCount: n };
+    },
+    async listFavourites(userId) {
+      if (!isUuid(userId)) return [];
+      const fees = await getFees();
+      const r = await pool.query(
+        `select ${CARD_COLS("$1")}
+         from favourites fv join items i on i.id = fv.item_id left join areas a on a.id = i.area_id
+         where fv.user_id = $1 and i.status = any($2::text[])
+         order by fv.created_at desc, fv.item_id desc limit 200`,
+        [userId, FAVOURABLE],
+      );
+      return r.rows.map((x) => cardOf(x, fees));
+    },
+    async getFollows(userId) {
+      return followsOf(pool, userId);
+    },
+    async addFollow(userId, kind, value) {
+      if (!isUuid(userId)) throw notFound("Compte");
+      const label = cleanFollowValue(kind, value);
+      const key = followKey(label);
+      return withTx(pool, async (c) => {
+        const me = (await c.query(`select 1 from profiles where id = $1 and deleted_at is null`, [userId])).rows[0];
+        if (!me) throw notFound("Compte");
+        await c.query(`select pg_advisory_xact_lock(hashtext($1))`, [`follow:${userId}`]); // le plafond tient même avec deux ajouts simultanés
+        const exists = (await c.query(`select 1 from member_follows where user_id = $1 and kind = $2 and value_key = $3`, [userId, kind, key])).rowCount;
+        if (!exists) {
+          const n = (await c.query(`select count(*)::int as n from member_follows where user_id = $1 and kind = $2`, [userId, kind])).rows[0].n as number;
+          if (n >= FOLLOW_MAX) throw followLimitError(kind);
+          await c.query(`insert into member_follows (user_id, kind, value_key, label, created_at) values ($1,$2,$3,$4,$5)`, [userId, kind, key, label, ts(now())]);
+        }
+        return followsOf(c, userId);
+      });
+    },
+    async removeFollow(userId, kind, value) {
+      if (!isUuid(userId)) return { brands: [], sizes: [] };
+      await pool.query(`delete from member_follows where user_id = $1 and kind = $2 and value_key = $3`, [userId, kind, followKey(cleanLine(String(value ?? "")))]);
+      return followsOf(pool, userId);
+    },
+    async listForYou(userId, o) {
+      if (!isUuid(userId)) return [];
+      const f = await followsOf(pool, userId);
+      if (!f.brands.length && !f.sizes.length) return [];
+      const fees = await getFees();
+      const limit = Math.min(Math.max(o?.limit ?? FOR_YOU_MAX, 1), FOR_YOU_MAX);
+      const r = await pool.query(
+        `select ${CARD_COLS("$1")}
+         from items i left join areas a on a.id = i.area_id
+         where i.status = 'active' and i.seller_id <> $1
+           and (exists (select 1 from member_follows m where m.user_id = $1 and m.kind = 'brand' and m.value_key = regexp_replace(trim(unaccent(lower(coalesce(i.brand, '')))), '\\s+', ' ', 'g'))
+             or exists (select 1 from member_follows m where m.user_id = $1 and m.kind = 'size' and m.value_key = regexp_replace(trim(unaccent(lower(coalesce(i.size_label, '')))), '\\s+', ' ', 'g')))
+         order by ${RECENT_ORDER} limit ${limit}`,
+        [userId],
+      );
+      return r.rows.map((x) => cardOf(x, fees));
+    },
+    // ---- fin agent H
 
     async listPayouts(userId) {
       const r = await pool.query(`select * from payouts where user_id = $1 order by requested_at desc limit 100`, [userId]);

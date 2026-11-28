@@ -4,6 +4,7 @@ import { notFound } from "next/navigation";
 import { AddToCartButton } from "@/components/client/AddToCartButton";
 import { BuyButton } from "@/components/client/BuyButton";
 import { DeliveryPicker } from "@/components/client/DeliveryChoice";
+import { FavouriteButton } from "@/components/client/FavouriteButton";
 import { StartChatButton } from "@/components/client/StartChatButton";
 import { Icon } from "@/components/icons";
 import { AppBar, Avatar, Banner, PriceTag, Stars } from "@/components/ui";
@@ -63,6 +64,10 @@ export default async function ItemPage({ params }: Props) {
             <div className="stack">
               <h1 className="h1" style={{ overflowWrap: "anywhere" }}>{item.title}</h1>
               <PriceTag item={item} large />
+              {!own && (item.status === "active" || item.status === "reserved" || item.status === "sold") && (
+                <FavouriteButton itemId={item.id} favourited={item.favourited} count={item.favouriteCount} variant="detail" />
+              )}
+              {own && item.favouriteCount > 0 && <span className="hint">{item.favouriteCount} favori{item.favouriteCount > 1 ? "s" : ""}</span>}
               {item.protectedPriceMinor > item.priceMinor && (
                 <p className="hint" style={{ margin: 0 }}>
                   La protection acheteur ({formatMoney(item.protectedPriceMinor - item.priceMinor, item.currency)}) garde ton argent en sécurité jusqu&apos;à la remise de l&apos;article.

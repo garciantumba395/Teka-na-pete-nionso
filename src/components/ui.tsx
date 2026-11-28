@@ -4,6 +4,7 @@ import { formatMoney } from "@/lib/money";
 import { SHIPMENT_EVENT_LABEL } from "@/lib/copy-courier";
 import { formatDateTimeShort } from "@/lib/datetime";
 import type { DeliveryMethod, ItemCard, OrderStatus, ShipmentView } from "@/lib/types";
+import { FavouriteButton } from "./client/FavouriteButton";
 import { Icon, type IconName } from "./icons";
 
 // Primitives présentationnelles (sans état). Mêmes classes que replica/design/primitives.css.
@@ -89,8 +90,17 @@ export function PriceTag({ item, large = false }: { item: Pick<ItemCard, "priceM
   );
 }
 
-export function ListingCard({ item, showDistance = false }: { item: ItemCard; showDistance?: boolean }) {
-  const unavailable = item.status === "sold" || item.status === "reserved";
+export function ListingCard({ item, showDistance = false, favouriteVariant = "card" }: { item: ItemCard; showDistance?: boolean; favouriteVariant?: "card" | "list" }) {
+  // Le cœur est un bouton FRÈRE du lien (jamais dedans : un bouton dans un lien est invalide et ferait naviguer).
+  return (
+    <div className="card-wrap">
+      <ListingCardLink item={item} showDistance={showDistance} />
+      {item.own ? null : <FavouriteButton itemId={item.id} favourited={item.favourited} count={item.favouriteCount} variant={favouriteVariant} />}
+    </div>
+  );
+}
+
+function ListingCardLink({ item, showDistance }: { item: ItemCard; showDistance: boolean }) {
   return (
     <Link href={`/items/${item.id}`} className="card">
       <div className="media">

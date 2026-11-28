@@ -35,6 +35,7 @@ export default async function MePage() {
           <Link href="/wallet" className="row row-link"><span className="lead"><Icon name="wallet" /> Portefeuille</span><Icon name="chev" /></Link>
           <Link href="/sell" className="row row-link"><span className="lead"><Icon name="plus" /> Vendre un article</span><Icon name="chev" /></Link>
           <Link href="/favourites" className="row row-link"><span className="lead"><Icon name="heart" /> Favoris</span><Icon name="chev" /></Link>
+          <Link href="/me/preferences" className="row row-link"><span className="lead"><Icon name="search" /> Mes préférences (marques et tailles)</span><Icon name="chev" /></Link>
           {["moderator", "support", "admin"].includes(me.role ?? "member") && <Link href="/staff" className="row row-link"><span className="lead"><Icon name="shield" /> Assistance</span><Icon name="chev" /></Link>}
           <Link href={`/members/${me.id}`} className="row row-link"><span className="lead"><Icon name="user" /> Mon profil public</span><Icon name="chev" /></Link>
         </nav>

@@ -35,6 +35,7 @@ import type {
   CartView,
 } from "../types";
 import type { PublicProhibitedRule } from "../prohibited";
+import type { Follows, FollowKind } from "../discovery";
 import type { NotificationList, SmsPreferences } from "../notifications";
 import type { ListingInput } from "../validation";
 
@@ -231,4 +232,24 @@ export interface DataLayer {
   /** Idempotent : retirer un article absent ne fait pas d'erreur. */
   removeFromCart(userId: string, itemId: string): Promise<CartView>;
   // ---- fin agent J
+
+  // ---- agent H : découverte (favoris, marques et tailles suivies, fil « Pour toi »)
+  /**
+   * Met une annonce en favori. Idempotent. 404 si l'annonce n'existe pas ou n'est pas visible (brouillon, masquée, retirée),
+   * 409 CANNOT_FAVOURITE_OWN si c'est l'annonce du membre. Retourne le nombre de favoris de l'annonce.
+   */
+  addFavourite(userId: string, itemId: string): Promise<{ favourited: true; favouriteCount: number }>;
+  /** Retire un favori. Idempotent, même si l'annonce a disparu. */
+  removeFavourite(userId: string, itemId: string): Promise<{ favourited: false; favouriteCount: number }>;
+  /** Favoris du membre, les plus récemment ajoutés d'abord ; disponibles, réservés ou vendus (jamais brouillon, masqué, retiré). Un membre ne lit que les siens. */
+  listFavourites(userId: string): Promise<ItemCard[]>;
+  /** Marques et tailles suivies (libellés tels que saisis, nettoyés). */
+  getFollows(userId: string): Promise<Follows>;
+  /** Suit une marque ou une taille. Idempotent (sans accent ni casse). 422 FOLLOW_LIMIT au-delà de 10 par type, 422 si vide. */
+  addFollow(userId: string, kind: FollowKind, value: string): Promise<Follows>;
+  /** Cesse de suivre (même comparaison). Idempotent. */
+  removeFollow(userId: string, kind: FollowKind, value: string): Promise<Follows>;
+  /** Annonces actives récentes correspondant à une marque OU une taille suivie, hors annonces du membre. 12 au plus. */
+  listForYou(userId: string, opts?: { limit?: number }): Promise<ItemCard[]>;
+  // ---- fin agent H
 }

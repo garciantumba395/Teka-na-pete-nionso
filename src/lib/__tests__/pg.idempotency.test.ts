@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, it } from "vitest";
 import { seedId as S } from "../data/ids";
-import type { AppError } from "../types";
+import type { AppError, User } from "../types";
 import { endTestPool, makePgEnv, TEST_URL } from "./pg-env";
 
 const suite = TEST_URL ? describe : describe.skip;
