@@ -22,6 +22,10 @@ export const JOBS = {
   release_delivered_orders: async (o?: JobOptions) => ({ released: await getData().releaseDeliveredOrders(o) }),
   /** Rembourse les colis restés « remis au coursier » trop longtemps sans livraison. */
   refund_stale_courier_orders: async (o?: JobOptions) => ({ refunded: await getData().refundStaleCourierOrders(o) }),
+  // ---- agent F : rappels
+  /** Prévient les deux parties des demandes d'annulation sans réponse, et rappelle à l'acheteur la fin proche de la fenêtre de réclamation. */
+  send_order_reminders: async (o?: JobOptions) => ({ cancelExpired: await getData().notifyExpiredCancelRequests(o), claimReminders: await getData().remindClaimWindows(o) }),
+  // ---- fin agent F
   /** Supprime les notifications lues depuis plus de 90 jours (quotidienne). */
   purge_old_notifications: async () => ({ purged: await getData().purgeOldNotifications() }),
 } as const;

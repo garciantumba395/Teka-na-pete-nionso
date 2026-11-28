@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { deriveHandoverCode } from "../handover";
 import { FEES } from "../fees";
+import { describeNotification } from "../notifications";
 import { AppError, type LedgerEntry, type ProviderEvent } from "../types";
 import { seedId as S } from "../data/ids";
 import type { DataLayer } from "../data/types";
@@ -1710,5 +1711,357 @@ export function defineContract(label: string, factory: () => Promise<ContractEnv
       });
     });
     // ---- fin agent C : notifications
+
+    // ---- agent F : notifications manquantes (annulation encadrée, coursier, messagerie, preuves, modération)
+    describe("notifications ajoutées (agent F)", () => {
+      const HOUR = 3_600_000;
+      const COURIER = { courierName: "Papy Moto", courierPhone: "0899000111", trackingRef: "MOTO-42" };
+      const SAFE_KEYS = new Set(["conversationId", "orderId", "itemId", "disputeId", "itemTitle", "senderName", "count", "role", "auto", "refunded", "outcome", "rating", "until"]);
+      const notifSms = () => env.sentSms().filter((s) => !/ton code/.test(s.text));
+      const list = async (id: string) => (await data.listNotifications(id)).items;
+      const ofKind = async (id: string, kind: string) => (await list(id)).filter((n) => n.kind === kind);
+      const kinds = async (id: string) => (await list(id)).map((n) => n.kind).sort();
+      const marieId = () => S("user-marie");
+      /** Aucun contenu sensible : clés connues seulement, ni numéro de téléphone, ni code de remise, ni montant dans la charge utile ou le texte. */
+      async function expectSafe(userId: string, orderIds: string[] = []) {
+        for (const n of await list(userId)) {
+          for (const k of Object.keys(n.payload)) expect(SAFE_KEYS.has(k), `${n.kind}.${k}`).toBe(true);
+          const json = JSON.stringify(n.payload);
+          expect(json, n.kind).not.toMatch(/\+?243\d{6}|\b0[89]\d{8}\b/);
+          for (const id of orderIds) expect(json, n.kind).not.toContain(deriveHandoverCode(id));
+          const d = describeNotification(n);
+          expect(`${d.title} ${d.body}`, n.kind).not.toMatch(/\$|USD|CDF|FC|\d{3,}/);
+        }
+      }
+      async function courierOrder(phone: string) {
+        const seller = (await data.getUser(marieId()))!;
+        const buyer = await signup(phone, "Acheteur Coursier F");
+        const item = await listing(seller.id, { priceMinor: 10_000 });
+        const order = await data.createOrder(buyer.id, { itemIds: [item.id], deliveryMethod: "courier", deliveryAreaId: S("area-com-limete"), deliveryLandmark: "Avenue de la Paix, portail bleu" });
+        await data.startPayment(order.id, buyer.id, { method: "mpesa", msisdn: "0821111111", idempotencyKey: `k-${order.id}` });
+        await env.flush();
+        return { seller, buyer, item, order };
+      }
+      async function shipped(phone: string) {
+        const o = await courierOrder(phone);
+        await data.shipOrder(o.order.id, o.seller.id, COURIER);
+        return o;
+      }
+      async function inTransit(phone: string) {
+        const o = await shipped(phone);
+        await data.markInTransit(o.order.id, o.seller.id);
+        return o;
+      }
+      async function received(phone: string) {
+        const o = await inTransit(phone);
+        await data.confirmReceived(o.order.id, o.buyer.id);
+        return o;
+      }
+
+      // ------------------------------------------------------------------ annulation encadrée
+      it("demande d'annulation : le vendeur est prévenu (notification + SMS), jamais l'acheteur ; rejouer ne crée rien", async () => {
+        const { order, buyer, seller } = await paidOrder("Acheteur F1", "+243821900101");
+        await data.requestCancellation(order.id, buyer.id);
+        const got = await ofKind(seller.id, "cancel_requested");
+        expect(got).toHaveLength(1);
+        expect(got[0].payload).toEqual({ orderId: order.id, itemTitle: "Robe test", role: "seller" });
+        expect(describeNotification(got[0]).href).toBe(`/orders/${order.id}`);
+        expect(await kinds(buyer.id)).toEqual([]);
+        // l'événement rejoué (double clic, nouvelle tentative réseau) : refusé, aucune notification de plus
+        expect(code(await rejects(data.requestCancellation(order.id, buyer.id)))).toBe("CANCEL_REQUEST_EXISTS");
+        expect(await ofKind(seller.id, "cancel_requested")).toHaveLength(1);
+        await env.settleSms();
+        const sms = notifSms().filter((s) => /demande l'annulation/.test(s.text));
+        expect(sms).toHaveLength(1);
+        expect(sms[0].to).toBe(seller.phone);
+        expect(sms[0].text).not.toMatch(/\d/);
+        await expectSafe(seller.id, [order.id]);
+      });
+
+      it("demande d'annulation : la préférence SMS « commandes » coupe le SMS mais pas la notification", async () => {
+        const { order, buyer, seller } = await paidOrder("Acheteur F2", "+243821900102");
+        await data.updateNotificationPreferences(seller.id, { orders: false });
+        await data.requestCancellation(order.id, buyer.id);
+        await env.settleSms();
+        expect(await ofKind(seller.id, "cancel_requested")).toHaveLength(1);
+        expect(notifSms().filter((s) => /demande l'annulation/.test(s.text))).toEqual([]);
+      });
+
+      it("demande retirée : le vendeur est prévenu, pas l'acheteur ; une nouvelle demande crée une nouvelle notification", async () => {
+        const { order, buyer, seller } = await paidOrder("Acheteur F3", "+243821900103");
+        await data.requestCancellation(order.id, buyer.id);
+        await data.withdrawCancellation(order.id, buyer.id);
+        const w = await ofKind(seller.id, "cancel_withdrawn");
+        expect(w).toHaveLength(1);
+        expect(w[0].payload).toMatchObject({ orderId: order.id, role: "seller" });
+        expect(describeNotification(w[0]).href).toBe(`/orders/${order.id}`);
+        expect((await kinds(buyer.id)).filter((k) => k.startsWith("cancel_"))).toEqual([]);
+        expect(code(await rejects(data.withdrawCancellation(order.id, buyer.id)))).toBe("CANCEL_REQUEST_NONE");
+        expect(await ofKind(seller.id, "cancel_withdrawn")).toHaveLength(1);
+        await data.requestCancellation(order.id, buyer.id);
+        expect(await ofKind(seller.id, "cancel_requested")).toHaveLength(2); // deux demandes distinctes, deux événements
+      });
+
+      it("demande acceptée : l'acheteur apprend que la commande est annulée et remboursée ; pas le vendeur", async () => {
+        const { order, buyer, seller } = await paidOrder("Acheteur F4", "+243821900104");
+        await data.requestCancellation(order.id, buyer.id);
+        await data.acceptCancellation(order.id, seller.id);
+        const a = await ofKind(buyer.id, "cancel_accepted");
+        expect(a).toHaveLength(1);
+        expect(a[0].payload).toMatchObject({ orderId: order.id, role: "buyer", refunded: true });
+        const d = describeNotification(a[0]);
+        expect(d.body).toContain("remboursé");
+        expect(d.href).toBe(`/orders/${order.id}`);
+        expect((await kinds(seller.id)).filter((k) => k.startsWith("cancel_") && k !== "cancel_requested")).toEqual([]);
+        expect(code(await rejects(data.acceptCancellation(order.id, seller.id)))).toBe("INVALID_STATE");
+        expect(await ofKind(buyer.id, "cancel_accepted")).toHaveLength(1);
+        await expectSafe(buyer.id, [order.id]);
+      });
+
+      it("demande refusée : l'acheteur est prévenu et peut ouvrir un litige ; pas le vendeur", async () => {
+        const { order, buyer, seller } = await paidOrder("Acheteur F5", "+243821900105");
+        await data.requestCancellation(order.id, buyer.id);
+        await data.declineCancellation(order.id, seller.id);
+        const n = await ofKind(buyer.id, "cancel_declined");
+        expect(n).toHaveLength(1);
+        expect(n[0].payload).toMatchObject({ orderId: order.id, role: "buyer" });
+        expect(describeNotification(n[0]).body).toContain("litige");
+        expect((await kinds(seller.id)).filter((k) => k === "cancel_declined")).toEqual([]);
+        expect(code(await rejects(data.declineCancellation(order.id, seller.id)))).toBe("CANCEL_REQUEST_NONE");
+        expect(await ofKind(buyer.id, "cancel_declined")).toHaveLength(1);
+      });
+
+      it("demande sans réponse : les deux parties sont prévenues une seule fois, seulement après le délai, jamais si la demande est résolue", async () => {
+        const { order, buyer, seller } = await paidOrder("Acheteur F6", "+243821900106");
+        await data.requestCancellation(order.id, buyer.id);
+        env.advance(FEES.cancelRequestTtlMs - 60_000);
+        expect(await data.notifyExpiredCancelRequests()).toBe(0);
+        env.advance(120_000);
+        expect(await data.notifyExpiredCancelRequests()).toBe(1);
+        const b = await ofKind(buyer.id, "cancel_expired");
+        const s = await ofKind(seller.id, "cancel_expired");
+        expect([b.length, s.length]).toEqual([1, 1]);
+        expect(b[0].payload).toMatchObject({ orderId: order.id, role: "buyer" });
+        expect(s[0].payload).toMatchObject({ orderId: order.id, role: "seller" });
+        expect(describeNotification(b[0]).body).toContain("refusée");
+        // tâche rejouée : rien de plus
+        expect(await data.notifyExpiredCancelRequests()).toBe(0);
+        expect(await ofKind(buyer.id, "cancel_expired")).toHaveLength(1);
+        expect(await ofKind(seller.id, "cancel_expired")).toHaveLength(1);
+        await expectSafe(buyer.id, [order.id]);
+        // une demande retirée ou refusée avant le délai n'expire jamais
+        const o2 = await paidOrder("Acheteur F6b", "+243821900107");
+        await data.requestCancellation(o2.order.id, o2.buyer.id);
+        await data.withdrawCancellation(o2.order.id, o2.buyer.id);
+        const o3 = await paidOrder("Acheteur F6c", "+243821900108");
+        await data.requestCancellation(o3.order.id, o3.buyer.id);
+        await data.declineCancellation(o3.order.id, o3.seller.id);
+        env.advance(FEES.cancelRequestTtlMs + HOUR);
+        expect(await data.notifyExpiredCancelRequests()).toBe(0);
+        expect(await ofKind(o2.buyer.id, "cancel_expired")).toEqual([]);
+        expect(await ofKind(o3.buyer.id, "cancel_expired")).toEqual([]);
+      });
+
+      // ------------------------------------------------------------------ livraison par coursier
+      it("colis remis au coursier : l'acheteur est prévenu (notification + SMS), pas le vendeur ; rejouer ne crée rien", async () => {
+        const { order, buyer, seller } = await shipped("+243821900111");
+        const n = await ofKind(buyer.id, "parcel_handed");
+        expect(n).toHaveLength(1);
+        expect(n[0].payload).toEqual({ orderId: order.id, itemTitle: "Robe test", role: "buyer" });
+        expect(describeNotification(n[0]).href).toBe(`/orders/${order.id}`);
+        expect(await ofKind(seller.id, "parcel_handed")).toEqual([]);
+        expect(code(await rejects(data.shipOrder(order.id, seller.id, COURIER)))).toBe("INVALID_STATE");
+        expect(await ofKind(buyer.id, "parcel_handed")).toHaveLength(1);
+        await env.settleSms();
+        const sms = notifSms().filter((s) => /remis au coursier/.test(s.text));
+        expect(sms).toHaveLength(1);
+        expect(sms[0].to).toBe(buyer.phone);
+        expect(sms[0].text).not.toMatch(/\d/);
+        // seuls « commande payée » (vendeur) et « colis remis » (acheteur) partent par SMS dans tout ce parcours
+        expect(notifSms()).toHaveLength(2);
+        await expectSafe(buyer.id, [order.id]);
+      });
+
+      it("colis en route : l'acheteur est prévenu, sans SMS ; rejouer ne crée rien", async () => {
+        const { order, buyer, seller } = await inTransit("+243821900112");
+        const n = await ofKind(buyer.id, "parcel_in_transit");
+        expect(n).toHaveLength(1);
+        expect(n[0].payload).toMatchObject({ orderId: order.id, role: "buyer" });
+        expect(await ofKind(seller.id, "parcel_in_transit")).toEqual([]);
+        expect(code(await rejects(data.markInTransit(order.id, seller.id)))).toBe("INVALID_STATE");
+        expect(await ofKind(buyer.id, "parcel_in_transit")).toHaveLength(1);
+        await env.settleSms();
+        expect(notifSms()).toHaveLength(2); // commande payée + colis remis, rien de plus
+      });
+
+      it("colis reçu : le vendeur est prévenu (la fenêtre démarre), pas l'acheteur ; rejouer ne crée rien", async () => {
+        const { order, buyer, seller } = await received("+243821900113");
+        const n = await ofKind(seller.id, "parcel_received");
+        expect(n).toHaveLength(1);
+        expect(n[0].payload).toEqual({ orderId: order.id, itemTitle: "Robe test", role: "seller" });
+        expect(describeNotification(n[0]).body).toContain("48 heures");
+        expect(await ofKind(buyer.id, "parcel_received")).toEqual([]);
+        expect(code(await rejects(data.confirmReceived(order.id, buyer.id)))).toBe("INVALID_STATE");
+        expect(await ofKind(seller.id, "parcel_received")).toHaveLength(1);
+        await expectSafe(seller.id, [order.id]);
+      });
+
+      it("rappel à l'acheteur : seulement à mi-fenêtre, une seule fois, pas après la libération, jamais au vendeur", async () => {
+        const { order, buyer, seller } = await received("+243821900114");
+        expect(await data.remindClaimWindows()).toBe(0); // 48 h restantes
+        env.advance(FEES.claimWindowMs / 2 - 60_000);
+        expect(await data.remindClaimWindows()).toBe(0); // un peu plus de la moitié restante
+        env.advance(120_000);
+        expect(await data.remindClaimWindows()).toBe(1);
+        const n = await ofKind(buyer.id, "claim_reminder");
+        expect(n).toHaveLength(1);
+        expect(n[0].payload).toEqual({ orderId: order.id, itemTitle: "Robe test", role: "buyer" });
+        expect(describeNotification(n[0]).body).toContain("litige");
+        expect(await data.remindClaimWindows()).toBe(0); // rejouée
+        expect(await ofKind(buyer.id, "claim_reminder")).toHaveLength(1);
+        expect(await ofKind(seller.id, "claim_reminder")).toEqual([]);
+        // après la fin de la fenêtre, plus de rappel (la libération a lieu)
+        const o2 = await received("+243821900115");
+        env.advance(FEES.claimWindowMs + HOUR);
+        expect(await data.remindClaimWindows()).toBe(0);
+        expect(await ofKind(o2.buyer.id, "claim_reminder")).toEqual([]);
+      });
+
+      it("libération automatique : les deux parties sont prévenues une seule fois, sans montant ; le vendeur apprend que l'argent est disponible", async () => {
+        const { order, buyer, seller } = await received("+243821900116");
+        expect(await data.releaseDeliveredOrders({ at: env.now() + FEES.claimWindowMs - 1 })).toBe(0);
+        expect(await ofKind(seller.id, "order_auto_released")).toEqual([]);
+        env.advance(FEES.claimWindowMs + 1);
+        expect(await data.releaseDeliveredOrders()).toBe(1);
+        const s = await ofKind(seller.id, "order_auto_released");
+        const b = await ofKind(buyer.id, "order_auto_released");
+        expect([s.length, b.length]).toEqual([1, 1]);
+        expect(s[0].payload).toEqual({ orderId: order.id, itemTitle: "Robe test", role: "seller" });
+        expect(describeNotification(s[0]).body).toContain("portefeuille");
+        expect(describeNotification(b[0]).body).toContain("finalisée");
+        expect(await data.releaseDeliveredOrders()).toBe(0); // tâche rejouée
+        expect(await ofKind(seller.id, "order_auto_released")).toHaveLength(1);
+        expect(await ofKind(buyer.id, "order_auto_released")).toHaveLength(1);
+        await env.settleSms();
+        expect(notifSms()).toHaveLength(2); // aucun SMS pour la libération
+        await expectSafe(seller.id, [order.id]);
+        await expectSafe(buyer.id, [order.id]);
+      });
+
+      it("colis non reçu ou perdu : l'autre partie est prévenue (sous ce type, pas en « litige ouvert »), jamais l'auteur", async () => {
+        const a = await inTransit("+243821900117");
+        await data.reportParcelLost(a.order.id, a.buyer.id, { description: "Le colis n'est jamais arrivé chez moi." });
+        const n = await ofKind(a.seller.id, "parcel_lost");
+        expect(n).toHaveLength(1);
+        expect(n[0].payload).toMatchObject({ orderId: a.order.id, itemTitle: "Robe test" });
+        expect(describeNotification(n[0]).href).toBe(`/orders/${a.order.id}/dispute`);
+        expect(await ofKind(a.seller.id, "dispute_opened")).toEqual([]);
+        expect(await kinds(a.buyer.id).then((k) => k.filter((x) => x === "parcel_lost" || x === "dispute_opened"))).toEqual([]);
+        expect(code(await rejects(data.reportParcelLost(a.order.id, a.buyer.id, { description: "Le colis n'est jamais arrivé chez moi." })))).toBe("INVALID_STATE");
+        expect(await ofKind(a.seller.id, "parcel_lost")).toHaveLength(1);
+        // signalé par le vendeur : c'est l'acheteur qui est prévenu
+        const b = await inTransit("+243821900118");
+        await data.reportParcelLost(b.order.id, b.seller.id, { description: "Le coursier ne répond plus du tout." });
+        expect(await ofKind(b.buyer.id, "parcel_lost")).toHaveLength(1);
+        expect((await ofKind(b.seller.id, "parcel_lost")).filter((x) => x.payload.orderId === b.order.id)).toEqual([]); // le vendeur (auteur) n'est pas prévenu de SON signalement
+        await expectSafe(b.buyer.id, [b.order.id]);
+      });
+
+      it("remboursement automatique d'un colis resté chez le coursier : les deux parties sont prévenues une seule fois", async () => {
+        const { order, buyer, seller } = await shipped("+243821900119");
+        env.advance(FEES.courierStaleMs - HOUR);
+        expect(await data.refundStaleCourierOrders()).toBe(0);
+        expect(await ofKind(buyer.id, "parcel_auto_refunded")).toEqual([]);
+        env.advance(2 * HOUR);
+        expect(await data.refundStaleCourierOrders()).toBe(1);
+        const b = await ofKind(buyer.id, "parcel_auto_refunded");
+        const s = await ofKind(seller.id, "parcel_auto_refunded");
+        expect([b.length, s.length]).toEqual([1, 1]);
+        expect(b[0].payload).toEqual({ orderId: order.id, itemTitle: "Robe test", role: "buyer" });
+        expect(describeNotification(b[0]).body).toContain("remboursé");
+        expect(await data.refundStaleCourierOrders()).toBe(0);
+        expect(await ofKind(buyer.id, "parcel_auto_refunded")).toHaveLength(1);
+        await expectSafe(buyer.id, [order.id]);
+        await expectSafe(seller.id, [order.id]);
+      });
+
+      // ------------------------------------------------------------------ messagerie et preuves
+      it("photo reçue : notifie comme un message, dans la même notification regroupée de la conversation, jamais l'auteur", async () => {
+        const seller = await signup("0811900121", "Vendeuse Photo F");
+        const buyer = await signup("0821900122", "Acheteur Photo F");
+        const item = await listing(seller.id);
+        const conv = await data.startConversation(buyer.id, item.id);
+        await data.sendMessage(conv.id, buyer.id, "Voici ma question.");
+        await data.sendPhotoMessage(conv.id, buyer.id, { body: "", photo: PHOTO });
+        const l = await data.listNotifications(seller.id);
+        expect(l.items).toHaveLength(1);
+        expect(l.items[0]).toMatchObject({ kind: "message_received", read: false });
+        expect(l.items[0].payload).toMatchObject({ conversationId: conv.id, count: 2, senderName: "Acheteur Photo F" });
+        expect(await kinds(buyer.id)).toEqual([]);
+        // photo seule : crée la notification de la conversation, puis la réponse photo prévient l'autre côté
+        const item2 = await listing(seller.id, { title: "Robe F2" });
+        const conv2 = await data.startConversation(buyer.id, item2.id);
+        await data.sendPhotoMessage(conv2.id, seller.id, { body: "Voilà", photo: PHOTO });
+        expect((await list(buyer.id)).filter((n) => n.payload.conversationId === conv2.id)).toHaveLength(1);
+        expect((await list(seller.id)).filter((n) => n.payload.conversationId === conv2.id)).toEqual([]);
+        // ouvrir la conversation lit la notification ; la photo suivante en crée une nouvelle
+        await data.getConversation(conv.id, seller.id);
+        expect((await data.listNotifications(seller.id)).unreadCount).toBe(0);
+        await data.sendPhotoMessage(conv.id, buyer.id, { body: "", photo: PHOTO });
+        expect((await data.listNotifications(seller.id)).unreadCount).toBe(1);
+        await expectSafe(seller.id);
+      });
+
+      it("preuve ajoutée à un litige : l'autre partie est prévenue (les deux si c'est l'assistance), jamais l'auteur ; une notification par preuve", async () => {
+        const { seller, buyer, order } = await paidOrder("Acheteur F7", "+243821900131");
+        const d = await data.openDispute(order.id, buyer.id, { reason: "not_as_described", description: "La robe ne ressemble pas aux photos." });
+        await data.addDisputeEvidence(d.id, buyer.id, { photo: PHOTO, note: "Détail de la tache" });
+        const n = await ofKind(seller.id, "dispute_evidence");
+        expect(n).toHaveLength(1);
+        expect(n[0].payload).toEqual({ orderId: order.id, disputeId: d.id, itemTitle: "Robe test" });
+        expect(describeNotification(n[0]).href).toBe(`/orders/${order.id}/dispute`);
+        expect(await ofKind(buyer.id, "dispute_evidence")).toEqual([]);
+        await data.addDisputeEvidence(d.id, buyer.id, { photo: PHOTO });
+        expect(await ofKind(seller.id, "dispute_evidence")).toHaveLength(2);
+        await data.addDisputeEvidence(d.id, seller.id, { photo: PHOTO });
+        expect(await ofKind(buyer.id, "dispute_evidence")).toHaveLength(1);
+        expect(await ofKind(seller.id, "dispute_evidence")).toHaveLength(2);
+        // l'assistance ajoute une preuve : les deux parties sont prévenues
+        await data.addDisputeEvidence(d.id, S("user-support-1"), { photo: PHOTO });
+        expect(await ofKind(buyer.id, "dispute_evidence")).toHaveLength(2);
+        expect(await ofKind(seller.id, "dispute_evidence")).toHaveLength(3);
+        // une preuve refusée (litige clos) ne notifie personne
+        await data.resolveDispute(S("user-support-1"), d.id, "refund_buyer", "Remboursement.");
+        expect(code(await rejects(data.addDisputeEvidence(d.id, buyer.id, { photo: PHOTO })))).toBe("INVALID_STATE");
+        expect(await ofKind(seller.id, "dispute_evidence")).toHaveLength(3);
+        await expectSafe(seller.id, [order.id]);
+      });
+
+      // ------------------------------------------------------------------ modération
+      it("annonce masquée par la modération : son vendeur est prévenu, sans détail du signalement ; ni le signaleur, ni l'assistance", async () => {
+        const seller = await signup("0811900141", "Vendeur Masqué");
+        const reporter = await signup("0821900142", "Signaleur Masque");
+        const item = await listing(seller.id, { title: "Montre test" });
+        const r = await data.createReport(reporter.id, { targetType: "item", targetId: item.id, reason: "scam", details: "Demande un paiement hors application, voici son numéro 0899123456." });
+        await data.handleReport(S("user-support-2"), r.id, "hide_item");
+        const n = await ofKind(seller.id, "listing_hidden");
+        expect(n).toHaveLength(1);
+        expect(n[0].payload).toEqual({ itemId: item.id, itemTitle: "Montre test" });
+        const d = describeNotification(n[0]);
+        expect(d.href).toBe(`/items/${item.id}`);
+        expect(`${d.title} ${d.body}`).not.toMatch(/scam|arnaque|paiement|0899|signal/i);
+        expect(await ofKind(reporter.id, "listing_hidden")).toEqual([]);
+        expect(await ofKind(S("user-support-2"), "listing_hidden")).toEqual([]);
+        expect(code(await rejects(data.handleReport(S("user-support-2"), r.id, "hide_item")))).toBe("INVALID_STATE");
+        expect(await ofKind(seller.id, "listing_hidden")).toHaveLength(1);
+        // classé sans suite : le vendeur n'apprend rien
+        const item2 = await listing(seller.id, { title: "Sac test" });
+        const r2 = await data.createReport(reporter.id, { targetType: "item", targetId: item2.id, reason: "other", details: "" });
+        await data.handleReport(S("user-support-2"), r2.id, "dismiss");
+        expect(await ofKind(seller.id, "listing_hidden")).toHaveLength(1);
+        await expectSafe(seller.id);
+      });
+    });
+    // ---- fin agent F
   });
 }

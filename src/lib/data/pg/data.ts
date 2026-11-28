@@ -1041,21 +1041,25 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
 
     // ---- agent A : annulation encadrée
     async requestCancellation(orderId, buyerId) {
+      const jobs: SmsJob[] = [];
       await withTx(pool, async (c) => {
-        await cancelCtx(c, orderId, buyerId, "buyer");
+        const order = await cancelCtx(c, orderId, buyerId, "buyer");
         const st = await cancelRequestsOf(c, orderId);
         if (st.livePending) throw new AppError("CANCEL_REQUEST_EXISTS", "Ta demande d'annulation est déjà envoyée au vendeur.", 409);
         if (st.refused) throw new AppError("CANCEL_REQUEST_REFUSED", "Le vendeur n'a pas accepté l'annulation. Si tu as un problème avec cette commande, ouvre un litige.", 409);
-        await c.query(`insert into order_cancel_requests (order_id, requested_by, requested_at) values ($1,$2,$3)`, [orderId, buyerId, ts(now())]);
+        const req = (await c.query(`insert into order_cancel_requests (order_id, requested_by, requested_at) values ($1,$2,$3) returning id`, [orderId, buyerId, ts(now())])).rows[0];
+        await notifyTx(c, { userId: order.sellerId, kind: "cancel_requested", payload: { orderId, itemTitle: await orderTitleOf(c, orderId), role: "seller" }, eventKey: `cancel_requested:${req.id}` }, jobs); // agent F
       });
+      fireSms(jobs);
       return buildView(pool, await loadOrder(pool, orderId), buyerId);
     },
 
     async withdrawCancellation(orderId, buyerId) {
       await withTx(pool, async (c) => {
-        await cancelCtx(c, orderId, buyerId, "buyer");
+        const order = await cancelCtx(c, orderId, buyerId, "buyer");
         const id = await pendingRequestTx(c, orderId);
         await c.query(`update order_cancel_requests set status = 'withdrawn', resolved_at = $2, resolved_by = $3 where id = $1`, [id, ts(now()), buyerId]);
+        await notifyTx(c, { userId: order.sellerId, kind: "cancel_withdrawn", payload: { orderId, itemTitle: await orderTitleOf(c, orderId), role: "seller" }, eventKey: `cancel_withdrawn:${id}` }); // agent F
       });
       return buildView(pool, await loadOrder(pool, orderId), buyerId);
     },
@@ -1068,6 +1072,7 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
         refund = await refundEscrowTx(c, order);
         await c.query(`update orders set status = 'cancelled', cancelled_at = $2 where id = $1`, [orderId, ts(now())]);
         await c.query(`update order_cancel_requests set status = 'accepted', resolved_at = $2, resolved_by = $3 where id = $1`, [id, ts(now()), sellerId]);
+        await notifyTx(c, { userId: order.buyerId, kind: "cancel_accepted", payload: { orderId, itemTitle: await orderTitleOf(c, orderId), role: "buyer", refunded: true }, eventKey: `cancel_accepted:${id}` }); // agent F
       });
       if (refund) await refundAtProvider(refund);
       return buildView(pool, await loadOrder(pool, orderId), sellerId);
@@ -1075,9 +1080,10 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
 
     async declineCancellation(orderId, sellerId) {
       await withTx(pool, async (c) => {
-        await cancelCtx(c, orderId, sellerId, "seller");
+        const order = await cancelCtx(c, orderId, sellerId, "seller");
         const id = await pendingRequestTx(c, orderId);
         await c.query(`update order_cancel_requests set status = 'declined', resolved_at = $2, resolved_by = $3 where id = $1`, [id, ts(now()), sellerId]);
+        await notifyTx(c, { userId: order.buyerId, kind: "cancel_declined", payload: { orderId, itemTitle: await orderTitleOf(c, orderId), role: "buyer" }, eventKey: `cancel_declined:${id}` }); // agent F
       });
       return buildView(pool, await loadOrder(pool, orderId), sellerId);
     },
@@ -1254,6 +1260,10 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
           `insert into private_photos (owner_id, mime, size, content, message_id, created_at) values ($1,$2,$3,$4,$5,$6) returning id`,
           [senderId, photo.mime, photo.bytes.length, photo.bytes, m.id, at])).rows[0];
         await tx.query(`update conversations set last_message_at = $2 where id = $1`, [conversationId, at]);
+        // agent F : une photo reçue notifie comme un message (même regroupement par conversation)
+        const other = c.buyer_id === senderId ? c.seller_id : c.buyer_id;
+        const title = (await tx.query(`select i.title from conversations cv join items i on i.id = cv.item_id where cv.id = $1`, [conversationId])).rows[0]?.title;
+        await notifyTx(tx, { userId: other, kind: "message_received", payload: { conversationId, itemTitle: title ?? "Article", senderName: c.my_name as string }, groupKey: `conv:${conversationId}` });
         return { id: m.id as string, photoId: ph.id as string };
       });
       return { id: row.id, mine: true, kind: "image" as const, body: text, photoUrl: privatePhotoUrl(row.photoId), senderName: c.my_name as string, flagged: flagged !== null, createdAt: at.getTime() };
@@ -1280,6 +1290,10 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
         await c.query(
           `insert into private_photos (id, owner_id, mime, size, content, evidence_id, created_at) values ($1,$2,$3,$4,$5,$6,$7)`,
           [photoId, authorId, photo.mime, photo.bytes.length, photo.bytes, e.id, at]);
+        // agent F : l'autre partie est prévenue (les deux parties si c'est l'assistance)
+        const order = await loadOrder(c, (await c.query(`select order_id from disputes where id = $1`, [disputeId])).rows[0].order_id as string);
+        const title = await orderTitleOf(c, order.id);
+        await notifyParties(c, order, () => ({ kind: "dispute_evidence", payload: { orderId: order.id, disputeId, itemTitle: title }, eventKey: `dispute_evidence:${e.id}` }), undefined, authorId);
       });
       return disputeViewOf(pool, disputeId, authorId);
     },
@@ -1502,7 +1516,9 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
         if (action === "dismiss") status = "dismissed";
         else if (action === "hide_item") {
           if (r.target_type !== "item") throw new AppError("VALIDATION", "Seule une annonce peut être masquée.", 422);
-          await c.query(`update items set status = 'hidden', updated_at = $2 where id = $1 and status = 'active'`, [r.target_id, ts(now())]);
+          const hid = (await c.query(`update items set status = 'hidden', updated_at = $2 where id = $1 and status = 'active' returning id, seller_id, title`, [r.target_id, ts(now())])).rows[0];
+          // agent F : le vendeur est prévenu, sans le détail du signalement (ni motif, ni auteur)
+          if (hid && hid.seller_id !== staffId) await notifyTx(c, { userId: hid.seller_id, kind: "listing_hidden", payload: { itemId: hid.id, itemTitle: hid.title }, eventKey: `listing_hidden:${reportId}` });
         } else {
           const userId = r.target_type === "user" ? r.target_id : (await c.query(`select seller_id from items where id = $1`, [r.target_id])).rows[0]?.seller_id;
           if (!userId) throw notFound("Membre");
@@ -1666,6 +1682,7 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
       if (!isUuid(orderId)) throw notFound("Commande");
       const name = input.courierName.trim();
       const phone = normalizeDrcPhone(input.courierPhone);
+      const jobs: SmsJob[] = [];
       await withTx(pool, async (c) => {
         const order = await loadOrder(c, orderId, true);
         if (order.sellerId !== sellerId) throw notFound("Commande");
@@ -1680,7 +1697,9 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
           [ship.id, name, phone, input.trackingRef?.trim().slice(0, 60) || null]);
         await c.query(`update orders set status = 'in_delivery', in_delivery_at = $2 where id = $1`, [orderId, ts(now())]);
         await logShipment(c, ship.id, orderId, "handed_to_courier", sellerId);
+        await notifyTx(c, { userId: order.buyerId, kind: "parcel_handed", payload: { orderId, itemTitle: await orderTitleOf(c, orderId), role: "buyer" }, eventKey: `parcel_handed:${orderId}` }, jobs); // agent F
       });
+      fireSms(jobs);
       return buildView(pool, await loadOrder(pool, orderId), sellerId);
     },
 
@@ -1694,6 +1713,7 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
           throw new AppError("INVALID_STATE", "Le colis doit d'abord être remis au coursier.", 409);
         await c.query(`update shipments set status = 'in_transit' where id = $1`, [ship.id]);
         await logShipment(c, ship.id, orderId, "in_transit", sellerId);
+        await notifyTx(c, { userId: order.buyerId, kind: "parcel_in_transit", payload: { orderId, itemTitle: await orderTitleOf(c, orderId), role: "buyer" }, eventKey: `parcel_in_transit:${orderId}` }); // agent F
       });
       return buildView(pool, await loadOrder(pool, orderId), sellerId);
     },
@@ -1710,6 +1730,7 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
         await c.query(`update shipments set status = 'delivered', delivered_confirmed_by = 'buyer' where id = $1`, [ship.id]);
         await c.query(`update orders set status = 'delivered', delivered_at = $2, auto_release_at = $3 where id = $1`, [orderId, ts(now()), ts(now() + fees.claimWindowMs)]);
         await logShipment(c, ship.id, orderId, "received", buyerId);
+        await notifyTx(c, { userId: order.sellerId, kind: "parcel_received", payload: { orderId, itemTitle: await orderTitleOf(c, orderId), role: "seller" }, eventKey: `parcel_received:${orderId}` }); // agent F
       });
       return buildView(pool, await loadOrder(pool, orderId), buyerId);
     },
@@ -1731,10 +1752,61 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
           [orderId, userId, text, ts(now())])).rows[0];
         await c.query(`update shipments set status = 'lost_suspected' where id = $1`, [ship.id]);
         await logShipment(c, ship.id, orderId, "lost_reported", userId);
+        const other = userId === order.buyerId ? order.sellerId : order.buyerId;
+        await notifyTx(c, { userId: other, kind: "parcel_lost", payload: { orderId, disputeId: d.id, itemTitle: await orderTitleOf(c, orderId) }, eventKey: `parcel_lost:${d.id}` }); // agent F
         return d.id as string;
       });
       return disputeViewOf(pool, id, userId);
     },
+
+    // ---- agent F : rappels et expirations notifiés
+    async notifyExpiredCancelRequests(o) {
+      const fees = await getFees();
+      const at = o?.at ?? now();
+      const rows = (await pool.query(
+        `select r.id, r.order_id from order_cancel_requests r join orders o on o.id = r.order_id
+         where r.status = 'pending' and r.requested_at <= $1 and o.status in ('paid','in_delivery') order by r.requested_at limit 200`, [ts(at - fees.cancelRequestTtlMs)])).rows;
+      let n = 0;
+      for (const r of rows) {
+        const fresh = await withTx(pool, async (c) => {
+          const order = await loadOrder(c, r.order_id as string, true);
+          if (order.status !== "paid" && order.status !== "in_delivery") return false; // acceptée, retirée ou commande close entre-temps
+          const still = (await c.query(`select 1 from order_cancel_requests where id = $1 and status = 'pending'`, [r.id])).rowCount;
+          if (!still) return false;
+          const title = await orderTitleOf(c, order.id);
+          const key = `cancel_expired:${r.id}`;
+          const before = (await c.query(`select count(*)::int as n from notifications where event_key = $1`, [key])).rows[0].n as number;
+          await notifyParties(c, order, (role) => ({ kind: "cancel_expired", payload: { orderId: order.id, itemTitle: title, role }, eventKey: key }));
+          const after = (await c.query(`select count(*)::int as n from notifications where event_key = $1`, [key])).rows[0].n as number;
+          return after > before; // rejouée : rien de nouveau
+        });
+        if (fresh) n++;
+      }
+      return n;
+    },
+
+    async remindClaimWindows(o) {
+      const fees = await getFees();
+      const at = o?.at ?? now();
+      const rows = (await pool.query(
+        `select id from orders where status = 'delivered' and delivery_method = 'courier' and auto_release_at > $1 and auto_release_at <= $2 order by auto_release_at limit 200`,
+        [ts(at), ts(at + fees.claimWindowMs / 2)])).rows;
+      let n = 0;
+      for (const r of rows) {
+        const fresh = await withTx(pool, async (c) => {
+          const order = await loadOrder(c, r.id as string, true);
+          if (order.status !== "delivered") return false;
+          const key = `claim_reminder:${order.id}`;
+          const before = (await c.query(`select count(*)::int as n from notifications where event_key = $1`, [key])).rows[0].n as number;
+          await notifyTx(c, { userId: order.buyerId, kind: "claim_reminder", payload: { orderId: order.id, itemTitle: await orderTitleOf(c, order.id), role: "buyer" }, eventKey: key });
+          const after = (await c.query(`select count(*)::int as n from notifications where event_key = $1`, [key])).rows[0].n as number;
+          return after > before;
+        });
+        if (fresh) n++;
+      }
+      return n;
+    },
+    // ---- fin agent F
 
     async releaseDeliveredOrders(o) {
       const at = o?.at ?? now();
@@ -1750,6 +1822,8 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
           await post(c, releaseEntries(ctx("order", id, order.currency), { sellerId: order.sellerId, itemsMinor: order.itemsMinor, shippingMinor: order.shippingMinor, feeMinor: order.protectionFeeMinor }));
           const ship = (await c.query(`select id from shipments where order_id = $1`, [id])).rows[0];
           if (ship) await logShipment(c, ship.id, id, "auto_released", null);
+          const title = await orderTitleOf(c, id);
+          await notifyParties(c, order, (role) => ({ kind: "order_auto_released", payload: { orderId: id, itemTitle: title, role }, eventKey: `order_auto_released:${id}` })); // agent F
           return true;
         });
         if (done) n++;
@@ -1772,6 +1846,8 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
           await c.query(`update orders set status = 'cancelled', cancelled_at = $2 where id = $1`, [id, ts(now())]);
           const ship = (await c.query(`update shipments set status = 'lost_suspected' where order_id = $1 returning id`, [id])).rows[0];
           if (ship) await logShipment(c, ship.id, id, "auto_refunded", null);
+          const title = await orderTitleOf(c, id);
+          await notifyParties(c, order, (role) => ({ kind: "parcel_auto_refunded", payload: { orderId: id, itemTitle: title, role }, eventKey: `parcel_auto_refunded:${id}` })); // agent F
           return true;
         });
         if (done) { n++; if (refund) await refundAtProvider(refund); }

@@ -1,4 +1,5 @@
 import { APP_NAME } from "./copy";
+import { FEES } from "./fees";
 
 // Notifications internes : types partagés par les deux couches de données, textes français et liens.
 // On stocke le TYPE et des identifiants (jamais de texte rédigé) : le libellé est produit à l'affichage,
@@ -17,12 +18,30 @@ export const NOTIFICATION_KINDS = [
   "review_received",
   "report_handled",
   "suspension",
+  // ---- agent F : événements ajoutés (annulation encadrée, coursier, preuves, modération)
+  "cancel_requested",
+  "cancel_accepted",
+  "cancel_declined",
+  "cancel_withdrawn",
+  "cancel_expired",
+  "parcel_handed",
+  "parcel_in_transit",
+  "parcel_received",
+  "claim_reminder",
+  "order_auto_released",
+  "parcel_lost",
+  "parcel_auto_refunded",
+  "dispute_evidence",
+  "listing_hidden",
+  // ---- fin agent F
 ] as const;
 export type NotificationKind = (typeof NOTIFICATION_KINDS)[number];
 
 export interface NotificationPayload {
   conversationId?: string;
   orderId?: string;
+  /** Annonce concernée (annonce masquée) : sert au lien, jamais au texte du signalement. */
+  itemId?: string;
   disputeId?: string;
   itemTitle?: string;
   senderName?: string;
@@ -72,13 +91,15 @@ export interface SmsPreferences { orders: boolean; disputes: boolean }
 export const DEFAULT_SMS_PREFERENCES: SmsPreferences = { orders: true, disputes: true };
 
 export const SMS_CATEGORIES: { key: SmsCategory; label: string; hint: string }[] = [
-  { key: "orders", label: "Commandes", hint: "Un SMS quand une de tes ventes est payée." },
+  { key: "orders", label: "Commandes", hint: "Un SMS quand une de tes ventes est payée ou qu'un acheteur demande à l'annuler, et quand le vendeur remet ton colis au coursier." },
   { key: "disputes", label: "Litiges", hint: "Un SMS quand un litige est ouvert ou résolu sur une de tes commandes." },
 ];
 
 /** Sous-ensemble critique envoyé par SMS en plus de la notification interne. */
 export const SMS_KIND_CATEGORY: Partial<Record<NotificationKind, SmsCategory>> = {
   order_paid: "orders",
+  cancel_requested: "orders", // agent F
+  parcel_handed: "orders", // agent F
   dispute_opened: "disputes",
   dispute_resolved: "disputes",
 };
@@ -90,6 +111,8 @@ export const SMS_DAILY_LIMIT = 5;
 export function smsText(kind: NotificationKind): string | null {
   switch (kind) {
     case "order_paid": return `${APP_NAME} : une de tes annonces vient d'être payée. Ouvre l'application pour organiser la remise.`;
+    case "cancel_requested": return `${APP_NAME} : un acheteur demande l'annulation d'une de tes ventes. Ouvre l'application pour répondre.`;
+    case "parcel_handed": return `${APP_NAME} : ton colis a été remis au coursier. Ouvre l'application pour suivre la livraison.`;
     case "dispute_opened": return `${APP_NAME} : un litige a été ouvert sur une de tes commandes. Ouvre l'application pour répondre.`;
     case "dispute_resolved": return `${APP_NAME} : un litige sur une de tes commandes est résolu. Ouvre l'application pour voir la décision.`;
     default: return null;
@@ -145,6 +168,42 @@ export function describeNotification(n: Pick<NotificationItem, "kind" | "payload
       const r = p.rating ? ` (${p.rating} sur 5)` : "";
       return { title: "Nouvel avis reçu", body: `Un membre a laissé un avis${r} suite à la commande de ${item}.`, href: order };
     }
+    // ---- agent F : événements ajoutés. Aucun montant, code de remise ni numéro : seulement le titre de l'annonce.
+    case "cancel_requested":
+      return { title: "Demande d'annulation", body: `L'acheteur de ${item} demande l'annulation de la commande. Accepte ou refuse depuis la commande : sans réponse à temps, la demande est considérée comme refusée.`, href: order };
+    case "cancel_accepted":
+      return { title: "Annulation acceptée", body: `Le vendeur a accepté d'annuler la commande de ${item} : elle est annulée et tu es remboursé.`, href: order };
+    case "cancel_declined":
+      return { title: "Annulation refusée", body: `Le vendeur n'a pas accepté d'annuler la commande de ${item}. Si tu as un problème avec cette commande, tu peux ouvrir un litige depuis la commande.`, href: order };
+    case "cancel_withdrawn":
+      return { title: "Demande d'annulation retirée", body: `L'acheteur a retiré sa demande d'annulation de ${item} : la commande continue.`, href: order };
+    case "cancel_expired":
+      return p.role === "buyer"
+        ? { title: "Demande d'annulation sans réponse", body: `Le vendeur n'a pas répondu à ta demande d'annulation de ${item} : elle est considérée comme refusée. Tu peux ouvrir un litige depuis la commande.`, href: order }
+        : { title: "Demande d'annulation expirée", body: `Tu n'as pas répondu à la demande d'annulation de ${item} à temps : elle est considérée comme refusée.`, href: order };
+    case "parcel_handed":
+      return { title: "Colis remis au coursier", body: `Le vendeur a remis ${item} au coursier. Suis la livraison depuis ta commande.`, href: order };
+    case "parcel_in_transit":
+      return { title: "Colis en route", body: `Ton colis ${item} est en route vers toi.`, href: order };
+    case "parcel_received":
+      return { title: "Colis reçu", body: `L'acheteur a confirmé la réception de ${item}. L'argent te sera libéré dans ${Math.round(FEES.claimWindowMs / 3_600_000)} heures, sauf litige.`, href: order };
+    case "claim_reminder":
+      return { title: "Un problème avec ton colis ?", body: `Tu as reçu ${item}. Si quelque chose ne va pas, ouvre un litige avant la fin de la période de réclamation : ensuite, l'argent est libéré au vendeur.`, href: order };
+    case "order_auto_released":
+      return p.role === "buyer"
+        ? { title: "Commande terminée", body: `La période de réclamation sur ${item} est terminée : la commande est finalisée et l'argent a été libéré au vendeur.`, href: order }
+        : { title: "Argent disponible", body: `La période de réclamation sur ${item} est terminée : l'argent est disponible dans ton portefeuille.`, href: order };
+    case "parcel_lost":
+      return { title: "Colis signalé non reçu", body: `Le colis de ${item} est signalé non reçu ou perdu : un litige a été ouvert. Réponds depuis la page du litige.`, href: dispute };
+    case "parcel_auto_refunded":
+      return p.role === "buyer"
+        ? { title: "Colis non livré : remboursé", body: `Le colis de ${item} est resté trop longtemps chez le coursier : la commande est annulée et tu es remboursé.`, href: order }
+        : { title: "Colis non livré : commande annulée", body: `Le colis de ${item} est resté trop longtemps chez le coursier : la commande est annulée et l'acheteur est remboursé.`, href: order };
+    case "dispute_evidence":
+      return { title: "Nouvelle preuve dans un litige", body: `Une photo a été ajoutée au litige sur ${item}.`, href: dispute };
+    case "listing_hidden":
+      return { title: "Annonce masquée", body: `Ton annonce ${item} a été masquée par notre équipe de modération : les autres membres ne la voient plus. Contacte l'assistance si tu penses qu'il y a une erreur.`, href: p.itemId ? `/items/${p.itemId}` : null };
+    // ---- fin agent F
     case "report_handled":
       return { title: "Signalement traité", body: "Merci pour ton signalement : notre équipe l'a traité.", href: null };
     case "suspension":

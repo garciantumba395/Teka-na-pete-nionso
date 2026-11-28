@@ -122,6 +122,9 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
   const smsPrefs = new Map<string, SmsPreferences>();
   const smsInFlight = new Set<Promise<void>>();
   // ---- fin agent C : notifications
+  // ---- agent F : « colis perdu » ouvre un litige mais notifie sous son propre type
+  let lostParcelFlow = false;
+  // ---- fin agent F
 
   if (opts.seed !== false) {
     const t = now();
@@ -855,7 +858,9 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
       if (livePending(orderId)) throw new AppError("CANCEL_REQUEST_EXISTS", "Ta demande d'annulation est déjà envoyée au vendeur.", 409);
       if (cancelReqs.some((r) => r.orderId === orderId && (r.status === "declined" || reqExpired(r))))
         throw new AppError("CANCEL_REQUEST_REFUSED", "Le vendeur n'a pas accepté l'annulation. Si tu as un problème avec cette commande, ouvre un litige.", 409);
-      cancelReqs.push({ id: randomUUID(), orderId, requestedBy: buyerId, status: "pending", requestedAt: now(), resolvedAt: null });
+      const rec: CancelReqRec = { id: randomUUID(), orderId, requestedBy: buyerId, status: "pending", requestedAt: now(), resolvedAt: null };
+      cancelReqs.push(rec);
+      notifyAndSms({ userId: order.sellerId, kind: "cancel_requested", payload: { orderId, itemTitle: orderTitle(order), role: "seller" }, eventKey: `cancel_requested:${rec.id}` }); // agent F
       return view(order, buyerId);
     },
 
@@ -865,6 +870,7 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
       if (!r) throw noOrExpired(orderId);
       r.status = "withdrawn";
       r.resolvedAt = now();
+      notifyAndSms({ userId: order.sellerId, kind: "cancel_withdrawn", payload: { orderId, itemTitle: orderTitle(order), role: "seller" }, eventKey: `cancel_withdrawn:${r.id}` }); // agent F
       return view(order, buyerId);
     },
 
@@ -877,6 +883,7 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
       order.cancelledAt = now();
       r.status = "accepted";
       r.resolvedAt = now();
+      notifyAndSms({ userId: order.buyerId, kind: "cancel_accepted", payload: { orderId, itemTitle: orderTitle(order), role: "buyer", refunded: true }, eventKey: `cancel_accepted:${r.id}` }); // agent F
       return view(order, sellerId);
     },
 
@@ -886,6 +893,7 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
       if (!r) throw noOrExpired(orderId);
       r.status = "declined";
       r.resolvedAt = now();
+      notifyAndSms({ userId: order.buyerId, kind: "cancel_declined", payload: { orderId, itemTitle: orderTitle(order), role: "buyer" }, eventKey: `cancel_declined:${r.id}` }); // agent F
       return view(order, sellerId);
     },
     // ---- fin agent A
@@ -1009,7 +1017,7 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
       const d: DisputeRec = { id: randomUUID(), orderId, openedBy: userId, reason: input.reason, description: text, status: "open", openedAt: now(), resolvedAt: null };
       disputes.set(d.id, d);
       const other = userId === order.buyerId ? order.sellerId : order.buyerId;
-      notifyAndSms({ userId: other, kind: "dispute_opened", payload: { orderId, disputeId: d.id, itemTitle: orderTitle(order) }, eventKey: `dispute_opened:${d.id}` });
+      notifyAndSms({ userId: other, kind: lostParcelFlow ? "parcel_lost" : "dispute_opened", payload: { orderId, disputeId: d.id, itemTitle: orderTitle(order) }, eventKey: `${lostParcelFlow ? "parcel_lost" : "dispute_opened"}:${d.id}` }); // agent F : « colis perdu » notifie en son nom
       return disputeView(d, userId);
     },
 
@@ -1089,6 +1097,8 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
       const m: MsgRec = { id: randomUUID(), convId: c.id, senderId, kind: "image", body: text, flagged: detectOffPlatform(text) !== null, readAt: null, createdAt: now(), photoId };
       messages.push(m);
       c.lastMessageAt = m.createdAt;
+      // agent F : une photo reçue notifie comme un message (même regroupement par conversation)
+      notifyAndSms({ userId: other, kind: "message_received", payload: { conversationId: c.id, itemTitle: items.get(c.itemId)?.title ?? "Article", senderName: profileOf(senderId).displayName }, groupKey: `conv:${c.id}` });
       return chatMessage(m, senderId);
     },
 
@@ -1105,7 +1115,10 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
         throw new AppError("EVIDENCE_LIMIT", `Tu as déjà ajouté ${MAX_EVIDENCE_PER_MEMBER} photos à ce litige : c'est le maximum.`, 409);
       const photoId = randomUUID();
       privatePhotos.set(photoId, { id: photoId, ownerId: authorId, mime: photo.mime, bytes: photo.bytes, scope: { type: "evidence", disputeId: d.id } });
-      evidenceRows.push({ id: randomUUID(), disputeId: d.id, authorId, staff: view0.viewerRole === "staff", photoId, note, createdAt: now() });
+      const ev: EvidenceRec = { id: randomUUID(), disputeId: d.id, authorId, staff: view0.viewerRole === "staff", photoId, note, createdAt: now() };
+      evidenceRows.push(ev);
+      const evOrder = loadOrder(d.orderId);
+      bothParties(evOrder, () => ({ userId: "", kind: "dispute_evidence", payload: { orderId: evOrder.id, disputeId: d.id, itemTitle: orderTitle(evOrder) }, eventKey: `dispute_evidence:${ev.id}` }), authorId); // agent F
       return disputeView(d, authorId);
     },
 
@@ -1207,7 +1220,11 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
       } else if (action === "hide_item") {
         if (r.targetType !== "item") throw new AppError("VALIDATION", "Seule une annonce peut être masquée.", 422);
         const it = items.get(r.targetId);
-        if (it && it.status === "active") it.status = "hidden";
+        if (it && it.status === "active") {
+          it.status = "hidden";
+          // agent F : le vendeur est prévenu, sans le détail du signalement (ni motif, ni auteur)
+          if (it.sellerId !== staffId) notifyAndSms({ userId: it.sellerId, kind: "listing_hidden", payload: { itemId: it.id, itemTitle: it.title }, eventKey: `listing_hidden:${r.id}` });
+        }
         r.status = "actioned";
       } else {
         const userId = r.targetType === "user" ? r.targetId : items.get(r.targetId)?.sellerId;
@@ -1305,6 +1322,7 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
       ship.status = "handed_to_courier";
       logShipment(ship, "handed_to_courier");
       setOrderStatus(order, "in_delivery");
+      notifyAndSms({ userId: order.buyerId, kind: "parcel_handed", payload: { orderId, itemTitle: orderTitle(order), role: "buyer" }, eventKey: `parcel_handed:${orderId}` }); // agent F
       return view(order, sellerId);
     },
 
@@ -1316,6 +1334,7 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
         throw new AppError("INVALID_STATE", "Le colis doit d'abord être remis au coursier.", 409);
       ship.status = "in_transit";
       logShipment(ship, "in_transit");
+      notifyAndSms({ userId: order.buyerId, kind: "parcel_in_transit", payload: { orderId, itemTitle: orderTitle(order), role: "buyer" }, eventKey: `parcel_in_transit:${orderId}` }); // agent F
       return view(order, sellerId);
     },
 
@@ -1331,6 +1350,7 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
       order.deliveredAt = now();
       order.autoReleaseAt = now() + FEES.claimWindowMs;
       logShipment(ship, "received");
+      notifyAndSms({ userId: order.sellerId, kind: "parcel_received", payload: { orderId, itemTitle: orderTitle(order), role: "seller" }, eventKey: `parcel_received:${orderId}` }); // agent F
       return view(order, buyerId);
     },
 
@@ -1341,7 +1361,9 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
       if (order.deliveryMethod !== "courier" || !ship) throw new AppError("INVALID_STATE", "Cette commande n'est pas livrée par coursier.", 409);
       if (order.status !== "in_delivery") throw new AppError("INVALID_STATE", "Le colis ne peut être signalé perdu qu'une fois remis au coursier et tant qu'il n'est pas reçu.", 409);
       const text = (input?.description ?? "").trim() || LOST_DEFAULT_TEXT;
-      const d = await api.openDispute(orderId, userId, { reason: "not_received", description: text });
+      lostParcelFlow = true; // agent F : openDispute est synchrone jusqu'à la notification, aucun autre appel ne s'intercale
+      let d: DisputeView;
+      try { d = await api.openDispute(orderId, userId, { reason: "not_received", description: text }); } finally { lostParcelFlow = false; }
       ship.status = "lost_suspected";
       logShipment(ship, "lost_reported");
       return d;
@@ -1357,6 +1379,7 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
         release(order);
         const ship = shipments.get(order.id);
         if (ship) logShipment(ship, "auto_released");
+        bothParties(order, (role) => ({ userId: "", kind: "order_auto_released", payload: { orderId: order.id, itemTitle: orderTitle(order), role }, eventKey: `order_auto_released:${order.id}` })); // agent F
         n++;
       }
       return n;
@@ -1375,10 +1398,40 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
         order.cancelledAt = now();
         ship.status = "lost_suspected";
         logShipment(ship, "auto_refunded");
+        bothParties(order, (role) => ({ userId: "", kind: "parcel_auto_refunded", payload: { orderId: order.id, itemTitle: orderTitle(order), role }, eventKey: `parcel_auto_refunded:${order.id}` })); // agent F
         n++;
       }
       return n;
     },
+
+    // ---- agent F : rappels et expirations notifiés
+    async notifyExpiredCancelRequests(o) {
+      const t = o?.at ?? now();
+      let n = 0;
+      for (const r of cancelReqs) {
+        if (r.status !== "pending" || t - r.requestedAt < FEES.cancelRequestTtlMs) continue;
+        const order = orders.get(r.orderId);
+        if (!order || (order.status !== "paid" && order.status !== "in_delivery")) continue;
+        const before = notifs.length;
+        bothParties(order, (role) => ({ userId: "", kind: "cancel_expired", payload: { orderId: order.id, itemTitle: orderTitle(order), role }, eventKey: `cancel_expired:${r.id}` }));
+        if (notifs.length > before) n++; // rejouée : rien de nouveau
+      }
+      return n;
+    },
+
+    async remindClaimWindows(o) {
+      const t = o?.at ?? now();
+      let n = 0;
+      for (const order of orders.values()) {
+        if (order.status !== "delivered" || order.deliveryMethod !== "courier" || order.autoReleaseAt == null || order.autoReleaseAt <= t) continue;
+        if (order.autoReleaseAt - t > FEES.claimWindowMs / 2) continue;
+        const before = notifs.length;
+        notifyAndSms({ userId: order.buyerId, kind: "claim_reminder", payload: { orderId: order.id, itemTitle: orderTitle(order), role: "buyer" }, eventKey: `claim_reminder:${order.id}` });
+        if (notifs.length > before) n++;
+      }
+      return n;
+    },
+    // ---- fin agent F
 
     // ---- agent C : notifications
     async listNotifications(userId, o) {
