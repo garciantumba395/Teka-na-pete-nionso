@@ -105,6 +105,14 @@ export const notificationPrefsPatch = z.object({
   disputes: z.boolean({ message: "Valeur invalide." }).optional(),
 }).strict();
 // ---- fin agent C : notifications
+// ---- agent H : découverte
+export const favouriteCreate = z.object({ itemId: uuid }).strict();
+/** Marque ou taille à suivre ; la longueur est vérifiée après nettoyage par la couche de données (cleanFollowValue). */
+export const followInput = z.object({
+  kind: z.enum(["brand", "size"], { message: "Type invalide : marque ou taille." }),
+  value: z.string({ message: "Valeur invalide." }).transform(cleanLine).pipe(z.string().max(200, "Valeur trop longue.")),
+}).strict();
+// ---- fin agent H
 export const idParam = uuid;
 
 /** Valide une entrée et lève une erreur 422 avec un message par champ. */

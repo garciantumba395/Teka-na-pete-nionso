@@ -1,4 +1,5 @@
 // Types du domaine. Ils reflètent replica/schema.sql (mêmes statuts, mêmes noms).
+import type { ItemSort } from "./discovery";
 
 export type Currency = "USD" | "CDF";
 
@@ -116,6 +117,12 @@ export interface ItemCard {
   meta: string; // « Marque · Taille · État »
   areaName: string | null;
   distanceKm: number | null;
+  /** Nombre de membres qui ont mis l'annonce en favori (agent H). */
+  favouriteCount: number;
+  /** Vrai si le membre connecté l'a en favori (toujours faux pour un visiteur). */
+  favourited: boolean;
+  /** Vrai si le membre connecté est le vendeur (pas de cœur sur sa propre annonce). */
+  own: boolean;
 }
 
 export interface ItemDetail extends ItemCard {
@@ -145,6 +152,10 @@ export interface ItemQuery {
   conditions?: Condition[];
   includeSold?: boolean;
   limit?: number;
+  /** agent H : tri (voir discovery.ts), décalage de pagination et membre connecté (état « favori » des cartes). */
+  sort?: ItemSort;
+  offset?: number;
+  viewerId?: string | null;
 }
 
 export interface Order {

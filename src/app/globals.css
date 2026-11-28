@@ -109,3 +109,26 @@ a.chip { text-decoration: none; }
 .notif-new { font-size: var(--text-xs-size); font-weight: 700; padding: 0 var(--space-8); border-radius: var(--radius-pill); background: var(--color-accent); color: var(--color-on-accent); }
 .notif-actions { display: flex; justify-content: space-between; align-items: center; gap: var(--space-12); flex-wrap: wrap; }
 /* ---- fin agent C : notifications */
+
+/* ---- agent H : découverte (cœur des favoris, tri, « Pour toi », préférences) */
+.card-wrap { position: relative; min-width: 0; }
+.fav-wrap { position: absolute; inset-block-start: var(--space-4); inset-inline-end: var(--space-4); display: grid; justify-items: end; gap: var(--space-4); max-width: 100%; }
+.fav-btn { position: relative; display: inline-flex; align-items: center; justify-content: center; gap: var(--space-4); min-width: var(--size-touch-min); min-height: var(--size-touch-min); padding: 0 var(--space-8);
+  border: 0; background: transparent; color: var(--color-text); border-radius: var(--radius-pill); cursor: pointer; font-size: var(--text-xs-size); font-weight: 600; }
+.fav-btn::before { content: ""; position: absolute; inset-block: calc(50% - 14px); inset-inline: var(--space-4); border-radius: var(--radius-pill); background: var(--color-bg); box-shadow: var(--shadow-card); }
+.fav-btn > * { position: relative; }
+.fav-btn .icon { width: 18px; height: 18px; }
+.fav-btn[aria-pressed="true"] { color: var(--color-danger); }
+.fav-btn:disabled { cursor: default; opacity: .7; }
+.fav-error { background: var(--color-bg); padding: var(--space-4) var(--space-8); border-radius: var(--radius-sm); box-shadow: var(--shadow-card); max-width: 160px; overflow-wrap: anywhere; }
+.fav-detail { position: static; justify-items: start; }
+.fav-detail .fav-btn { border: 1px solid var(--color-border); padding: 0 var(--space-12); }
+.fav-detail .fav-btn::before { display: none; }
+.fav-detail .fav-btn .icon { width: 20px; height: 20px; }
+.sort-row { display: flex; align-items: center; gap: var(--space-8); flex-wrap: wrap; }
+.for-you { display: grid; gap: var(--space-12); }
+.for-you-invite { display: flex; align-items: center; justify-content: space-between; gap: var(--space-12); flex-wrap: wrap; padding: var(--space-12) var(--space-16); border: 1px dashed var(--color-border); border-radius: var(--radius-md); }
+.follow-list { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: var(--space-8); }
+.follow-add { display: flex; gap: var(--space-8); align-items: flex-end; flex-wrap: wrap; }
+.follow-add .field { flex: 1 1 160px; min-width: 0; }
+/* ---- fin agent H */

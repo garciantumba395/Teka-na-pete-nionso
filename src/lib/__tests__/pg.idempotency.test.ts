@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, it } from "vitest";
 import { seedId as S } from "../data/ids";
-import type { AppError } from "../types";
+import type { AppError, User } from "../types";
 import { endTestPool, makePgEnv, TEST_URL } from "./pg-env";
 
 const suite = TEST_URL ? describe : describe.skip;
@@ -11,7 +11,7 @@ suite("PostgreSQL : clé d'idempotence de paiement", () => {
     const env = await makePgEnv();
     const data = env.data;
     const seller = (await data.getUser(S("user-marie")))!;
-    const buyers = [];
+    const buyers: User[] = [];
     for (const [phone, name] of [["0821000301", "Acheteur Clé A"], ["0821000302", "Acheteur Clé B"]] as const) {
       await data.requestOtp(phone);
       buyers.push((await data.verifyOtp(phone, "123456", name)).user);

@@ -24,6 +24,9 @@ import {
 import { checkListingText, defaultCompiledRules, DEFAULT_RULES, publicRule } from "../prohibited";
 import { CONDITIONS, validateListing, type ListingInput } from "../validation";
 import type { DataLayer } from "./types";
+import { cleanFollowValue, followKey, followLimitError, FOLLOW_MAX, FOR_YOU_MAX, priceSortKey, type FollowKind } from "../discovery";
+import { USD_CDF_PLACEHOLDER } from "../money";
+import { cleanLine } from "../text";
 import { seedAreas, seedCategories, seedItems, seedUsers } from "./seed";
 
 export interface FakeOptions {
@@ -122,6 +125,17 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
   const smsPrefs = new Map<string, SmsPreferences>();
   const smsInFlight = new Set<Promise<void>>();
   // ---- fin agent C : notifications
+
+  // ---- agent H : favoris et marques/tailles suivies
+  interface FavRec { userId: string; itemId: string; at: number; seq: number }
+  interface FollowRec { userId: string; kind: FollowKind; key: string; label: string; seq: number }
+  const favRows: FavRec[] = [];
+  const followRows: FollowRec[] = [];
+  let discoverySeq = 0;
+  const favCount = (itemId: string) => favRows.reduce((n, f) => (f.itemId === itemId ? n + 1 : n), 0);
+  const isFav = (userId: string | null | undefined, itemId: string) => !!userId && favRows.some((f) => f.userId === userId && f.itemId === itemId);
+  const FAVOURABLE = new Set(["active", "reserved", "sold"]);
+  // ---- fin agent H
 
   if (opts.seed !== false) {
     const t = now();
@@ -232,7 +246,7 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
     }));
   }
 
-  function toCard(it: Item, from?: { lat: number; lng: number }): ItemCard {
+  function toCard(it: Item, from?: { lat: number; lng: number }, viewerId?: string | null): ItemCard {
     const meta = [it.brand, it.sizeLabel, CONDITIONS.find((c) => c.value === it.condition)?.label].filter(Boolean).join(" · ");
     return {
       id: it.id, title: it.title, priceMinor: it.priceMinor, currency: it.currency,
@@ -240,6 +254,7 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
       status: it.status, photo: it.photos[0] ?? null, meta,
       areaName: areas.find((a) => a.id === it.areaId)?.name ?? null,
       distanceKm: from && it.lat != null && it.lng != null ? Math.round(distanceKm(from.lat, from.lng, it.lat, it.lng) * 10) / 10 : null,
+      favouriteCount: favCount(it.id), favourited: isFav(viewerId, it.id), own: !!viewerId && it.sellerId === viewerId,
     };
   }
 
@@ -539,6 +554,8 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
       deleted.add(userId);
       for (let i = notifs.length - 1; i >= 0; i--) if (notifs[i].userId === userId) notifs.splice(i, 1);
       smsPrefs.delete(userId);
+      for (let i = favRows.length - 1; i >= 0; i--) if (favRows[i].userId === userId) favRows.splice(i, 1); // agent H
+      for (let i = followRows.length - 1; i >= 0; i--) if (followRows[i].userId === userId) followRows.splice(i, 1);
       await api.deleteAllSessions(userId);
     },
     async getPhoto() {
@@ -605,11 +622,16 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
         }
         return true;
       });
-      if (q.radiusKm != null && from)
-        list.sort((a, b) => distanceKm(from.lat, from.lng, a.lat!, a.lng!) - distanceKm(from.lat, from.lng, b.lat!, b.lng!));
-      else list.sort((a, b) => (b.publishedAt ?? 0) - (a.publishedAt ?? 0));
-      list = list.slice(0, q.limit ?? 60);
-      return list.map((it) => toCard(it, q.radiusKm != null ? from : undefined));
+      // Départage commun à tous les tris : plus récent d'abord, puis identifiant décroissant (pagination stable).
+      const recent = (a: Item, b: Item) => (b.publishedAt ?? 0) - (a.publishedAt ?? 0) || (b.createdAt - a.createdAt) || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0);
+      const key = (it: Item) => priceSortKey(it.priceMinor, it.currency, USD_CDF_PLACEHOLDER);
+      if (q.sort === "price_asc") list.sort((a, b) => key(a) - key(b) || recent(a, b));
+      else if (q.sort === "price_desc") list.sort((a, b) => key(b) - key(a) || recent(a, b));
+      else if (q.sort === "favourites") list.sort((a, b) => favCount(b.id) - favCount(a.id) || recent(a, b));
+      else if (q.sort === "recent" || !(q.radiusKm != null && from)) list.sort(recent);
+      else list.sort((a, b) => distanceKm(from!.lat, from!.lng, a.lat!, a.lng!) - distanceKm(from!.lat, from!.lng, b.lat!, b.lng!) || recent(a, b));
+      list = list.slice(Math.max(q.offset ?? 0, 0), Math.max(q.offset ?? 0, 0) + (q.limit ?? 60));
+      return list.map((it) => toCard(it, q.radiusKm != null ? from : undefined, q.viewerId));
     },
 
     async getItem(id, viewerId) {
@@ -619,7 +641,7 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
       const seller = users.get(it.sellerId);
       if (!seller) return null;
       const detail: ItemDetail = {
-        ...toCard(it), brand: it.brand, sizeLabel: it.sizeLabel, description: it.description, photos: it.photos, condition: it.condition,
+        ...toCard(it, undefined, viewerId), brand: it.brand, sizeLabel: it.sizeLabel, description: it.description, photos: it.photos, condition: it.condition,
         categoryName: categories.find((c) => c.id === it.categoryId)?.name ?? "", seller: publicProfile(seller), sellerId: it.sellerId,
       };
       return detail;
@@ -1421,6 +1443,63 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
       return c;
     },
     // ---- fin agent C : notifications
+
+    // ---- agent H : découverte
+    async addFavourite(userId, itemId) {
+      if (!isMember(userId)) throw notFound("Compte");
+      const it = items.get(itemId);
+      if (!it || !FAVOURABLE.has(it.status)) throw notFound("Annonce");
+      if (it.sellerId === userId) throw new AppError("CANNOT_FAVOURITE_OWN", "Tu ne peux pas mettre ta propre annonce en favori.", 409);
+      if (!isFav(userId, itemId)) favRows.push({ userId, itemId, at: now(), seq: ++discoverySeq });
+      return { favourited: true as const, favouriteCount: favCount(itemId) };
+    },
+    async removeFavourite(userId, itemId) {
+      const i = favRows.findIndex((f) => f.userId === userId && f.itemId === itemId);
+      if (i >= 0) favRows.splice(i, 1);
+      return { favourited: false as const, favouriteCount: favCount(itemId) };
+    },
+    async listFavourites(userId) {
+      return favRows
+        .filter((f) => f.userId === userId)
+        .sort((a, b) => b.at - a.at || b.seq - a.seq)
+        .map((f) => items.get(f.itemId))
+        .filter((it): it is Item => !!it && FAVOURABLE.has(it.status))
+        .map((it) => toCard(it, undefined, userId));
+    },
+    async getFollows(userId) {
+      const mine = followRows.filter((f) => f.userId === userId).sort((a, b) => a.seq - b.seq);
+      return { brands: mine.filter((f) => f.kind === "brand").map((f) => f.label), sizes: mine.filter((f) => f.kind === "size").map((f) => f.label) };
+    },
+    async addFollow(userId, kind, value) {
+      if (!isMember(userId)) throw notFound("Compte");
+      const label = cleanFollowValue(kind, value);
+      const key = followKey(label);
+      const mine = followRows.filter((f) => f.userId === userId && f.kind === kind);
+      if (!mine.some((f) => f.key === key)) {
+        if (mine.length >= FOLLOW_MAX) throw followLimitError(kind);
+        followRows.push({ userId, kind, key, label, seq: ++discoverySeq });
+      }
+      return api.getFollows(userId);
+    },
+    async removeFollow(userId, kind, value) {
+      const key = followKey(cleanLine(String(value ?? "")));
+      const i = followRows.findIndex((f) => f.userId === userId && f.kind === kind && f.key === key);
+      if (i >= 0) followRows.splice(i, 1);
+      return api.getFollows(userId);
+    },
+    async listForYou(userId, o) {
+      const mine = followRows.filter((f) => f.userId === userId);
+      if (!mine.length) return [];
+      const brands = new Set(mine.filter((f) => f.kind === "brand").map((f) => f.key));
+      const sizes = new Set(mine.filter((f) => f.kind === "size").map((f) => f.key));
+      const recent = (a: Item, b: Item) => (b.publishedAt ?? 0) - (a.publishedAt ?? 0) || (b.createdAt - a.createdAt) || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0);
+      return [...items.values()]
+        .filter((it) => it.status === "active" && it.sellerId !== userId && ((it.brand && brands.has(followKey(it.brand))) || (it.sizeLabel && sizes.has(followKey(it.sizeLabel)))))
+        .sort(recent)
+        .slice(0, Math.min(o?.limit ?? FOR_YOU_MAX, FOR_YOU_MAX))
+        .map((it) => toCard(it, undefined, userId));
+    },
+    // ---- fin agent H
   };
 
   return api;

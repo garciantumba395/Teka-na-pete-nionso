@@ -58,6 +58,19 @@ export function defineA11y(label: string) {
       await check("S03 recherche avec marque, taille et état", bp, "/search?brand=zephyr&size=M&condition=good&condition=new");
       await check("S21 notifications (vide)", bp, "/notifications"); // agent C
       await check("S22 réglages des notifications", bp, "/me/notifications"); // agent C
+      // agent H : découverte (cartes avec cœur, favoris, préférences, « Pour toi », tri)
+      await check("S01 accueil, cartes avec cœur (visiteur)", page, "/");
+      await check("S17 favoris (vide)", bp, "/favourites");
+      expect((await buyer.request.post("/api/v1/favourites", { data: { itemId: item.id } })).status()).toBe(200);
+      await check("S17 favoris (une annonce)", bp, "/favourites");
+      await check("S17 fiche article avec cœur pressé (acheteur)", bp, `/items/${item.id}`);
+      await check("S01 accueil, invitation « Pour toi » (membre)", bp, "/");
+      await check("S23 préférences : marques et tailles (vide)", bp, "/me/preferences");
+      expect((await buyer.request.post("/api/v1/me/follows", { data: { kind: "brand", value: "Zephyr" } })).status()).toBe(200);
+      expect((await buyer.request.post("/api/v1/me/follows", { data: { kind: "size", value: "M" } })).status()).toBe(200);
+      await check("S23 préférences : marques et tailles (suivies)", bp, "/me/preferences");
+      await check("S01 accueil, section « Pour toi » (membre)", bp, "/");
+      await check("S03 recherche triée (prix décroissant, puce du tri)", bp, "/search?q=robe&sort=price_desc");
       // vendeur
       const sp = seller.page;
       await check("S09 commande payée (vendeur, demande d'annulation à traiter + saisie du code)", sp, `/orders/${paidId}`);
@@ -128,7 +141,7 @@ export function defineA11y(label: string) {
       const orderId = await apiBuyAndPay(buyer.request, item.id);
       await buyer.page.setViewportSize({ width: 320, height: 640 });
       await page.setViewportSize({ width: 320, height: 640 });
-      const screens: [typeof page, string][] = [[page, "/"], [page, "/search"], [page, "/signin"], [page, `/items/${item.id}`], [buyer.page, "/sell"], [buyer.page, `/orders/${orderId}`], [buyer.page, "/wallet"], [buyer.page, "/me"], [buyer.page, `/members/${seller.userId}`], [page, "/inbox"]];
+      const screens: [typeof page, string][] = [[page, "/"], [page, "/search"], [page, "/signin"], [page, `/items/${item.id}`], [buyer.page, "/sell"], [buyer.page, `/orders/${orderId}`], [buyer.page, "/wallet"], [buyer.page, "/me"], [buyer.page, `/members/${seller.userId}`], [page, "/inbox"], [buyer.page, "/favourites"], [buyer.page, "/me/preferences"], [buyer.page, "/"], [page, "/search?sort=price_asc"]];
       const over: string[] = [];
       for (const [p, url] of screens) { await open(p, url); if (!(await noHorizontalScroll(p))) over.push(url); }
       expect(over, "écrans qui débordent à 320 px").toEqual([]);

@@ -4,10 +4,21 @@ import { Icon } from "@/components/icons";
 import { getData } from "@/lib/data";
 import { seedId } from "@/lib/data/ids";
 import { APP_NAME } from "@/lib/copy";
+import { currentUser } from "@/lib/session";
 
 export default async function HomePage() {
   const data = getData();
-  const [cats, items] = await Promise.all([data.listCategories(), data.listItems({ limit: 24 })]);
+  const me = await currentUser();
+  // agent H : « Pour toi » (membre connecté seulement, l'accueil du visiteur est inchangé) ; la liste générale n'en répète aucune annonce.
+  const [cats, general, follows, forYou] = await Promise.all([
+    data.listCategories(),
+    data.listItems({ limit: 36, viewerId: me?.id ?? null }),
+    me ? data.getFollows(me.id) : null,
+    me ? data.listForYou(me.id) : [],
+  ]);
+  const seen = new Set(forYou.map((i) => i.id));
+  const items = general.filter((i) => !seen.has(i.id)).slice(0, 24);
+  const followsNothing = !!follows && follows.brands.length + follows.sizes.length === 0;
   const top = cats.filter((c) => c.parentId === null);
   return (
     <div className="page">
@@ -22,6 +33,29 @@ export default async function HomePage() {
         ))}
         <Link className="chip" href={`/search?area=${seedId("area-com-gombe")}&radius=10`}>Près de moi</Link>
       </nav>
+
+      {me && (
+        <section aria-labelledby="for-you" className="for-you">
+          <h2 id="for-you" className="h2">Pour toi</h2>
+          {followsNothing ? (
+            <div className="for-you-invite">
+              <span>Suis des marques et des tailles pour voir ici les annonces qui te correspondent.</span>
+              <Link className="btn btn-secondary" href="/me/preferences">Personnaliser mon fil</Link>
+            </div>
+          ) : forYou.length === 0 ? (
+            <div className="for-you-invite">
+              <span>Aucune annonce récente ne correspond à tes marques et à tes tailles pour l&apos;instant.</span>
+              <Link className="btn btn-secondary" href="/me/preferences">Modifier mes préférences</Link>
+            </div>
+          ) : (
+            <ul className="grid" style={{ listStyle: "none", padding: 0, margin: 0 }}>
+              {forYou.map((it) => (
+                <li key={it.id}><ListingCard item={it} /></li>
+              ))}
+            </ul>
+          )}
+        </section>
+      )}
 
       <section aria-labelledby="latest">
         <h1 id="latest" className="h2" style={{ marginBottom: "var(--space-12)" }}>Dernières annonces</h1>

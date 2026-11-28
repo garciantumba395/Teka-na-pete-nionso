@@ -4,6 +4,8 @@ import Link from "next/link";
 import { AppBar, EmptyState, ListingCard } from "@/components/ui";
 import { Icon } from "@/components/icons";
 import { getData } from "@/lib/data";
+import { ITEM_SORTS, ITEM_SORT_LABEL, parseItemSort } from "@/lib/discovery";
+import { currentUser } from "@/lib/session";
 import { seedId } from "@/lib/data/ids";
 import { CONDITIONS } from "@/lib/validation";
 import type { Condition } from "@/lib/types";
@@ -25,6 +27,8 @@ export default async function SearchPage({ searchParams }: { searchParams: Promi
   const rawCond = ([] as (string | undefined)[]).concat(sp.condition ?? []);
   const conditions = CONDITIONS.map((c) => c.value).filter((v): v is Condition => rawCond.includes(v));
 
+  const sort = parseItemSort(sp.sort); // agent H : valeur inconnue ignorée
+  const me = await currentUser();
   const data = getData();
   const [cats, communes, items] = await Promise.all([
     data.listCategories(),
@@ -38,17 +42,21 @@ export default async function SearchPage({ searchParams }: { searchParams: Promi
       brand: brand || undefined,
       sizeLabel: size || undefined,
       conditions: conditions.length ? conditions : undefined,
+      sort,
+      viewerId: me?.id ?? null,
       limit: 60,
     }),
   ]);
   const parents = cats.filter((c) => c.parentId === null);
   const hasFilters = !!(q || category || area || maxUsd || brand || size || conditions.length);
+  // Puce du tri actif : seulement si le tri choisi change quelque chose (« plus récent » est déjà le tri par défaut hors recherche par rayon).
+  const sortChip = !!sort && !(sort === "recent" && !(area && radius));
   const activeCat = cats.find((c) => c.id === category);
   const activeArea = communes.find((c) => c.id === area);
 
   const without = (key: string) => {
     const p = new URLSearchParams();
-    const cur: Record<string, string> = { q, category, area, radius: radius ? String(radius) : "", max: maxUsd ? String(maxUsd) : "", brand, size };
+    const cur: Record<string, string> = { q, category, area, radius: radius ? String(radius) : "", max: maxUsd ? String(maxUsd) : "", brand, size, sort: sort ?? "" };
     for (const [k, v] of Object.entries(cur)) if (v && k !== key && !(key === "area" && k === "radius")) p.set(k, v);
     if (key !== "condition") for (const c of conditions) p.append("condition", c);
     return `/search?${p.toString()}`;
@@ -101,6 +109,14 @@ export default async function SearchPage({ searchParams }: { searchParams: Promi
               <label htmlFor="size">Taille</label>
               <input id="size" name="size" className="input" maxLength={20} defaultValue={size} placeholder="Toutes" />
             </div>
+            <div className="field">
+              <label htmlFor="sort">Trier par</label>
+              <select id="sort" name="sort" className="input" defaultValue={sort ?? ""}>
+                <option value="">{area && radius ? "Le plus proche" : "Plus récent"}</option>
+                {area && radius ? <option value="recent">Plus récent</option> : null}
+                {ITEM_SORTS.filter((s) => s !== "recent").map((s) => <option key={s} value={s}>{ITEM_SORT_LABEL[s]}</option>)}
+              </select>
+            </div>
           </div>
           <fieldset style={{ border: 0, padding: 0, margin: 0, display: "flex", flexWrap: "wrap", gap: "var(--space-8) var(--space-16)" }}>
             <legend style={{ font: "600 var(--text-sm-size)/var(--text-sm-line) var(--font-sans)", marginBottom: "var(--space-4)" }}>État</legend>
@@ -114,8 +130,9 @@ export default async function SearchPage({ searchParams }: { searchParams: Promi
           <button className="btn btn-primary" type="submit">Rechercher</button>
         </form>
 
-        {hasFilters && (
+        {(hasFilters || sortChip) && (
           <div className="chips" aria-label="Filtres actifs">
+            {sort && sortChip && <Link className="chip" href={without("sort")}>Tri : {ITEM_SORT_LABEL[sort]} <Icon name="x" size={16} /><span className="sr-only">, revenir au tri par défaut</span></Link>}
             {q && <Link className="chip" href={without("q")} aria-label={`Retirer le mot-clé ${q}`}>« {q} » <Icon name="x" size={16} /></Link>}
             {activeCat && <Link className="chip" href={without("category")} aria-label={`Retirer la catégorie ${activeCat.name}`}>{activeCat.name} <Icon name="x" size={16} /></Link>}
             {activeArea && <Link className="chip" href={without("area")} aria-label={`Retirer le lieu ${activeArea.name}`}>{activeArea.name}{radius ? `, ${radius} km` : ""} <Icon name="x" size={16} /></Link>}
