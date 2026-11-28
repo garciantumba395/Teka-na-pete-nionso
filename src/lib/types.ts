@@ -56,6 +56,8 @@ export interface User {
   ratingCount: number;
   createdAt: number;
   role?: UserRole;
+  /** Langue d'interface choisie (fr, en, ln, sw) ; null = pas de choix enregistré. */
+  lang?: "fr" | "en" | "ln" | "sw" | null;
   /** Fin de la suspension en cours (sanction de modération), sinon null. */
   suspendedUntil?: number | null;
 }
@@ -74,7 +76,10 @@ export interface Category {
   id: string;
   parentId: string | null;
   slug: string;
+  /** Nom en français (langue de référence). */
   name: string;
+  /** Noms dans les autres langues ; une langue absente retombe sur `name`. */
+  names?: Partial<Record<"en" | "ln" | "sw", string>>;
   isSellable: boolean;
 }
 

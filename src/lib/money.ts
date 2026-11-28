@@ -9,14 +9,24 @@ function groupThousands(n: number): string {
   return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, NBSP);
 }
 
-export function formatMoney(minor: number, currency: Currency): string {
-  if (currency === "CDF") return `${groupThousands(Math.round(minor / 100))}${NBSP}FC`;
+/**
+ * Montant lisible. Français, lingala et swahili : usage congolais (virgule décimale, espace insécable entre les milliers, « 26,25 $ »).
+ * Anglais : « $26.25 » et « FC 35,000 ». `locale` vaut « fr » par défaut : les appelants qui ne le passent pas gardent le comportement d'avant.
+ */
+export function formatMoney(minor: number, currency: Currency, locale: "fr" | "en" | "ln" | "sw" = "fr"): string {
+  const en = locale === "en";
+  const group = (n: number) => (en ? String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ",") : groupThousands(n));
+  if (currency === "CDF") {
+    const v = group(Math.round(minor / 100));
+    return en ? `FC${NBSP}${v}` : `${v}${NBSP}FC`;
+  }
   const sign = minor < 0 ? "-" : "";
   const abs = Math.abs(minor);
   const whole = Math.floor(abs / 100);
   const cents = abs % 100;
-  const body = cents === 0 ? `${groupThousands(whole)}` : `${groupThousands(whole)},${String(cents).padStart(2, "0")}`;
-  return `${sign}${body}${NBSP}$`;
+  const dec = en ? "." : ",";
+  const body = cents === 0 ? `${group(whole)}` : `${group(whole)}${dec}${String(cents).padStart(2, "0")}`;
+  return en ? `${sign}$${body}` : `${sign}${body}${NBSP}$`;
 }
 
 /** Parse une saisie utilisateur (« 12,5 », « 35 000 ») en unités mineures. Retourne null si invalide. */

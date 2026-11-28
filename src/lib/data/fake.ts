@@ -553,6 +553,7 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
       }
       if (patch.bio !== undefined) u.bio = patch.bio.slice(0, 500);
       if (patch.areaId !== undefined) u.areaId = patch.areaId;
+      if (patch.lang !== undefined) u.lang = patch.lang;
       return u;
     },
 

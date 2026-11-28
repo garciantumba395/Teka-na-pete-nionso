@@ -84,8 +84,8 @@ test.describe("Photos de messages et de preuves", () => {
     await open(buyer.page, `/inbox/${conv}`);
     const attach = buyer.page.getByRole("button", { name: "Joindre une photo" });
     await expect(attach).toBeEnabled(); // inactif tant que le composant n'est pas hydraté : focus() et Entrée seraient ignorés
-    await attach.focus();
-    const [chooser] = await Promise.all([buyer.page.waitForEvent("filechooser"), buyer.page.keyboard.press("Enter")]);
+    // press() donne le focus puis appuie sur la touche en une seule opération : pas de fenêtre où le focus peut se perdre (rafraîchissement de la page)
+    const [chooser] = await Promise.all([buyer.page.waitForEvent("filechooser"), attach.press("Enter")]);
     await chooser.setFiles(file(await jpegBuffer(buyer.page, 400, 300)));
     await expect(buyer.page.getByRole("img", { name: "Aperçu de la photo à envoyer" })).toBeVisible();
     await buyer.page.getByRole("button", { name: "Envoyer" }).click();

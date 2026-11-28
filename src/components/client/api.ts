@@ -12,7 +12,7 @@ export class ApiError extends Error {
 }
 
 /** Appel de l'API interne. Erreurs réseau et erreurs métier ressortent avec un message lisible. */
-export async function api<T = unknown>(path: string, opts: { method?: string; body?: unknown } = {}): Promise<T> {
+export async function api<T = unknown>(path: string, opts: { method?: string; body?: unknown; quiet?: boolean } = {}): Promise<T> {
   let res: Response;
   try {
     res = await fetch(`/api/v1${path}`, {
@@ -27,7 +27,7 @@ export async function api<T = unknown>(path: string, opts: { method?: string; bo
   }
   const data = (await res.json().catch(() => null)) as { error?: { code?: string; message?: string; details?: Record<string, string> } } | null;
   // Session expirée en cours de route : retour à la connexion, puis retour à la page courante.
-  if (res.status === 401 && data?.error?.code === "UNAUTHENTICATED" && typeof window !== "undefined" && !path.startsWith("/auth/") && !window.location.pathname.startsWith("/signin")) {
+  if (!opts.quiet && res.status === 401 && data?.error?.code === "UNAUTHENTICATED" && typeof window !== "undefined" && !path.startsWith("/auth/") && !window.location.pathname.startsWith("/signin")) {
     window.location.assign(`/signin?next=${encodeURIComponent(window.location.pathname + window.location.search)}`);
   }
   if (!res.ok) throw new ApiError(data?.error?.code ?? "ERROR", data?.error?.message ?? ERROR_FALLBACK, data?.error?.details, res.status);

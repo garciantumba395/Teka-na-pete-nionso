@@ -50,7 +50,7 @@ export interface DataLayer {
   verifyOtp(phoneInput: string, code: string, displayName?: string): Promise<{ user: User; isNew: boolean }>;
   getUser(id: string): Promise<User | null>;
   getPublicProfile(id: string): Promise<PublicProfile | null>;
-  updateMe(userId: string, patch: { displayName?: string; bio?: string; areaId?: string | null }): Promise<User>;
+  updateMe(userId: string, patch: { displayName?: string; bio?: string; areaId?: string | null; lang?: "fr" | "en" | "ln" | "sw" }): Promise<User>;
 
   // Sessions : jeton opaque (seule son empreinte est stockée), révocable.
   createSession(userId: string, meta?: { ip?: string; userAgent?: string }): Promise<{ token: string; expiresAt: number }>;

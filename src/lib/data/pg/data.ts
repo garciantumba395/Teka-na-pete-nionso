@@ -1,6 +1,7 @@
 import { createHash, createHmac, randomBytes, randomInt, randomUUID, timingSafeEqual } from "node:crypto";
 import { assertLotOrderable, buildCartView, CART_MAX_ITEMS, type CartRow } from "../../cart";
 import { APP_NAME } from "../../copy";
+import { asLocale } from "../../../i18n/config";
 import { COURIER_FEE_MODES, payoutFee, protectionFee, shippingFee, shippingZone, type CourierFeeMode, type ShippingZone } from "../../fees";
 import { coarsen } from "../../geo";
 import { checkAttempt, codesEqual, deriveHandoverCode, hashCode } from "../../handover";
@@ -80,7 +81,7 @@ const chatMessageOf = (m: Row, viewerId: string): ChatMessage => ({
 const userOf = (r: Row): User => ({
   id: r.id, phone: r.phone ?? "", displayName: r.display_name, bio: r.bio ?? "", areaId: r.area_id,
   verificationLevel: r.verification_level, ratingAvg: r.rating_avg ?? null, ratingCount: r.rating_count, createdAt: r.created_at.getTime(),
-  role: (r.role ?? "member") as UserRole, suspendedUntil: r.suspended_until ? r.suspended_until.getTime() : null,
+  lang: asLocale(r.preferred_lang), role: (r.role ?? "member") as UserRole, suspendedUntil: r.suspended_until ? r.suspended_until.getTime() : null,
 });
 const profileOf = (r: Row): PublicProfile => ({
   id: r.id, displayName: r.display_name, bio: r.bio ?? "", areaId: r.area_id,
@@ -593,9 +594,10 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
       }
       const r = await pool.query(
         `update profiles set display_name = coalesce($2, display_name), bio = coalesce($3, bio),
-           area_id = case when $4::boolean then $5::uuid else area_id end
+           area_id = case when $4::boolean then $5::uuid else area_id end,
+           preferred_lang = coalesce($6, preferred_lang)
          where id = $1 and deleted_at is null returning *`,
-        [userId, patch.displayName ?? null, patch.bio === undefined ? null : patch.bio.slice(0, 500), patch.areaId !== undefined, patch.areaId ?? null],
+        [userId, patch.displayName ?? null, patch.bio === undefined ? null : patch.bio.slice(0, 500), patch.areaId !== undefined, patch.areaId ?? null, patch.lang ?? null],
       );
       if (!r.rows[0]) throw notFound("Compte");
       return userOf(r.rows[0]);

@@ -154,7 +154,7 @@ test.describe("H Découverte", () => {
     const v = await makeActor("Chercheur tri");
     const p = v.page;
     await open(p, `/search?q=${tok}`);
-    const titles = () => p.locator(".grid .card").evaluateAll((els) => els.map((e) => e.querySelector(".meta")?.textContent ?? ""));
+    const titles = () => p.locator(".grid a.card").evaluateAll((els) => els.map((e) => e.querySelector(".meta")?.textContent ?? ""));
     expect(await titles()).toEqual([dear.title, mid.title, cheap.title]); // plus récent d'abord
     await p.getByLabel("Trier par").selectOption("price_desc");
     await p.getByRole("button", { name: "Rechercher" }).click();

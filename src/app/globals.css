@@ -142,3 +142,8 @@ a.chip { text-decoration: none; }
 .follow-add { display: flex; gap: var(--space-8); align-items: flex-end; flex-wrap: wrap; }
 .follow-add .field { flex: 1 1 160px; min-width: 0; }
 /* ---- fin agent H */
+
+/* Langue (sélecteur) */
+.topnav-end { margin-left: auto; display: flex; align-items: center; gap: var(--space-12); }
+.lang-switch { display: grid; gap: var(--space-4); }
+.lang-switch.compact select { min-height: var(--size-touch-min); width: auto; padding-inline: var(--space-8); }

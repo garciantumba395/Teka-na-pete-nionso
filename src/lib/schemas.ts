@@ -24,6 +24,7 @@ export const mePatch = z.object({
   displayName: line(60).optional(),
   bio: multiline(500).optional(),
   areaId: uuid.nullable().optional(),
+  lang: z.enum(["fr", "en", "ln", "sw"], { message: "Langue non prise en charge." }).optional(),
 });
 export const itemCreate = z.object({
   // Même borne que la contrainte de la base (3 à 80) : sinon la couche factice accepterait un brouillon que PostgreSQL refuse.
