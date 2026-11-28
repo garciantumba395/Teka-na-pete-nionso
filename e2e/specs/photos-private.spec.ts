@@ -83,6 +83,7 @@ test.describe("Photos de messages et de preuves", () => {
     const { seller, buyer, conv } = await duo(makeActor);
     await open(buyer.page, `/inbox/${conv}`);
     const attach = buyer.page.getByRole("button", { name: "Joindre une photo" });
+    await expect(attach).toBeEnabled(); // inactif tant que le composant n'est pas hydraté : focus() et Entrée seraient ignorés
     await attach.focus();
     const [chooser] = await Promise.all([buyer.page.waitForEvent("filechooser"), buyer.page.keyboard.press("Enter")]);
     await chooser.setFiles(file(await jpegBuffer(buyer.page, 400, 300)));
