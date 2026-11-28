@@ -202,4 +202,11 @@ export interface DataLayer {
   /** Supprime les notifications LUES depuis plus de 90 jours. Retourne leur nombre. */
   purgeOldNotifications(): Promise<number>;
   // ---- fin agent C : notifications
+
+  // ---- agent F : rappels et expirations notifiés (tâche planifiée send_order_reminders)
+  /** Prévient l'acheteur ET le vendeur des demandes d'annulation restées sans réponse (traitées comme un refus). Idempotent par demande. Retourne le nombre de demandes notifiées. */
+  notifyExpiredCancelRequests(opts?: { at?: number }): Promise<number>;
+  /** Rappelle à l'acheteur, à mi-parcours de la fenêtre de réclamation, qu'il peut encore ouvrir un litige. Idempotent par commande. Retourne le nombre de rappels créés. */
+  remindClaimWindows(opts?: { at?: number }): Promise<number>;
+  // ---- fin agent F
 }

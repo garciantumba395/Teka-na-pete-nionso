@@ -30,7 +30,10 @@ describe("notifications : textes et liens", () => {
   });
 
   it("SMS : seulement le sous-ensemble critique, texte court sans chiffre ni donnée sensible", () => {
-    expect(Object.keys(SMS_KIND_CATEGORY).sort()).toEqual(["dispute_opened", "dispute_resolved", "order_paid"]);
+    // agent F : « demande d'annulation reçue » et « colis remis au coursier » rejoignent les SMS critiques, dans la catégorie « commandes »
+    expect(Object.keys(SMS_KIND_CATEGORY).sort()).toEqual(["cancel_requested", "dispute_opened", "dispute_resolved", "order_paid", "parcel_handed"]);
+    expect(SMS_KIND_CATEGORY.cancel_requested).toBe("orders");
+    expect(SMS_KIND_CATEGORY.parcel_handed).toBe("orders");
     for (const kind of NOTIFICATION_KINDS) {
       const t = smsText(kind);
       if (!(kind in SMS_KIND_CATEGORY)) expect(t, kind).toBeNull();
