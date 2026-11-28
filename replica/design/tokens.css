@@ -1,0 +1,96 @@
+/* GÉNÉRÉ par build_tokens.py depuis tokens.json. Ne pas modifier à la main. */
+:root {
+  --color-bg: #ffffff;
+  --color-surface: #f2f2f2;
+  --color-border: #e3e3e3;
+  --color-border-input: #858585;
+  --color-text: #1b1b1b;
+  --color-text-muted: #5a5a5a;
+  --color-accent: #2f5bea;
+  --color-accent-strong: #2448c4;
+  --color-accent-subtle: #e9eefd;
+  --color-on-accent: #ffffff;
+  --color-danger: #c62f2f;
+  --color-danger-bg: #fdecec;
+  --color-success: #1b6f45;
+  --color-success-bg: #e6f4ec;
+  --color-success-solid: #237a52;
+  --color-on-solid: #ffffff;
+  --color-warning: #7a5200;
+  --color-warning-bg: #fff3d1;
+  --color-rating: #b3590a;
+  --color-overlay: rgba(0,0,0,.5);
+  --font-sans: system-ui, -apple-system, 'Segoe UI', Roboto, 'Noto Sans', 'Helvetica Neue', Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  --text-xs-size: 12px;
+  --text-xs-line: 16px;
+  --text-xs-weight: 500;
+  --text-sm-size: 14px;
+  --text-sm-line: 20px;
+  --text-sm-weight: 400;
+  --text-base-size: 16px;
+  --text-base-line: 24px;
+  --text-base-weight: 400;
+  --text-lg-size: 20px;
+  --text-lg-line: 28px;
+  --text-lg-weight: 600;
+  --text-xl-size: 24px;
+  --text-xl-line: 30px;
+  --text-xl-weight: 700;
+  --text-display-size: 32px;
+  --text-display-line: 38px;
+  --text-display-weight: 700;
+  --text-price-size: 16px;
+  --text-price-line: 20px;
+  --text-price-weight: 700;
+  --text-price-sm-size: 14px;
+  --text-price-sm-line: 18px;
+  --text-price-sm-weight: 700;
+  --space-0: 0px;
+  --space-4: 4px;
+  --space-8: 8px;
+  --space-12: 12px;
+  --space-16: 16px;
+  --space-24: 24px;
+  --space-32: 32px;
+  --space-48: 48px;
+  --space-64: 64px;
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-pill: 999px;
+  --shadow-card: 0 1px 2px rgba(16,24,40,.06), 0 1px 3px rgba(16,24,40,.10);
+  --shadow-pop: 0 12px 32px rgba(16,24,40,.16);
+  --shadow-sheet: 0 -8px 24px rgba(16,24,40,.14);
+  --motion-fast: 120ms;
+  --motion-base: 200ms;
+  --motion-ease: cubic-bezier(.2,.8,.2,1);
+  --size-touch-min: 44px;
+  --size-appbar: 56px;
+  --size-tabbar: 56px;
+  --size-button-sm: 36px;
+  --size-button-md: 44px;
+  --size-button-lg: 52px;
+  --size-input: 48px;
+  --size-chip: 36px;
+  --size-avatar-sm: 24px;
+  --size-avatar-md: 40px;
+  --size-avatar-lg: 72px;
+  --size-icon: 24px;
+  --layout-page-padding: 16px;
+  --layout-grid-gap: 8px;
+  --layout-card-ratio: 3 / 4;
+  --layout-content-max: 1120px;
+  --layout-narrow-max: 480px;
+  --z-appbar: 10;
+  --z-tabbar: 10;
+  --z-sheet: 30;
+  --z-toast: 40;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root { --motion-fast: 0.01ms; --motion-base: 0.01ms; }
+}
+
+html { font-family: var(--font-sans); color: var(--color-text); background: var(--color-bg); }
+:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }

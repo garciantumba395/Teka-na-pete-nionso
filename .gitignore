@@ -1,0 +1,17 @@
+replica/screens/*
+!replica/screens/.gitkeep
+
+# app
+node_modules/
+.next/
+next-env.d.ts
+*.tsbuildinfo
+test-results/
+.env*.local
+playwright-report/
+
+# images de diff : elles reprennent des captures de l'original
+replica/diffs/*.png
+
+# copies de travail temporaires des agents parallèles
+.claude/worktrees/

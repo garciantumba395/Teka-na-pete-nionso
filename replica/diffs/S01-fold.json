@@ -1,0 +1,48 @@
+{
+  "mode": "layout",
+  "original": {
+    "width": 576,
+    "height": 1024
+  },
+  "clone": {
+    "width": 390,
+    "height": 844
+  },
+  "compared_at": {
+    "width": 390,
+    "height": 693
+  },
+  "height_delta_pct": 21.8,
+  "score": 19.9,
+  "verdict": "different",
+  "regions": [
+    {
+      "x": 0,
+      "y": 0,
+      "w": 567,
+      "h": 1024,
+      "cells": 165,
+      "where": "middle centre"
+    },
+    {
+      "x": 330,
+      "y": 47,
+      "w": 236,
+      "h": 141,
+      "cells": 9,
+      "where": "top right"
+    },
+    {
+      "x": 236,
+      "y": 47,
+      "w": 47,
+      "h": 94,
+      "cells": 2,
+      "where": "top centre"
+    }
+  ],
+  "files": {
+    "original": "/tmp/claude-0/-home-user-Teka-na-pete-nionso/18e167f0-e0a4-5a7c-bd1e-1a2ab549b12b/scratchpad/ref03.png",
+    "clone": "/tmp/claude-0/-home-user-Teka-na-pete-nionso/18e167f0-e0a4-5a7c-bd1e-1a2ab549b12b/scratchpad/S01-fold.png"
+  }
+}

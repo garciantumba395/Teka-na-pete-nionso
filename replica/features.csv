@@ -1,0 +1,68 @@
+feature,area,priority,original,clone,notes
+Créer une annonce avec photos (jusqu'à 20),vente,must,yes,yes,"[SRC] catalog-rules | M0 : jusqu'à 20 photos, compression 1280 px côté client, GPS retiré. Pas d'écran de prise de photo dédié (sélecteur natif)"
+Titre / description / catégorie / état / prix fixe,vente,must,yes,yes,[SRC+INF] champs exacts à confirmer | M0
+Choix des matières (max 3),vente,could,yes,no,[SRC] catalog-rules
+Plafond de valeur par article,vente,should,yes,yes,[SRC] 1000 USD chez Vinted; à adapter par devise locale | M0 : plafond vérifié côté serveur dans les deux devises. Valeur PLACEHOLDER (1 000 USD)
+Interdiction des enchères (prix fixe uniquement),vente,should,yes,yes,"[SRC] catalog-rules | M0 : prix fixe uniquement, pas d'enchères"
+Lots (bundles) avec prix total affiché,vente,should,yes,yes,"[SRC] catalog-rules | M1 : panier côté serveur (20 articles), page /cart groupée par vendeur et devise, une commande = un paiement, un code de remise, un litige, un avis ; réservation atomique ; lot mixte USD/CDF refusé (422) ; frais de livraison calculés une fois"
+Annonce masquée avec 24 h pour corriger,modération,should,yes,partial,[SRC] catalog-rules | M1 : masquage par la modération ; pas de délai de 24 h pour corriger ni de notification
+Catalogue de catégories autorisées / interdites,catalogue,must,yes,yes,"[SRC] catalog-rules; adapter la liste au marché local | Catalogue de règles d'articles interdits (12 règles par défaut, refus 422 à la publication, page publique, administration). À FAIRE VALIDER par un juriste local ; la détection par mots ne remplace pas le signalement"
+Recherche et filtres (catégorie/taille/marque/prix/état),découverte,must,yes,yes,"[IMG] captures 5 à 7 : tri, catégorie, lieu, prix, taille, marque, état, matière, couleur, retrait en personne | M1 : mot-clé, catégorie, prix max, rayon, marque, taille, état. Pas de tri, matière, couleur"
+Fil d'accueil / catalogue de résultats,découverte,must,yes,yes,"[IMG] captures 1 à 5 : grille à 2 colonnes, prix, cœur et compteur, carrousels | M0 : S01 et S03"
+Détail d'annonce (galerie / vendeur / frais),découverte,must,yes,yes,"[IMG] capture 5 : galerie à points, cœur, bandeau « Vendu », vendeur avec étoiles | M0 : galerie, vendeur, prix avec protection, états Vendu et Réservé"
+Favoris,découverte,should,yes,yes,"[IMG] captures 1 à 5 : cœur et compteur sur chaque carte | M1 : cœur sur chaque carte et la fiche (bouton indépendant, clavier, inactif avant hydratation), compteur, page /favourites avec annonces vendues ou réservées signalées. Pas de notification de baisse de prix ni de vente"
+Inscription et connexion,compte,must,yes,yes,"[IMG] captures 4 et 6 : réseaux sociaux + e-mail. Clone : téléphone + code SMS | M0 : téléphone + code SMS (factice en développement) | [BACKEND] Persistant en PostgreSQL, sessions révocables, limites de débit. SMS réel non branché"
+Vérification de compte,compte,should,yes,partial,[SRC] safety (existence confirmée) | Numéro vérifié seulement ; pièce d'identité non construite
+Profil public avec badge vérifié,compte,should,yes,yes,"[SRC] safety | M0 : profil public, mention « numéro vérifié »"
+Messagerie acheteur-vendeur,messagerie,must,yes,yes,"[SRC] safety | M1 : messages texte, non lus, interrogation toutes les 4 s (pas de temps réel), rappel de sécurité sur numéro ou lien. Pas de photos dans les messages"
+Filtre anti-spam dans les messages,messagerie,should,yes,partial,[SRC] safety | Détection de numéro et de lien : message remis avec un rappel (pas de blocage ni de modération)
+Offres de prix / négociation,messagerie,should,yes,no,[INF] à confirmer
+Achat via bouton « Acheter » (paiement protégé),paiement,must,yes,yes,"[SRC] how_it_works / refund policy | M0 : réservation atomique, paiement mobile money (factice)"
+Frais de protection ajoutés à l'acheteur,paiement,must,yes,yes,"[SRC] montant non lu. [IMG] captures 4 et 5 : prix « incl. » avec bouclier dès la liste | M0 : 5 % avec minimum, valeurs PLACEHOLDER"
+0 frais vendeur,paiement,must,yes,yes,[SRC] how_it_works | M0
+Fonds séquestrés jusqu'à confirmation,paiement,must,yes,yes,"[SRC] safety | M0 : séquestre dans le grand livre en partie double ; le PSP est factice | [BACKEND] Grand livre vérifié sur PostgreSQL (somme nulle, séquestre soldé). Fournisseur de paiement factice"
+Libération du paiement après 2 jours sans signalement,paiement,must,yes,yes,"[SRC] refund policy | Libération par le code de remise construite. Libération automatique après 48 h : non construite | Libération par le code de remise (immédiate). Filet : commande payée jamais remise au bout de 7 jours (PLACEHOLDER) = remboursement automatique de l'acheteur | Main propre : libération immédiate par le code. Coursier : libération automatique 48 h après « reçu » sans litige (tâche release_delivered_orders). Filet : remboursement automatique si jamais remis (7 jours) ou colis perdu (10 jours), PLACEHOLDERS"
+Solde vendeur et retrait des gains,paiement,must,yes,yes,"[INF] aucune source lue | M0 : solde, retrait, échec recrédité. Fournisseur factice | [BACKEND] Persistant et testé en concurrence (pas de double dépense). Fournisseur factice"
+Étiquette d'expédition prépayée,livraison,must,yes,no,[SRC] how_it_works; à remplacer par logistique locale
+Dépôt en point relais ou collecte à domicile,livraison,should,yes,no,[SRC] how_it_works
+Suivi de colis en temps réel,livraison,must,yes,partial,[SRC] how_it_works | Frise et historique horodaté renseignés à la main par le vendeur (coursier indépendant) ; pas de suivi en temps réel ni d'intégration à un transporteur
+Bouton « J'ai un problème » et litige guidé,litiges,must,yes,yes,"[SRC] refund policy | M1 : motif guidé puis description, sur commande payée et pas encore remise, par l'acheteur ou le vendeur"
+Motifs : non reçu / endommagé / non conforme,litiges,must,yes,yes,"[SRC] refund policy | M1 : 4 motifs (remise non faite, abîmé, non conforme, autre)"
+Photos obligatoires pour dommage,litiges,should,yes,partial,"[SRC] refund policy | Photos de preuve privées (6 par membre et par litige), facultatives : pas obligatoires pour le motif « abîmé »"
+Fenêtre de signalement de 2 jours calendaires,litiges,must,yes,yes,[SRC] refund policy | Main propre : litige avant la remise. Coursier : litige tant que la fenêtre de 48 h après « reçu » est ouverte
+Retour sous 5 jours ouvrés (retour payé par l'acheteur),litiges,should,yes,no,[SRC] refund policy
+Colis perdu : enquête après 25 jours ouvrés,litiges,should,yes,partial,[SRC] refund policy; adapter aux délais locaux | « Colis non reçu » ouvre un litige ; remboursement automatique après 10 jours (PLACEHOLDER) sans livraison. Pas d'enquête transporteur
+Remboursement complet (prix+frais+livraison+taxes),litiges,must,yes,yes,"[SRC] refund policy | Remboursement intégral à l'annulation avant remise, y compris paiement tardif. Pas via litige | Annulation avant remise, litige tranché en faveur de l'acheteur, paiement tardif : toujours intégral"
+Arbitrage par le support si désaccord,litiges,must,yes,yes,"[SRC] refund policy | M1 : rôle support/admin, écran /staff, décision rembourser ou payer, échanges des deux parties. Pas de décision partielle ni de délai de réponse automatique"
+Avis après commande terminée uniquement,confiance,must,yes,yes,"[SRC] safety | M1 : note de 1 à 5 et commentaire, un par membre et par commande terminée, affichés sur le profil"
+Signalement d'annonces et de membres,modération,must,yes,yes,"[SRC] safety | M1 : motifs, doublons ignorés, file de modération"
+Suspension (ex. 7 jours) ou blocage permanent,modération,should,yes,partial,"[SRC] catalog-rules | M1 : suspension de 7 jours (sessions coupées, actions refusées). Pas de blocage permanent"
+Scoring de risque prédictif (fraude),modération,could,yes,skip,[SRC] safety; basé sur les données de l'original; version simple à la place
+Compte Pro avec vérification société,pro,could,yes,no,[SRC] vinted.fr/pro
+Retour 14 jours obligatoire pour vendeurs Pro,pro,could,yes,no,[SRC] pro; dépend du droit local
+Mise en avant payante d'annonce (bump),monétisation,should,yes,no,[SRC] catalog-rules (existence); prix et mécanique non lus
+Notifications (push / email),engagement,should,yes,partial,"[INF] | Notifications internes (22 types) + pastille ; SMS pour 5 événements (commande payée, litige ouvert et résolu, demande d'annulation, colis remis) avec préférences et plafond de 5 par jour et par numéro (fournisseur console factice) ; rappels et expirations par tâche planifiée. Pas de push ni d'e-mail"
+Application mobile iOS et Android,plateforme,must,yes,partial,[SRC] /app | Application web installable (PWA) ; aucune application native ni publication sur les boutiques
+Rapports de transparence DSA,conformité,could,yes,skip,[SRC] safety; obligation UE sans équivalent direct
+Vinted Go (casiers automatiques),logistique,could,yes,skip,[SRC] newsroom; matériel et partenariats hors périmètre
+Régie publicitaire B2B,monétisation,could,yes,skip,[SRC] /advertising; hors périmètre initial
+Réseau de membres et catalogue existant,communauté,could,yes,skip,l'audience n'est pas clonable
+Paiement mobile money (M-Pesa / MTN MoMo / Orange Money / Airtel / Wave),paiement,must,no,partial,"[AFR] fonction d'adaptation; exclue du score de parité | M0 : 4 opérateurs en bac à sable (fournisseur factice). Aucun PSP réel | [BACKEND] Webhooks idempotents, rattrapage d'un webhook perdu, paiement tardif remboursé : testés sur PostgreSQL. Aucun PSP réel"
+Paiement à la livraison (option),paiement,should,no,no,[AFR]
+Remise en main propre avec code de confirmation,livraison,must,no,yes,"[AFR] | M0 : code à 6 chiffres dérivé (HMAC), 5 essais puis verrouillage"
+Livreurs et coursiers locaux (motos) intégrés,livraison,must,no,partial,"[AFR] | Coursier indépendant : le vendeur saisit nom, téléphone et référence ; frais par grille PLACEHOLDER ; frais de livraison versés au vendeur par défaut (il règle le coursier) ou gardés par la plateforme avec écran /staff/courier-fees pour les régler. Aucun coursier partenaire intégré"
+Localisation par repère / partage de position,livraison,should,no,partial,"[AFR] adressage informel | Commune + position approximative de l'annonce. Champ « repère » de la commande : API prête, pas d'interface"
+Mode léger : PWA et images compressées,plateforme,must,no,yes,"[AFR] connexion mobile inégale | Images compressées, police système, 0 Ko de police. Manifeste PWA et service worker : non construits | Application installable (manifeste, icônes originales, page hors-ligne, bandeau d'installation), images compressées côté client, JS initial 463 à 475 Ko brut (138 à 143 Ko gzip). Performance NON mesurée sur un vrai téléphone"
+Multilingue (FR / EN + langues locales),plateforme,must,no,no,[AFR]
+Multi-devises locales et plafonds adaptés,paiement,must,no,partial,"[AFR] | USD et CDF, plafond par devise. Taux de change PLACEHOLDER (2 800)"
+Partage d'annonce et notifications WhatsApp,engagement,should,no,no,[AFR]
+Vérification par numéro de téléphone (puis pièce d'identité),compte,must,no,partial,"[AFR] | Code SMS (factice). Pièce d'identité non construite | [BACKEND] Codes stockés en empreinte, 5 essais puis verrouillage, limites par numéro et par adresse. SMS réel non branché"
+Retrait en personne (option et filtre),découverte,should,yes,partial,[IMG?] captures 6 et 7 (maquettes possibles). Mode par défaut en RDC | Seul mode de remise du MVP. Pas d'option ni de filtre
+Recherche par rayon de distance avec carte,découverte,should,yes,partial,"[IMG?] capture 7. Exige des coordonnées sur les annonces (schéma à compléter) | Rayon autour d'une commune (3 à 25 km), tri par distance. Pas de carte"
+Fil personnalisé (tailles et marques suivies),découverte,should,yes,yes,"[IMG] capture 4 : bandeau d'invitation à personnaliser | M1 : suivi de 10 marques et 10 tailles au plus (/me/preferences), section « Pour toi » sur l'accueil (12 annonces, sans doublon, hors ses propres annonces), invitation si rien n'est suivi. Pas de recommandation par comportement"
+Marques récentes dans la recherche de marque,découverte,could,yes,no,[IMG?] capture 6
+Recherche enregistrée (marque-page),découverte,could,yes,no,[IMG?] capture 7
+Taille de colis choisie par le vendeur,vente,should,yes,no,[IMG?] capture 6 « Package size »
+Couleurs de l'article (jusqu'à 2),vente,could,yes,no,[IMG?] capture 6
+Intérêt pour l'échange (swap),vente,could,yes,no,[IMG?] capture 6
+"Connexion avec Facebook, Google ou Apple",compte,should,yes,skip,[IMG] capture 4. Remplacée par téléphone + OTP (identité = numéro)

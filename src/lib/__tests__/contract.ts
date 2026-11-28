@@ -1,0 +1,2866 @@
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { deriveHandoverCode } from "../handover";
+import { FEES, protectionFee } from "../fees";
+import { describeNotification } from "../notifications";
+import { AppError, type LedgerEntry, type ProviderEvent } from "../types";
+import { seedId as S } from "../data/ids";
+import type { DataLayer } from "../data/types";
+
+/**
+ * SUITE DE CONTRAT de DataLayer. Les MÊMES scénarios s'exécutent contre la couche factice (fake.contract.test.ts)
+ * et contre un vrai PostgreSQL (pg.contract.test.ts) : c'est ce qui prouve que l'une remplace l'autre
+ * sans changer le comportement visible par les écrans.
+ */
+export interface ContractEnv {
+  data: DataLayer;
+  now(): number;
+  advance(ms: number): void;
+  ledger(): Promise<LedgerEntry[]>;
+  pendingEvents(): Promise<ProviderEvent[]>;
+  flush(): Promise<void>;
+  refunds(): number;
+  /** agent C : SMS « envoyés » par le fournisseur factice, et attente des envois en cours (ils ne bloquent jamais la méthode métier). */
+  sentSms(): { to: string; text: string }[];
+  settleSms(): Promise<void>;
+  close?(): Promise<void>;
+}
+
+export function defineContract(label: string, factory: () => Promise<ContractEnv>, opts: { skip?: boolean } = {}) {
+  const suite = opts.skip ? describe.skip : describe;
+  suite(`contrat DataLayer : ${label}`, () => {
+    let env: ContractEnv;
+    let data: DataLayer;
+    const PHOTO = "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQ";
+
+    beforeEach(async () => {
+      env = await factory();
+      data = env.data;
+    });
+    afterEach(async () => {
+      await env.close?.();
+    });
+
+    async function signup(phone: string, name: string) {
+      await data.requestOtp(phone);
+      return (await data.verifyOtp(phone, "123456", name)).user;
+    }
+    async function listing(sellerId: string, over: Record<string, unknown> = {}) {
+      const d = await data.createDraft(sellerId, {
+        title: "Robe test", description: "", categoryId: S("cat-robes"), condition: "good", priceMinor: 2500, currency: "USD", areaId: S("area-com-gombe"), photos: [PHOTO], ...over,
+      });
+      return data.publishItem(sellerId, d.id);
+    }
+    const code = (e: unknown) => (e as AppError).code;
+    async function rejects(p: Promise<unknown>): Promise<AppError> {
+      try {
+        await p;
+      } catch (e) {
+        return e as AppError;
+      }
+      throw new Error("aurait dû échouer");
+    }
+    /** Somme du grand livre par devise : doit toujours être nulle. */
+    const ledgerSum = async (cur: "USD" | "CDF") => (await env.ledger()).filter((e) => e.currency === cur).reduce((s, e) => s + e.amountMinor, 0);
+    const account = async (a: string, cur: "USD" | "CDF" = "USD") => (await env.ledger()).filter((e) => e.account === a && e.currency === cur).reduce((s, e) => s + e.amountMinor, 0);
+
+    async function paidOrder(buyerName = "Acheteur", phone = "+243821111111", priceMinor = 2500) {
+      const seller = (await data.getUser(S("user-marie")))!;
+      const buyer = await signup(phone, buyerName);
+      const item = await listing(seller.id, { priceMinor });
+      const order = await data.createOrder(buyer.id, { itemIds: [item.id], deliveryMethod: "hand_delivery" });
+      await data.startPayment(order.id, buyer.id, { method: "mpesa", msisdn: "0821111111", idempotencyKey: `k-${order.id}` });
+      await env.flush();
+      return { seller, buyer, item, order };
+    }
+
+    describe("authentification par téléphone", () => {
+      it("refuse un numéro invalide", async () => {
+        expect(code(await rejects(data.requestOtp("12345")))).toBe("PHONE_INVALID");
+      });
+      it("crée un compte seulement avec un nom, puis connecte un compte existant", async () => {
+        await data.requestOtp("0831234567");
+        expect(code(await rejects(data.verifyOtp("0831234567", "123456")))).toBe("NAME_REQUIRED");
+        const r = await data.verifyOtp("0831234567", "123456", "Nouveau");
+        expect(r.isNew).toBe(true);
+        await data.requestOtp("+243831234567");
+        const again = await data.verifyOtp("831234567", "123456");
+        expect(again.isNew).toBe(false);
+        expect(again.user.id).toBe(r.user.id);
+      });
+      it("verrouille après 5 mauvais codes et limite les envois", async () => {
+        await data.requestOtp("0831234567");
+        for (let i = 0; i < 5; i++) expect(code(await rejects(data.verifyOtp("0831234567", "000000", "X Y")))).toBe("OTP_WRONG");
+        expect(code(await rejects(data.verifyOtp("0831234567", "123456", "X Y")))).toBe("OTP_LOCKED");
+        await data.requestOtp("0831234567");
+        await data.requestOtp("0831234567");
+        expect(code(await rejects(data.requestOtp("0831234567")))).toBe("OTP_RATE_LIMIT");
+      });
+      it("le code expire", async () => {
+        await data.requestOtp("0831234567");
+        env.advance(6 * 60_000);
+        expect(code(await rejects(data.verifyOtp("0831234567", "123456", "X Y")))).toBe("OTP_EXPIRED");
+      });
+    });
+
+    describe("annonces", () => {
+      it("refuse une photo qui n'est pas une image compressée, et au-delà de 20", async () => {
+        const m = (await data.getUser(S("user-marie")))!;
+        const base = { title: "Robe test", description: "", categoryId: S("cat-robes"), condition: "good", priceMinor: 100, currency: "USD", photos: ["<script>"] };
+        expect(code(await rejects(data.createDraft(m.id, base)))).toBe("VALIDATION");
+        expect(code(await rejects(data.createDraft(m.id, { ...base, photos: Array(21).fill(PHOTO) })))).toBe("VALIDATION");
+      });
+      it("applique le plafond de prix et la catégorie à la publication (côté serveur)", async () => {
+        const m = (await data.getUser(S("user-marie")))!;
+        const e = await rejects(listing(m.id, { priceMinor: 100_001 }));
+        expect(e.code).toBe("VALIDATION");
+        expect(e.details?.priceMinor).toMatch(/maximum/);
+        expect((await rejects(listing(m.id, { categoryId: S("cat-femme") }))).details?.categoryId).toMatch(/n'accepte pas/);
+        expect((await rejects(listing(m.id, { photos: [] }))).details?.photos).toMatch(/photo/);
+      });
+      it("un brouillon n'est visible que de son vendeur ; une annonce publiée l'est de tous", async () => {
+        const m = (await data.getUser(S("user-marie")))!;
+        const d = await data.createDraft(m.id, { title: "Brouillon", description: "", categoryId: S("cat-robes"), condition: "good", priceMinor: 100, currency: "USD", photos: [PHOTO] });
+        expect(await data.getItem(d.id, S("user-patrick"))).toBeNull();
+        expect(await data.getItem(d.id, m.id)).not.toBeNull();
+        await data.publishItem(m.id, d.id);
+        expect(await data.getItem(d.id, S("user-patrick"))).not.toBeNull();
+        expect(code(await rejects(data.publishItem(m.id, d.id)))).toBe("INVALID_STATE");
+      });
+      it("la position de l'annonce est approximative (arrondie)", async () => {
+        const m = (await data.getUser(S("user-marie")))!;
+        const it = await listing(m.id);
+        expect(it.lat).toBe(Math.round(it.lat! * 100) / 100);
+      });
+      it("recherche : texte sans accents, catégorie parente, rayon", async () => {
+        expect((await data.listItems({ q: "ecouteurs" })).map((c) => c.title)).toContain("Écouteurs filaires");
+        const femmes = await data.listItems({ categoryId: S("cat-femme") });
+        expect(femmes.length).toBeGreaterThan(3);
+        const near = await data.listItems({ areaId: S("area-com-gombe"), radiusKm: 3 });
+        expect(near.length).toBeGreaterThan(0);
+        expect(near.every((c) => c.distanceKm! <= 3)).toBe(true);
+        const wider = await data.listItems({ areaId: S("area-com-gombe"), radiusKm: 15 });
+        expect(wider.length).toBeGreaterThan(near.length);
+      });
+    });
+
+    describe("commande et réservation", () => {
+      it("deux acheteurs, un seul article : un seul gagne", async () => {
+        const m = (await data.getUser(S("user-marie")))!;
+        const a = await signup("0821000001", "Acheteur A");
+        const b = await signup("0821000002", "Acheteur B");
+        const item = await listing(m.id);
+        const results = await Promise.allSettled([
+          data.createOrder(a.id, { itemIds: [item.id], deliveryMethod: "hand_delivery" }),
+          data.createOrder(b.id, { itemIds: [item.id], deliveryMethod: "hand_delivery" }),
+        ]);
+        expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+        const lost = results.find((r) => r.status === "rejected") as PromiseRejectedResult;
+        expect(code(lost.reason)).toBe("ITEM_UNAVAILABLE");
+        expect((await data.getItem(item.id))!.status).toBe("reserved");
+      });
+      it("refuse l'achat de son propre article et les devises mélangées", async () => {
+        const m = (await data.getUser(S("user-marie")))!;
+        const own = await listing(m.id);
+        expect(code(await rejects(data.createOrder(m.id, { itemIds: [own.id], deliveryMethod: "hand_delivery" })))).toBe("SELF_PURCHASE");
+        const buyer = await signup("0821000003", "Acheteur C");
+        const usd = await listing(m.id);
+        const cdf = await listing(m.id, { currency: "CDF", priceMinor: 3_500_000 });
+        expect(code(await rejects(data.createOrder(buyer.id, { itemIds: [usd.id, cdf.id], deliveryMethod: "hand_delivery" })))).toBe("MIXED_CURRENCY");
+      });
+      it("le total = articles + frais de protection, calculé par le serveur", async () => {
+        const m = (await data.getUser(S("user-marie")))!;
+        const buyer = await signup("0821000004", "Acheteur D");
+        const item = await listing(m.id, { priceMinor: 10_000 });
+        const o = await data.createOrder(buyer.id, { itemIds: [item.id], deliveryMethod: "hand_delivery" });
+        expect(o.protectionFeeMinor).toBe(500);
+        expect(o.totalMinor).toBe(10_500);
+      });
+      it("un tiers ne voit pas la commande", async () => {
+        const { order } = await paidOrder();
+        const tiers = await signup("0821000009", "Tiers");
+        expect(code(await rejects(data.getOrder(order.id, tiers.id)))).toBe("NOT_FOUND");
+      });
+      it("expire après le délai et libère l'article", async () => {
+        const m = (await data.getUser(S("user-marie")))!;
+        const buyer = await signup("0821000005", "Acheteur E");
+        const item = await listing(m.id);
+        const o = await data.createOrder(buyer.id, { itemIds: [item.id], deliveryMethod: "hand_delivery" });
+        env.advance(FEES.orderPaymentTtlMs + 1);
+        expect((await data.getOrder(o.id, buyer.id)).status).toBe("expired");
+        expect((await data.getItem(item.id))!.status).toBe("active");
+      });
+    });
+
+    describe("paiement et séquestre", () => {
+      it("paiement réussi : commande payée, argent mis de côté, code visible de l'acheteur seul", async () => {
+        const { order, buyer, seller } = await paidOrder();
+        const v = await data.getOrder(order.id, buyer.id);
+        expect(v.status).toBe("paid");
+        expect(await account("order_escrow")).toBe(-order.totalMinor);
+        expect(await account("psp_clearing")).toBe(order.totalMinor);
+        expect(await data.getHandoverCode(order.id, buyer.id)).toBe(deriveHandoverCode(order.id));
+        expect(code(await rejects(data.getHandoverCode(order.id, seller.id)))).toBe("NOT_FOUND");
+        expect(await ledgerSum("USD")).toBe(0);
+      });
+      it("refus du paiement : la commande reste ouverte, un nouvel essai est possible", async () => {
+        const m = (await data.getUser(S("user-marie")))!;
+        const buyer = await signup("0821000006", "Acheteur F");
+        const item = await listing(m.id);
+        const o = await data.createOrder(buyer.id, { itemIds: [item.id], deliveryMethod: "hand_delivery" });
+        await data.startPayment(o.id, buyer.id, { method: "mpesa", msisdn: "0821000100", idempotencyKey: "k1" });
+        await env.flush();
+        const v = await data.getOrder(o.id, buyer.id);
+        expect(v.status).toBe("pending_payment");
+        expect(v.payment?.status).toBe("failed");
+        expect(v.payment?.failureCode).toBe("INSUFFICIENT_FUNDS");
+        await data.startPayment(o.id, buyer.id, { method: "mpesa", msisdn: "0821000101", idempotencyKey: "k2" });
+        await env.flush();
+        expect((await data.getOrder(o.id, buyer.id)).status).toBe("paid");
+      });
+      it("même clé d'idempotence = même paiement ; un second paiement en attente est refusé", async () => {
+        const m = (await data.getUser(S("user-marie")))!;
+        const buyer = await signup("0821000007", "Acheteur G");
+        const item = await listing(m.id);
+        const o = await data.createOrder(buyer.id, { itemIds: [item.id], deliveryMethod: "hand_delivery" });
+        const p1 = await data.startPayment(o.id, buyer.id, { method: "orange_money", msisdn: "0821000007", idempotencyKey: "same" });
+        const p2 = await data.startPayment(o.id, buyer.id, { method: "orange_money", msisdn: "0821000007", idempotencyKey: "same" });
+        expect(p2.id).toBe(p1.id);
+        expect(code(await rejects(data.startPayment(o.id, buyer.id, { method: "orange_money", msisdn: "0821000007", idempotencyKey: "autre" })))).toBe("PAYMENT_IN_PROGRESS");
+      });
+      it("un webhook rejoué ne change rien (même événement, puis nouvel événement sur le même paiement)", async () => {
+        const m = (await data.getUser(S("user-marie")))!;
+        const buyer = await signup("0821000010", "Acheteur K");
+        const item = await listing(m.id);
+        const o = await data.createOrder(buyer.id, { itemIds: [item.id], deliveryMethod: "hand_delivery" });
+        await data.startPayment(o.id, buyer.id, { method: "mpesa", msisdn: "0821000010", idempotencyKey: "replay" });
+        const [ev] = await env.pendingEvents();
+        expect((await data.handleProviderEvent(ev)).duplicate).toBe(false);
+        const n = (await env.ledger()).length;
+        expect(n).toBeGreaterThan(0);
+        expect((await data.handleProviderEvent(ev)).duplicate).toBe(true); // même eventId : table webhook_events
+        expect((await data.handleProviderEvent({ ...ev, eventId: "autre-id" })).duplicate).toBe(true); // paiement déjà encaissé
+        expect((await env.ledger()).length).toBe(n);
+        expect(await account("order_escrow")).toBe(-o.totalMinor); // encaissé une seule fois
+      });
+      it("paiement tardif après expiration : remboursé automatiquement, l'argent n'est jamais gardé", async () => {
+        const m = (await data.getUser(S("user-marie")))!;
+        const buyer = await signup("0821000008", "Acheteur H");
+        const item = await listing(m.id);
+        const o = await data.createOrder(buyer.id, { itemIds: [item.id], deliveryMethod: "hand_delivery" });
+        await data.startPayment(o.id, buyer.id, { method: "mpesa", msisdn: "0821000008", idempotencyKey: "late" });
+        env.advance(FEES.orderPaymentTtlMs + 1);
+        await env.flush();
+        const v = await data.getOrder(o.id, buyer.id);
+        expect(v.status).toBe("expired");
+        expect(v.payment?.status).toBe("refunded");
+        expect(await account("order_escrow")).toBe(0);
+        expect(await ledgerSum("USD")).toBe(0);
+        expect(env.refunds()).toBe(1);
+        expect((await data.getItem(item.id))!.status).toBe("active");
+      });
+      it("annulation du VENDEUR après paiement : remboursement intégral et article libéré (l'acheteur, lui, ne peut plus annuler seul)", async () => {
+        const { order, buyer, seller, item } = await paidOrder("Acheteur I", "+243821222222");
+        const refused = await rejects(data.cancelOrder(order.id, buyer.id));
+        expect(refused.code).toBe("CANCEL_REQUEST_REQUIRED");
+        expect(refused.status).toBe(409);
+        expect((await data.getOrder(order.id, buyer.id)).status).toBe("paid");
+        expect(await account("order_escrow")).toBe(-order.totalMinor);
+        const v = await data.cancelOrder(order.id, seller.id);
+        expect(v.status).toBe("cancelled");
+        expect(await account("order_escrow")).toBe(0);
+        expect(await account("psp_clearing")).toBe(0);
+        expect((await data.getItem(item.id))!.status).toBe("active");
+        expect(v.payment?.status).toBe("refunded");
+      });
+    });
+
+    describe("remise en main propre", () => {
+      it("le bon code libère l'argent au vendeur : commande terminée, article vendu, frais pour la plateforme", async () => {
+        const { order, seller, buyer, item } = await paidOrder();
+        const v = await data.confirmDelivery(order.id, seller.id, deriveHandoverCode(order.id));
+        expect(v.status).toBe("completed");
+        expect((await data.getItem(item.id))!.status).toBe("sold");
+        expect(await account("order_escrow")).toBe(0);
+        expect(await account("seller_available")).toBe(-order.itemsMinor);
+        expect(await account("platform_revenue")).toBe(-order.protectionFeeMinor);
+        expect(await ledgerSum("USD")).toBe(0);
+        expect((await data.getWallet(seller.id)).balances.find((b) => b.currency === "USD")?.availableMinor).toBeGreaterThanOrEqual(order.itemsMinor);
+        expect(code(await rejects(data.cancelOrder(order.id, buyer.id)))).toBe("INVALID_STATE");
+      });
+      it("5 mauvais codes verrouillent la remise, même avec le bon code ensuite", async () => {
+        const { order, seller } = await paidOrder();
+        for (let i = 4; i >= 1; i--) {
+          const e = await rejects(data.confirmDelivery(order.id, seller.id, "000000"));
+          expect(e.code).toBe("CODE_WRONG");
+          expect(e.message).toContain(String(i));
+        }
+        expect(code(await rejects(data.confirmDelivery(order.id, seller.id, "000000")))).toBe("CODE_LOCKED");
+        expect(code(await rejects(data.confirmDelivery(order.id, seller.id, deriveHandoverCode(order.id))))).toBe("CODE_LOCKED");
+        env.advance(FEES.handoverLockMs + 1);
+        expect((await data.confirmDelivery(order.id, seller.id, deriveHandoverCode(order.id))).status).toBe("completed");
+      });
+      it("seul le vendeur saisit le code ; l'acheteur ne peut pas se l'auto-valider", async () => {
+        const { order, buyer } = await paidOrder();
+        expect(code(await rejects(data.confirmDelivery(order.id, buyer.id, deriveHandoverCode(order.id))))).toBe("NOT_FOUND");
+      });
+    });
+
+    describe("portefeuille et retraits", () => {
+      async function richSeller() {
+        const { order, seller } = await paidOrder("Acheteur J", "+243821333333", 20_000);
+        await data.confirmDelivery(order.id, seller.id, deriveHandoverCode(order.id));
+        return seller;
+      }
+      it("refuse un retrait supérieur au solde ou sous le minimum", async () => {
+        const s = await richSeller();
+        const base = { currency: "USD" as const, method: "mpesa" as const, msisdn: "0810000001" };
+        expect(code(await rejects(data.requestPayout(s.id, { ...base, amountMinor: 999_999, idempotencyKey: "a" })))).toBe("INSUFFICIENT_FUNDS");
+        expect(code(await rejects(data.requestPayout(s.id, { ...base, amountMinor: 100, idempotencyKey: "b" })))).toBe("BELOW_MINIMUM");
+      });
+      it("retrait réussi : solde réduit du montant et des frais, grand livre équilibré", async () => {
+        const s = await richSeller();
+        const before = (await data.getWallet(s.id)).balances.find((b) => b.currency === "USD")!.availableMinor;
+        const p = await data.requestPayout(s.id, { currency: "USD", method: "mpesa", msisdn: "0810000001", amountMinor: 10_000, idempotencyKey: "ok" });
+        expect(p.feeMinor).toBe(100);
+        expect((await data.getWallet(s.id)).balances.find((b) => b.currency === "USD")!.availableMinor).toBe(before - 10_100);
+        await env.flush();
+        expect((await data.listPayouts(s.id))[0].status).toBe("paid");
+        expect(await ledgerSum("USD")).toBe(0);
+      });
+      it("même clé d'idempotence : un seul retrait", async () => {
+        const s = await richSeller();
+        const input = { currency: "USD" as const, method: "mpesa" as const, msisdn: "0810000001", amountMinor: 5_000, idempotencyKey: "once" };
+        const a = await data.requestPayout(s.id, input);
+        const b = await data.requestPayout(s.id, input);
+        expect(b.id).toBe(a.id);
+        expect(await data.listPayouts(s.id)).toHaveLength(1);
+      });
+      it("retrait refusé par l'opérateur : le vendeur est recrédité intégralement", async () => {
+        const s = await richSeller();
+        const before = (await data.getWallet(s.id)).balances.find((b) => b.currency === "USD")!.availableMinor;
+        await data.requestPayout(s.id, { currency: "USD", method: "mpesa", msisdn: "0810000100", amountMinor: 10_000, idempotencyKey: "bad" });
+        await env.flush();
+        const w = await data.getWallet(s.id);
+        expect((await data.listPayouts(s.id))[0].status).toBe("failed");
+        expect(w.balances.find((b) => b.currency === "USD")!.availableMinor).toBe(before);
+        expect(await ledgerSum("USD")).toBe(0);
+      });
+    });
+
+    describe("sessions", () => {
+      it("un jeton ouvre une session, se révoque, et ne vaut rien une fois expiré", async () => {
+        const u = await signup("0831111111", "Session Un");
+        const { token, expiresAt } = await data.createSession(u.id);
+        expect(token.length).toBeGreaterThan(30);
+        expect(expiresAt).toBeGreaterThan(env.now());
+        expect((await data.getSessionUser(token))?.id).toBe(u.id);
+        expect(await data.getSessionUser("jeton-inconnu")).toBeNull();
+        await data.deleteSession(token);
+        expect(await data.getSessionUser(token)).toBeNull();
+        const again = await data.createSession(u.id);
+        env.advance(31 * 86_400_000);
+        expect(await data.getSessionUser(again.token)).toBeNull();
+      });
+      it("« se déconnecter partout » révoque toutes les sessions du membre, et seulement les siennes", async () => {
+        const a = await signup("0831111112", "Membre A");
+        const b = await signup("0831111113", "Membre B");
+        const a1 = await data.createSession(a.id);
+        const a2 = await data.createSession(a.id);
+        const b1 = await data.createSession(b.id);
+        await data.deleteAllSessions(a.id);
+        expect(await data.getSessionUser(a1.token)).toBeNull();
+        expect(await data.getSessionUser(a2.token)).toBeNull();
+        expect((await data.getSessionUser(b1.token))?.id).toBe(b.id);
+      });
+    });
+
+    describe("limitation de débit", () => {
+      it("laisse passer N appels par fenêtre, bloque ensuite avec un délai d'attente, puis repart", async () => {
+        const k = "test:cle";
+        for (let i = 0; i < 3; i++) expect((await data.rateLimit(k, 3, 60)).allowed).toBe(true);
+        const blocked = await data.rateLimit(k, 3, 60);
+        expect(blocked.allowed).toBe(false);
+        expect(blocked.retryAfterSec).toBeGreaterThan(0);
+        expect(blocked.retryAfterSec).toBeLessThanOrEqual(60);
+        expect((await data.rateLimit("autre-cle", 3, 60)).allowed).toBe(true); // les clés sont indépendantes
+        env.advance(61_000);
+        expect((await data.rateLimit(k, 3, 60)).allowed).toBe(true);
+      });
+    });
+
+    describe("suppression de compte", () => {
+      it("refuse tant qu'une commande est ouverte", async () => {
+        const m = (await data.getUser(S("user-marie")))!;
+        const buyer = await signup("0831111114", "Acheteur Z");
+        const item = await listing(m.id);
+        await data.createOrder(buyer.id, { itemIds: [item.id], deliveryMethod: "hand_delivery" });
+        expect(code(await rejects(data.deleteAccount(buyer.id)))).toBe("ACCOUNT_HAS_OPEN_ORDERS");
+        expect(code(await rejects(data.deleteAccount(m.id)))).toBe("ACCOUNT_HAS_OPEN_ORDERS");
+      });
+      it("refuse tant qu'il reste de l'argent dans le portefeuille", async () => {
+        const { seller, order } = await paidOrder("Acheteur Y", "+243821444444");
+        await data.confirmDelivery(order.id, seller.id, deriveHandoverCode(order.id));
+        expect(code(await rejects(data.deleteAccount(seller.id)))).toBe("ACCOUNT_HAS_FUNDS");
+      });
+      it("anonymise le profil, retire les annonces, révoque les sessions, et libère le numéro", async () => {
+        const u = await signup("0831111115", "A Supprimer");
+        const item = await listing(u.id);
+        const { token } = await data.createSession(u.id);
+        await data.deleteAccount(u.id);
+        expect(await data.getUser(u.id)).toBeNull();
+        expect(await data.getPublicProfile(u.id)).toBeNull();
+        expect(await data.getSessionUser(token)).toBeNull();
+        expect(await data.getItem(item.id, "autre-membre")).toBeNull();
+        expect(await data.listItems({ q: "Robe test" }).then((l) => l.some((c) => c.id === item.id))).toBe(false);
+        await data.requestOtp("0831111115");
+        const again = await data.verifyOtp("0831111115", "123456", "Nouveau Compte");
+        expect(again.isNew).toBe(true);
+        expect(again.user.id).not.toBe(u.id);
+      });
+    });
+
+    describe("entretien", () => {
+      it("purge les codes, sessions et compteurs expirés", async () => {
+        await data.requestOtp("0831111116");
+        const u = await signup("0831111117", "Purge");
+        await data.createSession(u.id);
+        await data.rateLimit("purge:cle", 1, 10);
+        env.advance(40 * 86_400_000);
+        const r = await data.purgeExpired();
+        expect(r.otp).toBeGreaterThanOrEqual(1);
+        expect(r.sessions).toBeGreaterThanOrEqual(1);
+        expect(r.rateLimits).toBeGreaterThanOrEqual(1);
+      });
+      it("le rapprochement ne casse rien quand il n'y a rien à rattraper", async () => {
+        expect(await data.reconcilePendingPayments()).toBe(0);
+      });
+    });
+
+    describe("identifiants invalides : jamais d'erreur serveur", () => {
+      it("un texte qui n'est pas un identifiant est « introuvable », pas une panne", async () => {
+        const u = await signup("0831111118", "Id Invalide");
+        expect(await data.getItem("inexistant", u.id)).toBeNull();
+        expect(await data.getUser("inexistant")).toBeNull();
+        expect(await data.getPublicProfile("inexistant")).toBeNull();
+        expect(code(await rejects(data.getOrder("inexistant", u.id)))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.createOrder(u.id, { itemIds: ["inexistant"], deliveryMethod: "hand_delivery" })))).toBe("NOT_FOUND");
+        expect(await data.listItems({ categoryId: "inexistant" })).toEqual([]);
+        expect(await data.listItems({ sellerId: "inexistant" })).toEqual([]);
+        expect(await data.listAreas("inexistant")).toEqual([]);
+      });
+    });
+
+    describe("autorisations : un second utilisateur n'obtient rien", () => {
+      it("ne peut ni voir, ni payer, ni annuler, ni valider, ni lire le code d'une commande qui n'est pas la sienne", async () => {
+        const { order, buyer, seller } = await paidOrder("Acheteur X", "+243821555555");
+        const tiers = await signup("0831111119", "Tiers");
+        expect(code(await rejects(data.getOrder(order.id, tiers.id)))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.getPayment(order.id, tiers.id)))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.getHandoverCode(order.id, tiers.id)))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.cancelOrder(order.id, tiers.id)))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.confirmDelivery(order.id, tiers.id, deriveHandoverCode(order.id))))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.acceptOrder(order.id, tiers.id)))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.startPayment(order.id, tiers.id, { method: "mpesa", msisdn: "0831111119", idempotencyKey: "intrus-1" })))).toBe("NOT_FOUND");
+        expect((await data.listMyOrders(tiers.id)).length).toBe(0);
+        expect((await data.getWallet(tiers.id)).balances).toEqual([]);
+        expect(await data.listPayouts(tiers.id)).toEqual([]);
+        // et la commande est intacte
+        expect((await data.getOrder(order.id, buyer.id)).status).toBe("paid");
+        expect((await data.getOrder(order.id, seller.id)).status).toBe("paid");
+      });
+      it("une clé d'idempotence ne peut pas être réutilisée par un autre membre", async () => {
+        const { seller, order } = await paidOrder("Acheteur W", "+243821666666", 20_000);
+        await data.confirmDelivery(order.id, seller.id, deriveHandoverCode(order.id));
+        const input = { currency: "USD" as const, method: "mpesa" as const, msisdn: "0810000001", amountMinor: 5_000, idempotencyKey: "cle-partagee" };
+        await data.requestPayout(seller.id, input);
+        const autre = await signup("0831111120", "Autre Vendeur");
+        expect(code(await rejects(data.requestPayout(autre.id, input)))).toBe("IDEMPOTENCY_CONFLICT");
+      });
+    });
+
+    describe("messagerie", () => {
+      async function duo() {
+        const seller = await signup("0811000091", "Vendeuse Chat");
+        const buyer = await signup("0821000092", "Acheteur Chat");
+        const item = await listing(seller.id);
+        return { seller, buyer, item };
+      }
+      it("ouvrir une conversation est idempotent, écrire est réservé aux deux parties", async () => {
+        const { seller, buyer, item } = await duo();
+        const a = await data.startConversation(buyer.id, item.id);
+        const b = await data.startConversation(buyer.id, item.id);
+        expect(a.created).toBe(true);
+        expect(b).toEqual({ id: a.id, created: false });
+        await data.sendMessage(a.id, buyer.id, "Bonjour, il est encore disponible ?");
+        const reply = await data.sendMessage(a.id, seller.id, "Oui, à Gombe.");
+        expect(reply.mine).toBe(true);
+        const asBuyer = await data.getConversation(a.id, buyer.id);
+        expect(asBuyer.messages.map((m) => [m.mine, m.body])).toEqual([[true, "Bonjour, il est encore disponible ?"], [false, "Oui, à Gombe."]]);
+        expect(asBuyer.counterpart.id).toBe(seller.id);
+      });
+      it("on ne s'écrit pas à soi-même ; une annonce inconnue ou en brouillon est introuvable", async () => {
+        const { seller, buyer, item } = await duo();
+        expect(code(await rejects(data.startConversation(seller.id, item.id)))).toBe("OWN_ITEM");
+        expect(code(await rejects(data.startConversation(buyer.id, S("item-inconnu"))))).toBe("NOT_FOUND");
+        const draft = await data.createDraft(seller.id, { title: "Brouillon", description: "", categoryId: S("cat-robes"), condition: "good", priceMinor: 1000, currency: "USD", areaId: S("area-com-gombe"), photos: [PHOTO] });
+        expect(code(await rejects(data.startConversation(buyer.id, draft.id)))).toBe("NOT_FOUND");
+      });
+      it("un tiers ne lit ni n'écrit dans la conversation (404 partout)", async () => {
+        const { buyer, item } = await duo();
+        const tiers = await signup("0831000093", "Tiers Curieux");
+        const c = await data.startConversation(buyer.id, item.id);
+        await data.sendMessage(c.id, buyer.id, "Message privé");
+        expect(code(await rejects(data.getConversation(c.id, tiers.id)))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.sendMessage(c.id, tiers.id, "Intrus")))).toBe("NOT_FOUND");
+        expect(await data.listConversations(tiers.id)).toEqual([]);
+        expect((await data.getConversation(c.id, buyer.id)).messages.length).toBe(1);
+      });
+      it("messages vides ou trop longs refusés ; numéro et lien signalés mais remis", async () => {
+        const { buyer, item } = await duo();
+        const c = await data.startConversation(buyer.id, item.id);
+        expect(code(await rejects(data.sendMessage(c.id, buyer.id, "   ")))).toBe("VALIDATION");
+        expect(code(await rejects(data.sendMessage(c.id, buyer.id, "x".repeat(2001))))).toBe("VALIDATION");
+        const ok = await data.sendMessage(c.id, buyer.id, "x".repeat(2000));
+        expect(ok.flagged).toBe(false);
+        const num = await data.sendMessage(c.id, buyer.id, "Appelle-moi au 082 123 45 67");
+        const lien = await data.sendMessage(c.id, buyer.id, "Paie ici https://exemple.com/pay");
+        expect(num.flagged).toBe(true);
+        expect(lien.flagged).toBe(true);
+        expect((await data.getConversation(c.id, buyer.id)).messages.length).toBe(3);
+      });
+      it("non lus : comptés pour le destinataire, remis à zéro à la lecture ; liste triée par dernier message", async () => {
+        const { seller, buyer, item } = await duo();
+        const item2 = await listing(seller.id, { title: "Sac test" });
+        const c1 = await data.startConversation(buyer.id, item.id);
+        const c2 = await data.startConversation(buyer.id, item2.id);
+        await data.sendMessage(c1.id, buyer.id, "Premier");
+        env.advance(1000);
+        await data.sendMessage(c2.id, buyer.id, "Second");
+        env.advance(1000);
+        await data.sendMessage(c2.id, buyer.id, "Troisième");
+        const inbox = await data.listConversations(seller.id);
+        expect(inbox.map((x) => [x.id, x.unread])).toEqual([[c2.id, 2], [c1.id, 1]]);
+        expect(inbox[0].lastMessage).toBe("Troisième");
+        await data.getConversation(c2.id, seller.id);
+        expect((await data.listConversations(seller.id)).map((x) => x.unread)).toEqual([0, 1]);
+        expect((await data.listConversations(buyer.id)).every((x) => x.unread === 0)).toBe(true);
+      });
+      it("le compte supprimé de l'interlocuteur : conversation lisible, écriture refusée", async () => {
+        const { seller, buyer, item } = await duo();
+        const c = await data.startConversation(buyer.id, item.id);
+        await data.sendMessage(c.id, buyer.id, "Avant la suppression");
+        await data.deleteAccount(buyer.id);
+        const view = await data.getConversation(c.id, seller.id);
+        expect(view.counterpart.displayName).toBe("Membre supprimé");
+        expect(code(await rejects(data.sendMessage(c.id, seller.id, "Tu es là ?")))).toBe("MEMBER_DELETED");
+      });
+    });
+
+    describe("litiges et arbitrage", () => {
+      const staff = () => S("user-support-1");
+      it("ouvrir un litige gèle le séquestre : plus d'annulation ni de remise, ni de retrait", async () => {
+        const { seller, buyer, order } = await paidOrder("Acheteur L1", "+243821000101", 10_000);
+        const d = await data.openDispute(order.id, buyer.id, { reason: "not_as_described", description: "La robe est beaucoup trop petite." });
+        expect(d.status).toBe("open");
+        expect(d.viewerRole).toBe("buyer");
+        expect((await data.getOrder(order.id, seller.id)).status).toBe("disputed");
+        expect((await data.getOrder(order.id, seller.id)).dispute?.id).toBe(d.id);
+        expect(code(await rejects(data.cancelOrder(order.id, buyer.id)))).toBe("INVALID_STATE");
+        expect(code(await rejects(data.confirmDelivery(order.id, seller.id, deriveHandoverCode(order.id))))).toBe("INVALID_STATE");
+        expect(code(await rejects(data.openDispute(order.id, seller.id, { reason: "other", description: "Contestation du vendeur." })))).toBe("DISPUTE_EXISTS");
+        expect(await account("order_escrow")).toBe(-Math.round(10_000 + 500) );
+        expect(await ledgerSum("USD")).toBe(0);
+      });
+      it("remboursement par l'assistance : acheteur remboursé en totalité, article remis en vente, grand livre équilibré", async () => {
+        const { seller, buyer, item, order } = await paidOrder("Acheteur L2", "+243821000102", 10_000);
+        const d = await data.openDispute(order.id, seller.id, { reason: "other", description: "L'acheteur refuse de venir au rendez-vous." });
+        await data.addDisputeNote(d.id, buyer.id, "Je n'ai jamais reçu de message du vendeur.");
+        const done = await data.resolveDispute(staff(), d.id, "refund_buyer", "Remboursement : pas de remise.");
+        expect(done.status).toBe("resolved_refund");
+        expect(done.viewerRole).toBe("staff");
+        expect(done.notes.map((n) => [n.staff, n.note])).toEqual([[false, "Je n'ai jamais reçu de message du vendeur."], [true, "Remboursement : pas de remise."]]);
+        expect((await data.getOrder(order.id, buyer.id)).status).toBe("refunded");
+        expect((await data.getItem(item.id))!.status).toBe("active");
+        expect(await account("order_escrow")).toBe(0);
+        expect(await account("seller_available")).toBe(0);
+        expect(await ledgerSum("USD")).toBe(0);
+        expect(env.refunds()).toBe(1);
+        expect(code(await rejects(data.resolveDispute(staff(), d.id, "release_seller")))).toBe("INVALID_STATE");
+        expect(code(await rejects(data.addDisputeNote(d.id, buyer.id, "Trop tard")))).toBe("INVALID_STATE");
+      });
+      it("paiement du vendeur par l'assistance : argent libéré, commande terminée", async () => {
+        const { seller, buyer, item, order } = await paidOrder("Acheteur L3", "+243821000103", 10_000);
+        const d = await data.openDispute(order.id, buyer.id, { reason: "not_received", description: "Le vendeur ne s'est pas présenté." });
+        await data.resolveDispute(staff(), d.id, "release_seller");
+        expect((await data.getOrder(order.id, buyer.id)).status).toBe("completed");
+        expect((await data.getItem(item.id))!.status).toBe("sold");
+        expect((await data.getWallet(seller.id)).balances.find((b) => b.currency === "USD")?.availableMinor).toBe(10_000);
+        expect(await account("order_escrow")).toBe(0);
+        expect(await ledgerSum("USD")).toBe(0);
+        expect(env.refunds()).toBe(0);
+      });
+      it("seule l'assistance tranche ; un tiers ne voit rien (404) ; un membre ne peut pas se servir de l'accès assistance", async () => {
+        const { buyer, order } = await paidOrder("Acheteur L4", "+243821000104", 10_000);
+        const d = await data.openDispute(order.id, buyer.id, { reason: "damaged", description: "Écran fissuré à la remise." });
+        const tiers = await signup("0831000105", "Tiers Litige");
+        expect(code(await rejects(data.getDisputeById(d.id, tiers.id)))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.getOrderDispute(order.id, tiers.id)))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.addDisputeNote(d.id, tiers.id, "Intrus")))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.resolveDispute(tiers.id, d.id, "refund_buyer")))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.resolveDispute(buyer.id, d.id, "refund_buyer")))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.listOpenDisputes(buyer.id)))).toBe("NOT_FOUND");
+        expect((await data.listOpenDisputes(staff())).map((x) => x.id)).toContain(d.id);
+        expect((await data.getOrder(order.id, buyer.id)).status).toBe("disputed");
+      });
+      it("validations : description trop courte, motif inconnu, commande non payée ou déjà remise", async () => {
+        const { buyer, seller, order } = await paidOrder("Acheteur L5", "+243821000106", 10_000);
+        expect(code(await rejects(data.openDispute(order.id, buyer.id, { reason: "other", description: "court" })))).toBe("VALIDATION");
+        expect(code(await rejects(data.openDispute(order.id, buyer.id, { reason: "inconnu" as never, description: "Une description assez longue." })))).toBe("VALIDATION");
+        await data.confirmDelivery(order.id, seller.id, deriveHandoverCode(order.id));
+        expect(code(await rejects(data.openDispute(order.id, buyer.id, { reason: "other", description: "Une description assez longue." })))).toBe("INVALID_STATE");
+        const item2 = await listing(seller.id);
+        const unpaid = await data.createOrder(buyer.id, { itemIds: [item2.id], deliveryMethod: "hand_delivery" });
+        expect(code(await rejects(data.openDispute(unpaid.id, buyer.id, { reason: "other", description: "Une description assez longue." })))).toBe("INVALID_STATE");
+      });
+      it("commande payée jamais remise au-delà du délai : remboursée automatiquement, sauf si un litige est ouvert", async () => {
+        const a = await paidOrder("Acheteur A1", "+243821000107", 10_000);
+        const b = await paidOrder("Acheteur A2", "+243821000108", 10_000);
+        await data.openDispute(b.order.id, b.buyer.id, { reason: "other", description: "Litige ouvert avant le délai." });
+        env.advance(FEES.unhandedOrderMs - 60_000);
+        expect(await data.expireStalePaidOrders()).toBe(0);
+        env.advance(120_000);
+        expect(await data.expireStalePaidOrders()).toBe(1);
+        expect((await data.getOrder(a.order.id, a.buyer.id)).status).toBe("cancelled");
+        expect((await data.getItem(a.item.id))!.status).toBe("active");
+        expect((await data.getOrder(b.order.id, b.buyer.id)).status).toBe("disputed");
+        expect(await data.expireStalePaidOrders()).toBe(0);
+        expect(env.refunds()).toBe(1);
+        expect(await ledgerSum("USD")).toBe(0);
+      });
+    });
+
+    describe("avis", () => {
+      it("un avis par membre et par commande terminée ; la note moyenne suit ; refusé avant la fin", async () => {
+        const { seller, buyer, order } = await paidOrder("Acheteur R1", "+243821000111", 5_000);
+        expect(code(await rejects(data.createReview(order.id, buyer.id, { rating: 5, comment: "" })))).toBe("INVALID_STATE");
+        await data.confirmDelivery(order.id, seller.id, deriveHandoverCode(order.id));
+        expect((await data.getOrder(order.id, buyer.id)).actions).toContain("review");
+        const before = (await data.getUser(seller.id))!;
+        const r = await data.createReview(order.id, buyer.id, { rating: 4, comment: "  Vendeuse ponctuelle.  " });
+        expect(r.comment).toBe("Vendeuse ponctuelle.");
+        const after = (await data.getUser(seller.id))!;
+        expect(after.ratingCount).toBe(before.ratingCount + 1);
+        const expected = Math.round((Math.round((before.ratingAvg ?? 0) * 100) * before.ratingCount + 400) / (before.ratingCount + 1)) / 100;
+        expect(Number(after.ratingAvg)).toBe(expected);
+        expect(code(await rejects(data.createReview(order.id, buyer.id, { rating: 5, comment: "" })))).toBe("REVIEW_EXISTS");
+        expect((await data.getOrder(order.id, buyer.id)).actions).not.toContain("review");
+        const back = await data.createReview(order.id, seller.id, { rating: 5, comment: "" });
+        expect(back.rating).toBe(5);
+        expect((await data.listReviews(seller.id))[0].comment).toBe("Vendeuse ponctuelle.");
+        expect((await data.getMyReview(order.id, buyer.id))?.rating).toBe(4);
+      });
+      it("note hors bornes, commentaire trop long, tiers : refusés", async () => {
+        const { seller, buyer, order } = await paidOrder("Acheteur R2", "+243821000112", 5_000);
+        await data.confirmDelivery(order.id, seller.id, deriveHandoverCode(order.id));
+        for (const rating of [0, 6, 2.5, -1]) expect(code(await rejects(data.createReview(order.id, buyer.id, { rating, comment: "" }))), `note ${rating}`).toBe("VALIDATION");
+        expect(code(await rejects(data.createReview(order.id, buyer.id, { rating: 3, comment: "x".repeat(501) })))).toBe("VALIDATION");
+        const tiers = await signup("0831000113", "Tiers Avis");
+        expect(code(await rejects(data.createReview(order.id, tiers.id, { rating: 1, comment: "" })))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.getMyReview(order.id, tiers.id)))).toBe("NOT_FOUND");
+        expect((await data.getUser(seller.id))!.ratingCount).toBe(31); // aucun avis refusé n'a été compté (31 = valeur de démonstration)
+      });
+    });
+
+    describe("signalement et modération", () => {
+      const moderator = () => S("user-support-2");
+      it("signaler est idempotent et refuse sa propre annonce, sa propre personne et une cible inconnue", async () => {
+        const seller = await signup("0811000121", "Vendeur Signalé");
+        const reporter = await signup("0821000122", "Signaleur");
+        const item = await listing(seller.id);
+        const a = await data.createReport(reporter.id, { targetType: "item", targetId: item.id, reason: "scam", details: "Demande un paiement hors appli." });
+        const b = await data.createReport(reporter.id, { targetType: "item", targetId: item.id, reason: "scam", details: "" });
+        expect(a.created).toBe(true);
+        expect(b).toEqual({ id: a.id, created: false });
+        expect(code(await rejects(data.createReport(seller.id, { targetType: "item", targetId: item.id, reason: "other", details: "" })))).toBe("OWN_TARGET");
+        expect(code(await rejects(data.createReport(seller.id, { targetType: "user", targetId: seller.id, reason: "other", details: "" })))).toBe("OWN_TARGET");
+        expect(code(await rejects(data.createReport(reporter.id, { targetType: "item", targetId: S("item-inconnu"), reason: "other", details: "" })))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.createReport(reporter.id, { targetType: "user", targetId: S("membre-inconnu"), reason: "other", details: "" })))).toBe("NOT_FOUND");
+      });
+      it("la modération masque une annonce ou classe sans suite ; un membre ordinaire n'a pas accès", async () => {
+        const seller = await signup("0811000123", "Vendeur Fautif");
+        const reporter = await signup("0821000124", "Signaleur Deux");
+        const item = await listing(seller.id);
+        const r = await data.createReport(reporter.id, { targetType: "item", targetId: item.id, reason: "prohibited", details: "" });
+        expect(code(await rejects(data.listReports(reporter.id)))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.handleReport(reporter.id, r.id, "hide_item")))).toBe("NOT_FOUND");
+        const open = await data.listReports(moderator());
+        expect(open.find((x) => x.id === r.id)?.targetLabel).toBe("Robe test");
+        const done = await data.handleReport(moderator(), r.id, "hide_item");
+        expect(done.status).toBe("actioned");
+        expect((await data.getItem(item.id, reporter.id))).toBeNull();
+        expect(code(await rejects(data.handleReport(moderator(), r.id, "dismiss")))).toBe("INVALID_STATE");
+        const r2 = await data.createReport(reporter.id, { targetType: "user", targetId: seller.id, reason: "harassment", details: "" });
+        expect(code(await rejects(data.handleReport(moderator(), r2.id, "hide_item")))).toBe("VALIDATION");
+        expect((await data.handleReport(moderator(), r2.id, "dismiss")).status).toBe("dismissed");
+        expect((await data.listReports(moderator(), "dismissed")).length).toBe(1);
+      });
+      it("suspension : sessions coupées, compte marqué suspendu pendant 7 jours puis libéré", async () => {
+        const seller = await signup("0811000125", "Vendeur Suspendu");
+        const reporter = await signup("0821000126", "Signaleur Trois");
+        const sess = await data.createSession(seller.id);
+        const r = await data.createReport(reporter.id, { targetType: "user", targetId: seller.id, reason: "scam", details: "" });
+        await data.handleReport(moderator(), r.id, "suspend_user");
+        expect(await data.getSessionUser(sess.token)).toBeNull();
+        const u = (await data.getUser(seller.id))!;
+        expect(u.suspendedUntil).toBe(env.now() + 7 * 86_400_000);
+        env.advance(7 * 86_400_000 + 1000);
+        expect((await data.getUser(seller.id))!.suspendedUntil ?? null).toBeNull();
+      });
+    });
+
+    describe("filtres de recherche", () => {
+      it("marque (sans accent ni casse), taille exacte, état : combinables", async () => {
+        const seller = await signup("0811000131", "Vendeur Filtres");
+        const a = await listing(seller.id, { title: "Robe filtre A", brand: "Zéphyr", sizeLabel: "M", condition: "new" });
+        const b = await listing(seller.id, { title: "Robe filtre B", brand: "Autre", sizeLabel: "L", condition: "good" });
+        const ids = async (q: Record<string, unknown>) => (await data.listItems({ q: "filtre", ...q })).map((x) => x.id).sort();
+        expect(await ids({ brand: "zephyr" })).toEqual([a.id]);
+        expect(await ids({ sizeLabel: "l" })).toEqual([b.id]);
+        expect(await ids({ conditions: ["new"] })).toEqual([a.id]);
+        expect(await ids({ conditions: ["new", "good"] })).toEqual([a.id, b.id].sort());
+        expect(await ids({ brand: "zephyr", sizeLabel: "L" })).toEqual([]);
+        expect(await ids({ brand: "100%_" })).toEqual([]);
+      });
+    });
+
+    // ---- agent A : annulation encadrée
+    describe("annulation encadrée après paiement", () => {
+      it("avant paiement : annulation libre pour l'acheteur comme pour le vendeur, sans demande", async () => {
+        const seller = (await data.getUser(S("user-marie")))!;
+        const buyer = await signup("+243821700001", "Acheteur C0");
+        const a = await data.createOrder(buyer.id, { itemIds: [(await listing(seller.id)).id], deliveryMethod: "hand_delivery" });
+        expect((await data.getOrder(a.id, buyer.id)).actions).not.toContain("request_cancel");
+        expect((await data.cancelOrder(a.id, buyer.id)).status).toBe("cancelled");
+        const b = await data.createOrder(buyer.id, { itemIds: [(await listing(seller.id)).id], deliveryMethod: "hand_delivery" });
+        expect((await data.cancelOrder(b.id, seller.id)).status).toBe("cancelled");
+      });
+      it("l'acheteur demande, le vendeur voit la demande et les bonnes actions apparaissent des deux côtés", async () => {
+        const { order, buyer, seller } = await paidOrder("Acheteur C1", "+243821700101");
+        const before = await data.getOrder(order.id, buyer.id);
+        expect(before.cancelRequest).toBeNull();
+        expect(before.actions).toContain("request_cancel");
+        expect(before.actions).not.toContain("cancel");
+        const v = await data.requestCancellation(order.id, buyer.id);
+        expect(v.cancelRequest?.status).toBe("pending");
+        expect(v.cancelRequest?.requestedAt).toBe(env.now());
+        expect(v.cancelRequest?.expiresAt).toBe(env.now() + FEES.cancelRequestTtlMs);
+        expect(v.actions).toContain("withdraw_cancel");
+        expect(v.actions).not.toContain("request_cancel");
+        expect(v.status).toBe("paid");
+        const sv = await data.getOrder(order.id, seller.id);
+        expect(sv.cancelRequest?.status).toBe("pending");
+        expect(sv.actions).toEqual(expect.arrayContaining(["accept_cancel", "decline_cancel", "cancel", "confirm_delivery"]));
+        expect(await account("order_escrow")).toBe(-order.totalMinor); // rien ne bouge tant que le vendeur n'a pas accepté
+      });
+      it("une seconde demande identique (double clic) est refusée sans doublon", async () => {
+        const { order, buyer } = await paidOrder("Acheteur C2", "+243821700102");
+        await data.requestCancellation(order.id, buyer.id);
+        expect(code(await rejects(data.requestCancellation(order.id, buyer.id)))).toBe("CANCEL_REQUEST_EXISTS");
+        expect((await data.getOrder(order.id, buyer.id)).cancelRequest?.status).toBe("pending");
+      });
+      it("acceptation : remboursement intégral, commande annulée, article remis en vente, grand livre équilibré", async () => {
+        const { order, buyer, seller, item } = await paidOrder("Acheteur C3", "+243821700103", 10_000);
+        await data.requestCancellation(order.id, buyer.id);
+        const v = await data.acceptCancellation(order.id, seller.id);
+        expect(v.status).toBe("cancelled");
+        expect(v.cancelRequest?.status).toBe("accepted");
+        expect(v.payment?.status).toBe("refunded");
+        expect(await account("order_escrow")).toBe(0);
+        expect(await account("psp_clearing")).toBe(0);
+        expect(await account("seller_available")).toBe(0);
+        expect(await account("platform_revenue")).toBe(0);
+        expect(await ledgerSum("USD")).toBe(0);
+        expect(env.refunds()).toBe(1);
+        expect((await data.getItem(item.id))!.status).toBe("active");
+        const bv = await data.getOrder(order.id, buyer.id);
+        expect(bv.status).toBe("cancelled");
+        expect(bv.cancelRequest?.status).toBe("accepted");
+        expect(bv.actions).toEqual([]);
+        // plus rien à faire : ni seconde acceptation, ni nouvelle demande
+        expect(code(await rejects(data.acceptCancellation(order.id, seller.id)))).toBe("INVALID_STATE");
+        expect(code(await rejects(data.requestCancellation(order.id, buyer.id)))).toBe("INVALID_STATE");
+        expect(env.refunds()).toBe(1);
+      });
+      it("refus : la commande reste payée, pas de nouvelle demande, l'acheteur peut ouvrir un litige que l'assistance tranche", async () => {
+        const { order, buyer, seller } = await paidOrder("Acheteur C4", "+243821700104", 10_000);
+        await data.requestCancellation(order.id, buyer.id);
+        const v = await data.declineCancellation(order.id, seller.id);
+        expect(v.status).toBe("paid");
+        expect(v.cancelRequest?.status).toBe("declined");
+        expect(v.actions).not.toContain("accept_cancel");
+        const bv = await data.getOrder(order.id, buyer.id);
+        expect(bv.actions).not.toContain("request_cancel");
+        expect(bv.actions).not.toContain("withdraw_cancel");
+        expect(bv.actions).toContain("issue");
+        expect(code(await rejects(data.requestCancellation(order.id, buyer.id)))).toBe("CANCEL_REQUEST_REFUSED");
+        expect(code(await rejects(data.cancelOrder(order.id, buyer.id)))).toBe("CANCEL_REQUEST_REQUIRED");
+        expect(await account("order_escrow")).toBe(-order.totalMinor);
+        const d = await data.openDispute(order.id, buyer.id, { reason: "other", description: "Le vendeur refuse d'annuler la vente." });
+        expect(d.status).toBe("open");
+        await data.resolveDispute(S("user-support-1"), d.id, "refund_buyer");
+        expect((await data.getOrder(order.id, buyer.id)).status).toBe("refunded");
+        expect(await account("order_escrow")).toBe(0);
+        expect(await ledgerSum("USD")).toBe(0);
+      });
+      it("retrait : l'acheteur retire sa demande, le vendeur ne peut plus l'accepter, l'acheteur peut en refaire une", async () => {
+        const { order, buyer, seller } = await paidOrder("Acheteur C5", "+243821700105");
+        await data.requestCancellation(order.id, buyer.id);
+        const v = await data.withdrawCancellation(order.id, buyer.id);
+        expect(v.cancelRequest).toBeNull();
+        expect(v.actions).toContain("request_cancel");
+        expect((await data.getOrder(order.id, seller.id)).cancelRequest).toBeNull();
+        expect(code(await rejects(data.acceptCancellation(order.id, seller.id)))).toBe("CANCEL_REQUEST_NONE");
+        expect(code(await rejects(data.declineCancellation(order.id, seller.id)))).toBe("CANCEL_REQUEST_NONE");
+        expect(code(await rejects(data.withdrawCancellation(order.id, buyer.id)))).toBe("CANCEL_REQUEST_NONE");
+        expect((await data.requestCancellation(order.id, buyer.id)).cancelRequest?.status).toBe("pending");
+      });
+      it("expiration : au-delà du délai (3 jours par défaut), la demande vaut refus, sans mouvement d'argent, et ne peut plus être acceptée", async () => {
+        expect(FEES.cancelRequestTtlMs).toBe(3 * 86_400_000);
+        const { order, buyer, seller } = await paidOrder("Acheteur C6", "+243821700106", 10_000);
+        await data.requestCancellation(order.id, buyer.id);
+        env.advance(FEES.cancelRequestTtlMs - 60_000);
+        expect((await data.getOrder(order.id, seller.id)).cancelRequest?.status).toBe("pending");
+        env.advance(120_000);
+        const sv = await data.getOrder(order.id, seller.id);
+        expect(sv.cancelRequest?.status).toBe("expired");
+        expect(sv.actions).not.toContain("accept_cancel");
+        expect(sv.status).toBe("paid");
+        const bv = await data.getOrder(order.id, buyer.id);
+        expect(bv.cancelRequest?.status).toBe("expired");
+        expect(bv.actions).not.toContain("request_cancel");
+        expect(bv.actions).not.toContain("withdraw_cancel");
+        expect(code(await rejects(data.acceptCancellation(order.id, seller.id)))).toBe("CANCEL_REQUEST_EXPIRED");
+        expect(code(await rejects(data.declineCancellation(order.id, seller.id)))).toBe("CANCEL_REQUEST_EXPIRED");
+        expect(code(await rejects(data.withdrawCancellation(order.id, buyer.id)))).toBe("CANCEL_REQUEST_EXPIRED");
+        expect(code(await rejects(data.requestCancellation(order.id, buyer.id)))).toBe("CANCEL_REQUEST_REFUSED");
+        expect(await account("order_escrow")).toBe(-order.totalMinor);
+        expect(env.refunds()).toBe(0);
+        // le litige reste ouvert à l'acheteur
+        expect((await data.openDispute(order.id, buyer.id, { reason: "other", description: "Demande restée sans réponse." })).status).toBe("open");
+      });
+      it("remise par code pendant une demande : le code vaut acceptation, la demande est close et l'argent va au vendeur", async () => {
+        const { order, buyer, seller } = await paidOrder("Acheteur C7", "+243821700107", 10_000);
+        await data.requestCancellation(order.id, buyer.id);
+        const v = await data.confirmDelivery(order.id, seller.id, deriveHandoverCode(order.id));
+        expect(v.status).toBe("completed");
+        expect(v.cancelRequest).toBeNull();
+        expect((await data.getOrder(order.id, buyer.id)).cancelRequest).toBeNull();
+        expect(await account("order_escrow")).toBe(0);
+        expect(await account("seller_available")).toBe(-order.itemsMinor);
+        expect(await ledgerSum("USD")).toBe(0);
+        expect(code(await rejects(data.acceptCancellation(order.id, seller.id)))).toBe("INVALID_STATE");
+        expect(code(await rejects(data.withdrawCancellation(order.id, buyer.id)))).toBe("INVALID_STATE");
+      });
+      it("le vendeur peut toujours annuler seul pendant une demande : remboursement intégral, demande close", async () => {
+        const { order, buyer, seller, item } = await paidOrder("Acheteur C8", "+243821700108");
+        await data.requestCancellation(order.id, buyer.id);
+        const v = await data.cancelOrder(order.id, seller.id);
+        expect(v.status).toBe("cancelled");
+        expect(v.cancelRequest).toBeNull();
+        expect(await account("order_escrow")).toBe(0);
+        expect(await ledgerSum("USD")).toBe(0);
+        expect((await data.getItem(item.id))!.status).toBe("active");
+        expect(env.refunds()).toBe(1);
+      });
+      it("droits : l'acheteur ne répond pas à sa propre demande, le vendeur n'en fait pas, un tiers n'obtient que des 404", async () => {
+        const { order, buyer, seller } = await paidOrder("Acheteur C9", "+243821700109");
+        const tiers = await signup("0831111188", "Tiers C");
+        expect(code(await rejects(data.requestCancellation(order.id, seller.id)))).toBe("NOT_FOUND");
+        await data.requestCancellation(order.id, buyer.id);
+        expect(code(await rejects(data.acceptCancellation(order.id, buyer.id)))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.declineCancellation(order.id, buyer.id)))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.withdrawCancellation(order.id, seller.id)))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.requestCancellation(order.id, tiers.id)))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.withdrawCancellation(order.id, tiers.id)))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.acceptCancellation(order.id, tiers.id)))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.declineCancellation(order.id, tiers.id)))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.acceptCancellation("00000000-0000-4000-8000-000000000000", seller.id)))).toBe("NOT_FOUND");
+        expect((await data.getOrder(order.id, seller.id)).cancelRequest?.status).toBe("pending");
+        expect(await account("order_escrow")).toBe(-order.totalMinor);
+      });
+      it("états incompatibles : pas de demande avant paiement, après remise, ni pendant un litige", async () => {
+        const seller = (await data.getUser(S("user-marie")))!;
+        const buyer = await signup("+243821700110", "Acheteur C10");
+        const unpaid = await data.createOrder(buyer.id, { itemIds: [(await listing(seller.id)).id], deliveryMethod: "hand_delivery" });
+        expect(code(await rejects(data.requestCancellation(unpaid.id, buyer.id)))).toBe("INVALID_STATE");
+        const d = await paidOrder("Acheteur C11", "+243821700111");
+        await data.openDispute(d.order.id, d.buyer.id, { reason: "other", description: "Litige ouvert avant toute demande." });
+        expect(code(await rejects(data.requestCancellation(d.order.id, d.buyer.id)))).toBe("INVALID_STATE");
+        const e = await paidOrder("Acheteur C12", "+243821700112");
+        await data.confirmDelivery(e.order.id, e.seller.id, deriveHandoverCode(e.order.id));
+        expect(code(await rejects(data.requestCancellation(e.order.id, e.buyer.id)))).toBe("INVALID_STATE");
+        expect((await data.getOrder(e.order.id, e.buyer.id)).actions).not.toContain("request_cancel");
+      });
+      it("commande jamais remise au-delà du délai général : remboursement automatique malgré une demande en attente", async () => {
+        const { order, buyer } = await paidOrder("Acheteur C13", "+243821700113", 10_000);
+        await data.requestCancellation(order.id, buyer.id);
+        env.advance(FEES.unhandedOrderMs + 1000);
+        expect(await data.expireStalePaidOrders()).toBe(1);
+        const v = await data.getOrder(order.id, buyer.id);
+        expect(v.status).toBe("cancelled");
+        expect(v.cancelRequest).toBeNull();
+        expect(await ledgerSum("USD")).toBe(0);
+      });
+    });
+    // ---- fin agent A
+
+    // ---- agent E : articles interdits
+    describe("articles interdits à la publication", () => {
+      const draftOf = (sellerId: string, over: Record<string, unknown>) =>
+        data.createDraft(sellerId, { title: "Robe test", description: "", categoryId: S("cat-robes"), condition: "good", priceMinor: 2500, currency: "USD", areaId: S("area-com-gombe"), photos: [PHOTO], ...over });
+
+      it("une annonce interdite est refusée en 422 avec le champ et le message de la règle ; elle reste en brouillon", async () => {
+        const seller = await signup("0811000141", "Vendeur Interdit");
+        const d = await draftOf(seller.id, { title: "Vends pistolet 9mm" });
+        const e = await rejects(data.publishItem(seller.id, d.id));
+        expect(code(e)).toBe("PROHIBITED_ITEM");
+        expect(e.status).toBe(422);
+        expect(Object.keys(e.details ?? {})).toEqual(["title"]);
+        expect(e.message).toBe(e.details!.title);
+        // brouillon intact : visible de son vendeur seulement, pas dans les résultats de recherche
+        const mine = await data.getItem(d.id, seller.id);
+        expect(mine?.title).toBe("Vends pistolet 9mm");
+        expect(mine?.status).toBe("draft");
+        expect(await data.getItem(d.id, null)).toBeNull();
+        expect((await data.listItems({ q: "pistolet" })).some((x) => x.id === d.id)).toBe(false);
+        // un second essai donne le même refus (pas d'état à moitié publié)
+        expect(code(await rejects(data.publishItem(seller.id, d.id)))).toBe("PROHIBITED_ITEM");
+      });
+      it("la description et la marque sont contrôlées ; le refus ne divulgue ni le mot trouvé ni la liste", async () => {
+        const seller = await signup("0811000142", "Vendeur Interdit Deux");
+        const d = await draftOf(seller.id, { description: "Je vends aussi de la Cocaïne" });
+        const e = await rejects(data.publishItem(seller.id, d.id));
+        expect(Object.keys(e.details ?? {})).toEqual(["description"]);
+        expect(JSON.stringify([e.message, e.details]).toLowerCase()).not.toMatch(/coca/);
+        const d2 = await draftOf(seller.id, { brand: "Kalachnikov" });
+        expect(Object.keys((await rejects(data.publishItem(seller.id, d2.id))).details ?? {})).toEqual(["brand"]);
+      });
+      it("contournements par casse, accents, espaces et lettres espacées : refusés", async () => {
+        const seller = await signup("0811000143", "Vendeur Contourne");
+        for (const title of ["ARME à FEU", "a  r  m  e   a   feu", "C O C A Ï N E", "t.r.a.m.a.d.o.l"]) {
+          const d = await draftOf(seller.id, { title });
+          expect(code(await rejects(data.publishItem(seller.id, d.id))), title).toBe("PROHIBITED_ITEM");
+        }
+      });
+      it("les mots proches mais légitimes sont acceptés (limites de mots, exceptions)", async () => {
+        const seller = await signup("0811000144", "Vendeur Légitime");
+        for (const title of ["Alarme maison", "Bracelet charme", "Pistolet à colle", "Robe ivoire", "Téléphone non volé"]) {
+          const a = await listing(seller.id, { title });
+          expect(a.status).toBe("active");
+        }
+        const withDesc = await listing(seller.id, { title: "Veste", description: "Couleur ivoire, achetée en Côte d'Ivoire, très bon état." });
+        expect(withDesc.status).toBe("active");
+      });
+      it("aucun contournement pour le personnel : un modérateur ou le support ne publie pas non plus pour un vendeur, et la règle vaut pour tous", async () => {
+        const staff = S("user-support-2");
+        const d = await draftOf(staff, { title: "Munitions calibre 12" });
+        expect(code(await rejects(data.publishItem(staff, d.id)))).toBe("PROHIBITED_ITEM");
+      });
+      it("les annonces déjà publiées ne sont pas rétro-analysées", async () => {
+        const seller = await signup("0811000145", "Vendeur Ancien");
+        const ok = await listing(seller.id, { title: "Montre ordinaire" });
+        expect((await data.getItem(ok.id, null))?.status).toBe("active");
+        expect((await data.listItems({ q: "montre ordinaire" })).some((x) => x.id === ok.id)).toBe(true);
+      });
+      it("la liste publique des règles ne contient jamais de mots-clés", async () => {
+        const rules = await data.listProhibitedRules();
+        expect(rules.length).toBeGreaterThanOrEqual(10);
+        for (const r of rules) {
+          expect(Object.keys(r).sort()).toEqual(["id", "label", "message"]);
+          expect(r.label.length).toBeGreaterThan(0);
+        }
+        expect(JSON.stringify(rules).toLowerCase()).not.toMatch(/kalachnikov|cocaine|tramadol/);
+      });
+    });
+    // ---- fin agent E
+
+    // ---- agent B : photos de preuve et de messagerie
+    describe("photos de messages et de preuves de litige", () => {
+      const PNG = `data:image/png;base64,${Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4]).toString("base64")}`;
+      const DISGUISED = `data:image/jpeg;base64,${Buffer.from("ceci est un fichier texte, pas une image").toString("base64")}`;
+      const TOO_BIG = `data:image/jpeg;base64,${Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]), Buffer.alloc(460_000, 1)]).toString("base64")}`;
+      const idOf = (url: string) => url.split("/").pop()!;
+      const support = () => S("user-support-1");
+      const uuid = "11111111-2222-4333-8444-555555555555";
+
+      async function chat(buyerName = "Acheteur Photo", phone = "0821000301") {
+        const seller = await signup(`0811${phone.slice(4)}`, "Vendeur Photo");
+        const buyer = await signup(phone, buyerName);
+        const item = await listing(seller.id);
+        const conv = await data.startConversation(buyer.id, item.id);
+        return { seller, buyer, item, convId: conv.id };
+      }
+      async function disputed() {
+        const { seller, buyer, order } = await paidOrder("Acheteur Preuve", "+243821000302");
+        const dispute = await data.openDispute(order.id, buyer.id, { reason: "not_as_described", description: "La robe ne ressemble pas aux photos." });
+        return { seller, buyer, order, dispute };
+      }
+
+      it("message avec photo : texte facultatif, vu par les deux membres, octets et type vérifiés", async () => {
+        const { seller, buyer, convId } = await chat();
+        const withText = await data.sendPhotoMessage(convId, buyer.id, { body: "Voici la tache", photo: PHOTO });
+        expect(withText).toMatchObject({ kind: "image", mine: true, body: "Voici la tache", senderName: "Acheteur Photo" });
+        expect(withText.photoUrl).toMatch(/^\/api\/v1\/private-photos\/[0-9a-f-]{36}$/);
+        const only = await data.sendPhotoMessage(convId, seller.id, { body: "", photo: PNG });
+        expect(only.body).toBe("");
+        // la messagerie texte garde sa règle : un message vide reste refusé
+        expect(code(await rejects(data.sendMessage(convId, buyer.id, "   ")))).toBe("VALIDATION");
+
+        const view = await data.getConversation(convId, seller.id);
+        const photos = view.messages.filter((m) => m.kind === "image");
+        expect(photos.map((m) => [m.mine, m.senderName, m.body])).toEqual([[false, "Acheteur Photo", "Voici la tache"], [true, "Vendeur Photo", ""]]);
+        expect(view.lastMessage).toBe("Photo");
+        expect((await data.getConversation(convId, buyer.id)).messages.find((m) => m.id === only.id)?.mine).toBe(false);
+
+        const a = await data.getPrivatePhoto(idOf(withText.photoUrl!), seller.id);
+        expect(a?.mime).toBe("image/jpeg");
+        expect(a?.bytes.length).toBeGreaterThan(3);
+        expect((await data.getPrivatePhoto(idOf(only.photoUrl!), buyer.id))?.mime).toBe("image/png");
+        expect((await data.getPrivatePhoto(idOf(withText.photoUrl!), buyer.id))?.mime).toBe("image/jpeg");
+      });
+
+      it("message avec photo : un tiers n'a ni la conversation (404) ni la photo (null), identifiant inconnu = même réponse", async () => {
+        const { buyer, convId } = await chat("Acheteur Secret", "0821000303");
+        const tiers = await signup("0821000304", "Tiers Curieux");
+        const m = await data.sendPhotoMessage(convId, buyer.id, { body: "", photo: PHOTO });
+        expect(code(await rejects(data.sendPhotoMessage(convId, tiers.id, { body: "", photo: PHOTO })))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.getConversation(convId, tiers.id)))).toBe("NOT_FOUND");
+        expect(await data.getPrivatePhoto(idOf(m.photoUrl!), tiers.id)).toBeNull();
+        expect(await data.getPrivatePhoto(uuid, buyer.id)).toBeNull();
+        expect(await data.getPrivatePhoto("pas-un-uuid", buyer.id)).toBeNull();
+        expect(await data.getPrivatePhoto(idOf(m.photoUrl!), uuid)).toBeNull();
+        // jamais dans les listes ni dans le service public des photos d'annonces
+        expect(await data.listConversations(tiers.id)).toEqual([]);
+        expect(await data.getPhoto(idOf(m.photoUrl!))).toBeNull();
+      });
+
+      it("message avec photo : fichier texte déguisé, format inconnu, trop lourd, texte trop long : refusés sans rien stocker", async () => {
+        const { buyer, convId } = await chat("Acheteur Refus", "0821000305");
+        for (const bad of [DISGUISED, TOO_BIG, "data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=", "data:image/gif;base64,R0lGODlhAQABAAAAACw=", "https://exemple.cd/photo.jpg", ""]) {
+          const e = await rejects(data.sendPhotoMessage(convId, buyer.id, { body: "x", photo: bad }));
+          expect(e.code).toBe("VALIDATION");
+          expect(e.details?.photo).toBeTruthy();
+        }
+        expect(code(await rejects(data.sendPhotoMessage(convId, buyer.id, { body: "é".repeat(2001), photo: PHOTO })))).toBe("VALIDATION");
+        expect((await data.getConversation(convId, buyer.id)).messages).toEqual([]);
+      });
+
+      it("message avec photo : refusé si l'autre membre a supprimé son compte", async () => {
+        const { seller, buyer, convId } = await chat("Acheteur Départ", "0821000306");
+        await data.deleteAccount(seller.id);
+        expect(code(await rejects(data.sendPhotoMessage(convId, buyer.id, { body: "", photo: PHOTO })))).toBe("MEMBER_DELETED");
+      });
+
+      it("preuve de litige : les deux parties et l'assistance voient les photos et leurs notes ; un tiers n'y a pas accès", async () => {
+        const { seller, buyer, dispute } = await disputed();
+        const tiers = await signup("0821000307", "Tiers Preuve");
+        const sellerName = seller.displayName;
+        const v1 = await data.addDisputeEvidence(dispute.id, buyer.id, { photo: PHOTO, note: "Le col est déchiré" });
+        expect(v1.evidence).toHaveLength(1);
+        expect(v1.evidence[0]).toMatchObject({ authorName: "Acheteur Preuve", mine: true, staff: false, note: "Le col est déchiré" });
+        await data.addDisputeEvidence(dispute.id, seller.id, { photo: PNG });
+        await data.addDisputeEvidence(dispute.id, support(), { photo: PHOTO, note: "Photo demandée par l'assistance" });
+
+        const forSeller = await data.getDisputeById(dispute.id, seller.id);
+        expect(forSeller.evidence.map((e) => [e.authorName, e.mine, e.staff])).toEqual([["Acheteur Preuve", false, false], [sellerName, true, false], ["Assistance", false, true]]);
+        const forStaff = await data.getDisputeById(dispute.id, support());
+        expect(forStaff.viewerRole).toBe("staff");
+        expect(forStaff.evidence).toHaveLength(3);
+        // les photos de preuve ne s'affichent pas dans les échanges (notes)
+        expect(forStaff.notes).toEqual([]);
+
+        for (const e of forStaff.evidence) {
+          for (const who of [buyer.id, seller.id, support()]) expect(await data.getPrivatePhoto(idOf(e.photoUrl), who)).not.toBeNull();
+          expect(await data.getPrivatePhoto(idOf(e.photoUrl), tiers.id)).toBeNull();
+        }
+        expect(code(await rejects(data.addDisputeEvidence(dispute.id, tiers.id, { photo: PHOTO })))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.getDisputeById(dispute.id, tiers.id)))).toBe("NOT_FOUND");
+        // jamais dans le service public des photos d'annonces
+        expect(await data.getPhoto(idOf(forStaff.evidence[0].photoUrl))).toBeNull();
+      });
+
+      it("preuve de litige : 6 photos au plus par membre et par litige, photo invalide refusée, litige clos refusé", async () => {
+        const { seller, buyer, dispute } = await disputed();
+        const bad = await rejects(data.addDisputeEvidence(dispute.id, buyer.id, { photo: DISGUISED }));
+        expect([bad.code, !!bad.details?.photo]).toEqual(["VALIDATION", true]);
+        expect(code(await rejects(data.addDisputeEvidence(dispute.id, buyer.id, { photo: TOO_BIG })))).toBe("VALIDATION");
+        expect(code(await rejects(data.addDisputeEvidence(dispute.id, buyer.id, { photo: PHOTO, note: "x".repeat(501) })))).toBe("VALIDATION");
+        expect((await data.getDisputeById(dispute.id, buyer.id)).evidence).toEqual([]);
+
+        for (let i = 0; i < 6; i++) await data.addDisputeEvidence(dispute.id, buyer.id, { photo: PHOTO, note: `photo ${i + 1}` });
+        expect(code(await rejects(data.addDisputeEvidence(dispute.id, buyer.id, { photo: PHOTO })))).toBe("EVIDENCE_LIMIT");
+        // la limite est par membre : le vendeur et l'assistance gardent leurs 6
+        await data.addDisputeEvidence(dispute.id, seller.id, { photo: PNG });
+        await data.addDisputeEvidence(dispute.id, support(), { photo: PHOTO });
+        expect((await data.getDisputeById(dispute.id, seller.id)).evidence).toHaveLength(8);
+
+        await data.resolveDispute(support(), dispute.id, "refund_buyer");
+        expect(code(await rejects(data.addDisputeEvidence(dispute.id, seller.id, { photo: PHOTO })))).toBe("INVALID_STATE");
+        // une fois le litige clos, les preuves restent consultables par les participants
+        const closed = await data.getDisputeById(dispute.id, buyer.id);
+        expect(closed.evidence).toHaveLength(8);
+        expect(await data.getPrivatePhoto(idOf(closed.evidence[0].photoUrl), buyer.id)).not.toBeNull();
+      });
+
+      it("preuve de litige : deux envois simultanés ne dépassent pas la limite", async () => {
+        const { buyer, dispute } = await disputed();
+        for (let i = 0; i < 5; i++) await data.addDisputeEvidence(dispute.id, buyer.id, { photo: PHOTO });
+        const results = await Promise.allSettled([data.addDisputeEvidence(dispute.id, buyer.id, { photo: PHOTO }), data.addDisputeEvidence(dispute.id, buyer.id, { photo: PHOTO })]);
+        expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+        expect((await data.getDisputeById(dispute.id, buyer.id)).evidence).toHaveLength(6);
+      });
+    });
+
+    // ---- agent D : livraison par coursier
+    describe("livraison par coursier et libération automatique", () => {
+      const staffD = () => S("user-support-1");
+      const HOUR = 3_600_000;
+      const GOMBE = () => S("area-com-gombe");
+      const LIMETE = () => S("area-com-limete");
+      const COURIER = { courierName: "Papy Moto", courierPhone: "0899000111", trackingRef: "MOTO-42" };
+      const usdAvailable = async (userId: string) => (await data.getWallet(userId)).balances.find((b) => b.currency === "USD")?.availableMinor ?? 0;
+
+      /** Commande par coursier, payée. Le vendeur (Marie) est à Gombe, l'acheteur se fait livrer à `area`. */
+      async function courierOrder(phone: string, opts: { area?: string; priceMinor?: number; currency?: "USD" | "CDF"; pay?: boolean } = {}) {
+        const seller = (await data.getUser(S("user-marie")))!;
+        const buyer = await signup(phone, "Acheteur Coursier");
+        const item = await listing(seller.id, { priceMinor: opts.priceMinor ?? 10_000, currency: opts.currency ?? "USD" });
+        const order = await data.createOrder(buyer.id, {
+          itemIds: [item.id], deliveryMethod: "courier", deliveryAreaId: opts.area ?? LIMETE(), deliveryLandmark: "Avenue de la Paix, portail bleu",
+        });
+        if (opts.pay !== false) {
+          await data.startPayment(order.id, buyer.id, { method: "mpesa", msisdn: "0821111111", idempotencyKey: `k-${order.id}` });
+          await env.flush();
+        }
+        return { seller, buyer, item, order };
+      }
+      async function inTransit(phone: string, opts: Parameters<typeof courierOrder>[1] = {}) {
+        const o = await courierOrder(phone, opts);
+        await data.shipOrder(o.order.id, o.seller.id, COURIER);
+        await data.markInTransit(o.order.id, o.seller.id);
+        return o;
+      }
+      async function received(phone: string, opts: Parameters<typeof courierOrder>[1] = {}) {
+        const o = await inTransit(phone, opts);
+        await data.confirmReceived(o.order.id, o.buyer.id);
+        return o;
+      }
+
+      it("frais de livraison : grille par zone, inclus dans le total et dans le grand livre ; mêmes montants au devis et à la commande", async () => {
+        const same = await courierOrder("+243821000201", { area: GOMBE(), pay: false });
+        expect(same.order.shippingMinor).toBe(FEES.shippingGrid.sameCommune.USD);
+        const city = await courierOrder("+243821000202", { area: LIMETE(), pay: false });
+        expect(city.order.shippingMinor).toBe(FEES.shippingGrid.sameCity.USD);
+        expect(city.order.totalMinor).toBe(city.order.itemsMinor + city.order.shippingMinor + city.order.protectionFeeMinor);
+        expect(await data.quoteShipping(city.item.id, LIMETE())).toEqual({ shippingMinor: city.order.shippingMinor, currency: "USD", zone: "sameCity" });
+        expect((await data.quoteShipping(same.item.id, GOMBE())).zone).toBe("sameCommune");
+        const cdf = await courierOrder("+243821000203", { area: LIMETE(), currency: "CDF", priceMinor: 5_000_000, pay: false });
+        expect(cdf.order.shippingMinor).toBe(FEES.shippingGrid.sameCity.CDF);
+        // remise en main propre : aucun frais
+        const seller = (await data.getUser(S("user-marie")))!;
+        const buyer = await signup("+243821000204", "Acheteur Main");
+        const it = await listing(seller.id);
+        expect((await data.createOrder(buyer.id, { itemIds: [it.id], deliveryMethod: "hand_delivery" })).shippingMinor).toBe(0);
+        // grand livre : le paiement bloque le total complet, la libération ventile articles, livraison et frais
+        const o = await received("+243821000205");
+        await data.acceptOrder(o.order.id, o.buyer.id);
+        expect(await account("shipping_payable")).toBe(0); // agent G : mode par défaut « seller », la livraison est versée au vendeur
+        expect(await account("platform_revenue")).toBe(-o.order.protectionFeeMinor);
+        expect(await account("order_escrow")).toBe(0);
+        expect(await ledgerSum("USD")).toBe(0);
+        expect(await usdAvailable(o.seller.id)).toBe(10_000 + o.order.shippingMinor);
+      });
+
+      it("création : commune et repère obligatoires, commune valide seulement, point relais pas encore disponible", async () => {
+        const seller = (await data.getUser(S("user-marie")))!;
+        const buyer = await signup("+243821000206", "Acheteur Valide");
+        const it = await listing(seller.id);
+        const base = { itemIds: [it.id], deliveryMethod: "courier" as const };
+        expect(code(await rejects(data.createOrder(buyer.id, { ...base, deliveryLandmark: "Près du marché" })))).toBe("VALIDATION");
+        expect(code(await rejects(data.createOrder(buyer.id, { ...base, deliveryAreaId: LIMETE() })))).toBe("VALIDATION");
+        expect(code(await rejects(data.createOrder(buyer.id, { ...base, deliveryAreaId: LIMETE(), deliveryLandmark: "ab" })))).toBe("VALIDATION");
+        expect(code(await rejects(data.createOrder(buyer.id, { ...base, deliveryAreaId: S("area-prov-kinshasa"), deliveryLandmark: "Près du marché" })))).toBe("VALIDATION");
+        expect(code(await rejects(data.createOrder(buyer.id, { ...base, deliveryAreaId: S("zone-inconnue"), deliveryLandmark: "Près du marché" })))).toBe("VALIDATION");
+        expect(code(await rejects(data.createOrder(buyer.id, { itemIds: [it.id], deliveryMethod: "relay_point" })))).toBe("NOT_SUPPORTED");
+        expect(code(await rejects(data.quoteShipping(it.id, S("area-prov-kinshasa"))))).toBe("VALIDATION");
+        expect(code(await rejects(data.quoteShipping(S("item-inconnu"), LIMETE())))).toBe("NOT_FOUND");
+        // l'article n'a pas été réservé par les tentatives refusées
+        expect((await data.createOrder(buyer.id, { ...base, deliveryAreaId: LIMETE(), deliveryLandmark: "Près du marché" })).status).toBe("pending_payment");
+      });
+
+      it("parcours : remis au coursier, en route, reçu, accepté : argent libéré une seule fois, historique complet", async () => {
+        const { seller, buyer, order } = await courierOrder("+243821000207");
+        const v0 = await data.getOrder(order.id, buyer.id);
+        expect(v0.status).toBe("paid");
+        expect(v0.shipment).toMatchObject({ status: "pending", courierName: null, courierPhone: null });
+        expect(v0.actions).not.toContain("reveal_code");
+        expect((await data.getOrder(order.id, seller.id)).actions).toEqual(expect.arrayContaining(["ship", "cancel"]));
+        expect((await data.getOrder(order.id, seller.id)).actions).not.toContain("confirm_delivery");
+
+        const shipped = await data.shipOrder(order.id, seller.id, COURIER);
+        expect(shipped.status).toBe("in_delivery");
+        expect(shipped.shipment).toMatchObject({ status: "handed_to_courier", courierName: "Papy Moto", courierPhone: "+243899000111", trackingRef: "MOTO-42" });
+        const vb = await data.getOrder(order.id, buyer.id);
+        expect(vb.shipment?.courierName).toBe("Papy Moto"); // visible à l'acheteur après paiement
+        expect(vb.actions).toEqual(expect.arrayContaining(["confirm_received", "report_lost", "issue"]));
+        expect(vb.actions).not.toContain("cancel");
+        expect((await data.getOrder(order.id, seller.id)).actions).toContain("mark_in_transit");
+
+        const transit = await data.markInTransit(order.id, seller.id);
+        expect(transit.shipment?.status).toBe("in_transit");
+        expect(transit.actions).not.toContain("mark_in_transit");
+
+        const rec = await data.confirmReceived(order.id, buyer.id);
+        expect(rec.status).toBe("delivered");
+        expect(rec.deliveredAt).toBe(env.now());
+        expect(rec.autoReleaseAt).toBe(env.now() + FEES.claimWindowMs);
+        expect(rec.shipment?.status).toBe("delivered");
+        expect(await usdAvailable(seller.id)).toBe(0); // pas encore libéré
+        expect(rec.actions).toEqual(expect.arrayContaining(["accept", "issue"]));
+
+        const done = await data.acceptOrder(order.id, buyer.id);
+        expect(done.status).toBe("completed");
+        expect(await usdAvailable(seller.id)).toBe(10_000 + order.shippingMinor);
+        expect(code(await rejects(data.acceptOrder(order.id, buyer.id)))).toBe("INVALID_STATE");
+        expect(await usdAvailable(seller.id)).toBe(10_000 + order.shippingMinor);
+        expect(done.shipment?.events.map((e) => e.kind)).toEqual(["paid", "handed_to_courier", "in_transit", "received"]);
+        expect(await ledgerSum("USD")).toBe(0);
+        // la tâche automatique ne touche pas à une commande déjà terminée
+        env.advance(FEES.claimWindowMs + HOUR);
+        expect(await data.releaseDeliveredOrders()).toBe(0);
+        expect(await usdAvailable(seller.id)).toBe(10_000 + order.shippingMinor);
+      });
+
+      it("pas de code de remise pour le coursier ; la remise en main propre reste inchangée", async () => {
+        const { seller, buyer, order } = await courierOrder("+243821000208");
+        expect(code(await rejects(data.getHandoverCode(order.id, buyer.id)))).toBe("INVALID_STATE");
+        expect(code(await rejects(data.confirmDelivery(order.id, seller.id, deriveHandoverCode(order.id))))).toBe("INVALID_STATE");
+        const hand = await paidOrder("Acheteur Main", "+243821000209");
+        const v = await data.getOrder(hand.order.id, hand.buyer.id);
+        expect(v.shipment).toBeNull();
+        expect(v.actions).toContain("reveal_code");
+        expect(code(await rejects(data.shipOrder(hand.order.id, hand.seller.id, COURIER)))).toBe("INVALID_STATE");
+        expect(code(await rejects(data.confirmReceived(hand.order.id, hand.buyer.id)))).toBe("INVALID_STATE");
+        expect(code(await rejects(data.reportParcelLost(hand.order.id, hand.buyer.id)))).toBe("INVALID_STATE");
+        expect((await data.confirmDelivery(hand.order.id, hand.seller.id, deriveHandoverCode(hand.order.id))).status).toBe("completed");
+      });
+
+      it("droits et transitions : seul le bon rôle agit, dans le bon ordre ; un tiers reçoit 404", async () => {
+        const { seller, buyer, order } = await courierOrder("+243821000210", { pay: false });
+        const tiers = await signup("0831000211", "Tiers Coursier");
+        // commande non payée : rien n'est possible
+        expect(code(await rejects(data.shipOrder(order.id, seller.id, COURIER)))).toBe("INVALID_STATE");
+        expect(code(await rejects(data.confirmReceived(order.id, buyer.id)))).toBe("INVALID_STATE");
+        await data.startPayment(order.id, buyer.id, { method: "mpesa", msisdn: "0821111111", idempotencyKey: `k-${order.id}` });
+        await env.flush();
+        // tiers : 404 partout
+        expect(code(await rejects(data.shipOrder(order.id, tiers.id, COURIER)))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.markInTransit(order.id, tiers.id)))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.confirmReceived(order.id, tiers.id)))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.reportParcelLost(order.id, tiers.id)))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.getOrder(order.id, tiers.id)))).toBe("NOT_FOUND");
+        // l'acheteur ne peut pas expédier ; le vendeur ne peut pas confirmer la réception
+        expect(code(await rejects(data.shipOrder(order.id, buyer.id, COURIER)))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.confirmReceived(order.id, seller.id)))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.markInTransit(order.id, buyer.id)))).toBe("NOT_FOUND");
+        // ordre des étapes
+        expect(code(await rejects(data.markInTransit(order.id, seller.id)))).toBe("INVALID_STATE");
+        expect(code(await rejects(data.confirmReceived(order.id, buyer.id)))).toBe("INVALID_STATE");
+        expect(code(await rejects(data.reportParcelLost(order.id, buyer.id)))).toBe("INVALID_STATE");
+        expect(code(await rejects(data.acceptOrder(order.id, buyer.id)))).toBe("INVALID_STATE");
+        // coursier : nom et téléphone valides exigés, rien n'est enregistré en cas d'erreur
+        expect(code(await rejects(data.shipOrder(order.id, seller.id, { ...COURIER, courierName: " " })))).toBe("VALIDATION");
+        expect(code(await rejects(data.shipOrder(order.id, seller.id, { ...COURIER, courierPhone: "12" })))).toBe("VALIDATION");
+        expect((await data.getOrder(order.id, seller.id)).status).toBe("paid");
+        await data.shipOrder(order.id, seller.id, { courierName: "Papy Moto", courierPhone: "0899000111" });
+        expect((await data.getOrder(order.id, buyer.id)).shipment?.trackingRef).toBeNull();
+        expect(code(await rejects(data.shipOrder(order.id, seller.id, COURIER)))).toBe("INVALID_STATE");
+        expect(code(await rejects(data.markInTransit(order.id, buyer.id)))).toBe("NOT_FOUND");
+        await data.markInTransit(order.id, seller.id);
+        expect(code(await rejects(data.markInTransit(order.id, seller.id)))).toBe("INVALID_STATE");
+        // une fois le colis parti, l'acheteur n'annule plus seul
+        expect(code(await rejects(data.cancelOrder(order.id, buyer.id)))).toBe("INVALID_STATE");
+        await data.confirmReceived(order.id, buyer.id);
+        expect(code(await rejects(data.confirmReceived(order.id, buyer.id)))).toBe("INVALID_STATE");
+        expect(code(await rejects(data.reportParcelLost(order.id, buyer.id)))).toBe("INVALID_STATE");
+        expect(code(await rejects(data.cancelOrder(order.id, seller.id)))).toBe("INVALID_STATE");
+      });
+
+      it("libération automatique à J+48 h sans litige : idempotente, une seule écriture au grand livre", async () => {
+        const { seller, buyer, order } = await received("+243821000212");
+        env.advance(FEES.claimWindowMs - 60_000);
+        expect(await data.releaseDeliveredOrders()).toBe(0);
+        expect((await data.getOrder(order.id, buyer.id)).status).toBe("delivered");
+        expect(await usdAvailable(seller.id)).toBe(0);
+        env.advance(120_000);
+        expect(await data.releaseDeliveredOrders()).toBe(1);
+        expect(await data.releaseDeliveredOrders()).toBe(0);
+        const v = await data.getOrder(order.id, seller.id);
+        expect(v.status).toBe("completed");
+        expect(v.completedAt).not.toBeNull();
+        expect(v.shipment?.events.map((e) => e.kind)).toEqual(["paid", "handed_to_courier", "in_transit", "received", "auto_released"]);
+        expect(await usdAvailable(seller.id)).toBe(10_000 + order.shippingMinor);
+        expect(await account("order_escrow")).toBe(0);
+        expect(await ledgerSum("USD")).toBe(0);
+        expect((await data.getItem((await data.getOrder(order.id, buyer.id)).items[0].id))!.status).toBe("sold");
+        expect(env.refunds()).toBe(0);
+        // l'acheteur peut donner son avis sur une vente terminée automatiquement
+        expect((await data.getOrder(order.id, buyer.id)).actions).toContain("review");
+      });
+
+      it("libération automatique à l'heure simulée (at) : même décision que l'horloge réelle", async () => {
+        const { seller, order } = await received("+243821000213");
+        expect(await data.releaseDeliveredOrders({ at: env.now() + FEES.claimWindowMs - 1 })).toBe(0);
+        expect(await data.releaseDeliveredOrders({ at: env.now() + FEES.claimWindowMs })).toBe(1);
+        expect((await data.getOrder(order.id, seller.id)).status).toBe("completed");
+      });
+
+      it("litige pendant la fenêtre : gèle la libération automatique ; résolu en faveur du vendeur ou de l'acheteur", async () => {
+        const a = await received("+243821000214");
+        const b = await received("+243821000215");
+        env.advance(FEES.claimWindowMs - HOUR);
+        const da = await data.openDispute(a.order.id, a.buyer.id, { reason: "damaged", description: "Le colis est arrivé écrasé." });
+        const db2 = await data.openDispute(b.order.id, b.buyer.id, { reason: "not_as_described", description: "Ce n'est pas la bonne taille." });
+        env.advance(10 * HOUR);
+        expect(await data.releaseDeliveredOrders()).toBe(0);
+        expect((await data.getOrder(a.order.id, a.buyer.id)).status).toBe("disputed");
+        expect(await usdAvailable(a.seller.id)).toBe(0);
+        // le vendeur est payé par l'assistance : libération depuis le statut « livrée »
+        await data.resolveDispute(staffD(), da.id, "release_seller", "Le colis était intact à la livraison.");
+        expect((await data.getOrder(a.order.id, a.buyer.id)).status).toBe("completed");
+        expect(await usdAvailable(a.seller.id)).toBe(10_000 + a.order.shippingMinor);
+        // l'acheteur est remboursé
+        await data.resolveDispute(staffD(), db2.id, "refund_buyer");
+        const vb = await data.getOrder(b.order.id, b.buyer.id);
+        expect(vb.status).toBe("refunded");
+        expect(env.refunds()).toBe(1);
+        expect(await data.releaseDeliveredOrders()).toBe(0);
+        expect(await usdAvailable(a.seller.id)).toBe(10_000 + a.order.shippingMinor);
+        expect(await account("order_escrow")).toBe(0);
+        expect(await ledgerSum("USD")).toBe(0);
+      });
+
+      it("litige après livraison : acheteur seulement, et seulement dans la fenêtre de réclamation", async () => {
+        const { seller, buyer, order } = await received("+243821000216");
+        expect(code(await rejects(data.openDispute(order.id, seller.id, { reason: "other", description: "Je conteste cette livraison." })))).toBe("INVALID_STATE");
+        env.advance(FEES.claimWindowMs + 1000); // fenêtre close, la tâche n'a pas encore tourné
+        expect((await data.getOrder(order.id, buyer.id)).actions).not.toContain("issue");
+        expect(code(await rejects(data.openDispute(order.id, buyer.id, { reason: "other", description: "Trop tard pour réclamer." })))).toBe("INVALID_STATE");
+        expect(await data.releaseDeliveredOrders()).toBe(1);
+        expect(await usdAvailable(seller.id)).toBe(10_000 + order.shippingMinor);
+      });
+
+      it("colis perdu : acheteur ou vendeur signale, litige non reçu, argent gelé ; remboursement par l'assistance", async () => {
+        const a = await inTransit("+243821000217");
+        const d = await data.reportParcelLost(a.order.id, a.buyer.id);
+        expect(d).toMatchObject({ status: "open", reason: "not_received", openedByMe: true });
+        const v = await data.getOrder(a.order.id, a.seller.id);
+        expect(v.status).toBe("disputed");
+        expect(v.shipment?.status).toBe("lost_suspected");
+        expect(v.shipment?.events.map((e) => e.kind)).toEqual(["paid", "handed_to_courier", "in_transit", "lost_reported"]);
+        expect(code(await rejects(data.reportParcelLost(a.order.id, a.seller.id)))).toBe("INVALID_STATE");
+        expect(code(await rejects(data.confirmReceived(a.order.id, a.buyer.id)))).toBe("INVALID_STATE");
+        env.advance(FEES.courierStaleMs + FEES.claimWindowMs);
+        expect(await data.refundStaleCourierOrders()).toBe(0); // gelé par le litige
+        await data.resolveDispute(staffD(), d.id, "refund_buyer");
+        expect((await data.getOrder(a.order.id, a.buyer.id)).status).toBe("refunded");
+        expect((await data.getItem(a.item.id))!.status).toBe("active");
+        expect(env.refunds()).toBe(1);
+        expect(await account("order_escrow")).toBe(0);
+        expect(await ledgerSum("USD")).toBe(0);
+        // le vendeur peut aussi signaler, avec ses propres mots
+        const b = await courierOrder("+243821000218");
+        await data.shipOrder(b.order.id, b.seller.id, COURIER);
+        const tiers = await signup("0831000219", "Tiers Perdu");
+        expect(code(await rejects(data.reportParcelLost(b.order.id, tiers.id)))).toBe("NOT_FOUND");
+        const d2 = await data.reportParcelLost(b.order.id, b.seller.id, { description: "Le coursier ne répond plus depuis hier." });
+        expect(d2).toMatchObject({ reason: "not_received", openedByMe: true, description: "Le coursier ne répond plus depuis hier." });
+        expect(code(await rejects(data.reportParcelLost(b.order.id, b.seller.id, { description: "court" })))).toBe("INVALID_STATE"); // déjà en litige
+      });
+
+      it("colis resté « remis au coursier » trop longtemps : remboursement automatique, idempotent ; les autres filets ne s'en mêlent pas", async () => {
+        const stale = await inTransit("+243821000220");
+        const quick = await received("+243821000221");
+        const unshipped = await courierOrder("+243821000222");
+        env.advance(FEES.unhandedOrderMs + HOUR);
+        // 7 jours : seule la commande jamais remise au coursier est remboursée par le filet existant
+        expect(await data.expireStalePaidOrders()).toBe(1);
+        expect((await data.getOrder(unshipped.order.id, unshipped.buyer.id)).status).toBe("cancelled");
+        expect((await data.getOrder(stale.order.id, stale.buyer.id)).status).toBe("in_delivery");
+        expect(await data.refundStaleCourierOrders()).toBe(0);
+        env.advance(FEES.courierStaleMs - FEES.unhandedOrderMs); // dix jours après la remise au coursier (le délai a démarré à la remise)
+        expect(await data.refundStaleCourierOrders()).toBe(1);
+        expect(await data.refundStaleCourierOrders()).toBe(0);
+        const v = await data.getOrder(stale.order.id, stale.buyer.id);
+        expect(v.status).toBe("cancelled");
+        expect(v.shipment?.events.map((e) => e.kind).slice(-1)).toEqual(["auto_refunded"]);
+        expect((await data.getItem(stale.item.id))!.status).toBe("active");
+        expect(env.refunds()).toBe(2); // la commande jamais remise + le colis jamais livré
+        // une commande déjà reçue n'est jamais remboursée : elle est libérée
+        expect((await data.getOrder(quick.order.id, quick.buyer.id)).status).toBe("delivered");
+        expect(await data.releaseDeliveredOrders()).toBe(1);
+        expect(await usdAvailable(quick.seller.id)).toBe(10_000 + quick.order.shippingMinor);
+        expect(await account("order_escrow")).toBe(0);
+        expect(await ledgerSum("USD")).toBe(0);
+      });
+    });
+
+    // ---- agent C : notifications
+    describe("notifications", () => {
+      /** SMS de notification seulement : les codes de connexion (inscription des acteurs du test) passent aussi par le fournisseur en PostgreSQL. */
+      const notifSms = () => env.sentSms().filter((s) => !/ton code/.test(s.text));
+      const kinds = async (id: string) => (await data.listNotifications(id)).items.map((n) => n.kind).sort();
+      const marie = () => S("user-marie");
+      const moderator = () => S("user-support-2");
+      const staff = () => S("user-support-1");
+      async function duo(a = "0811000191", b = "0821000192") {
+        const seller = await signup(a, "Vendeuse Notif");
+        const buyer = await signup(b, "Acheteur Notif");
+        const item = await listing(seller.id);
+        return { seller, buyer, item };
+      }
+
+      it("message : une seule notification non lue par conversation, regroupée, jamais pour l'auteur", async () => {
+        const { seller, buyer, item } = await duo();
+        const conv = await data.startConversation(buyer.id, item.id);
+        expect(await kinds(seller.id)).toEqual([]); // ouvrir une conversation ne prévient personne
+        await data.sendMessage(conv.id, buyer.id, "Bonjour, il est disponible ?");
+        await data.sendMessage(conv.id, buyer.id, "Je peux passer demain.");
+        const l = await data.listNotifications(seller.id);
+        expect(l.unreadCount).toBe(1);
+        expect(l.items).toHaveLength(1);
+        expect(l.items[0].kind).toBe("message_received");
+        expect(l.items[0].payload).toMatchObject({ conversationId: conv.id, count: 2, senderName: "Acheteur Notif" });
+        expect(await kinds(buyer.id)).toEqual([]); // l'auteur n'est jamais prévenu de son propre message
+        await data.sendMessage(conv.id, seller.id, "Oui, à Gombe.");
+        expect(await kinds(buyer.id)).toEqual(["message_received"]);
+        expect((await data.listNotifications(seller.id)).items).toHaveLength(1);
+        // ouvrir la conversation lit sa notification ; le message suivant en crée une nouvelle
+        await data.getConversation(conv.id, seller.id);
+        expect((await data.listNotifications(seller.id)).unreadCount).toBe(0);
+        await data.sendMessage(conv.id, buyer.id, "Parfait, merci.");
+        const again = await data.listNotifications(seller.id);
+        expect(again.unreadCount).toBe(1);
+        expect(again.items).toHaveLength(2);
+        expect(again.items[0].read).toBe(false); // non lues d'abord
+        expect(again.items[0].payload.count).toBe(1);
+      });
+
+      it("commande payée : le vendeur est prévenu une seule fois, même si l'événement du PSP est rejoué ; pas l'acheteur", async () => {
+        const seller = (await data.getUser(marie()))!;
+        const buyer = await signup("+243821000301", "Acheteur P1");
+        const item = await listing(seller.id);
+        const order = await data.createOrder(buyer.id, { itemIds: [item.id], deliveryMethod: "hand_delivery" });
+        expect(await kinds(seller.id)).toEqual([]); // réservé mais pas encore payé
+        await data.startPayment(order.id, buyer.id, { method: "mpesa", msisdn: "0821111111", idempotencyKey: `k-${order.id}` });
+        const [ev] = await env.pendingEvents();
+        await env.flush();
+        expect(await kinds(seller.id)).toEqual(["order_paid"]);
+        expect((await data.listNotifications(seller.id)).items[0].payload).toMatchObject({ orderId: order.id, role: "seller", itemTitle: "Robe test" });
+        expect(await kinds(buyer.id)).toEqual([]);
+        expect((await data.handleProviderEvent(ev)).duplicate).toBe(true);
+        expect((await data.handleProviderEvent({ ...ev, eventId: "autre-evt" })).duplicate).toBe(true);
+        expect(await kinds(seller.id)).toEqual(["order_paid"]);
+      });
+
+      it("remise confirmée : l'acheteur est prévenu (pas le vendeur, auteur) ; avis : la cible seulement", async () => {
+        const { seller, buyer, order } = await paidOrder("Acheteur P2", "+243821000302");
+        await data.confirmDelivery(order.id, seller.id, deriveHandoverCode(order.id));
+        expect(await kinds(buyer.id)).toEqual(["order_completed"]);
+        expect((await data.listNotifications(buyer.id)).items[0].payload).toMatchObject({ role: "buyer", orderId: order.id });
+        expect(await kinds(seller.id)).toEqual(["order_paid"]);
+        await data.createReview(order.id, buyer.id, { rating: 4, comment: "Très bien." });
+        expect(await kinds(seller.id)).toEqual(["order_paid", "review_received"]);
+        expect((await data.listNotifications(seller.id)).items.find((n) => n.kind === "review_received")!.payload.rating).toBe(4);
+        expect(await kinds(buyer.id)).toEqual(["order_completed"]);
+      });
+
+      it("annulation : seule l'autre partie est prévenue ; expiration : les deux, une seule fois", async () => {
+        const { seller, buyer, item } = await duo("0811000193", "0821000194");
+        const o1 = await data.createOrder(buyer.id, { itemIds: [item.id], deliveryMethod: "hand_delivery" });
+        await data.cancelOrder(o1.id, buyer.id);
+        expect(await kinds(seller.id)).toEqual(["order_cancelled"]);
+        expect(await kinds(buyer.id)).toEqual([]);
+        const o2 = await data.createOrder(buyer.id, { itemIds: [item.id], deliveryMethod: "hand_delivery" });
+        env.advance(FEES.orderPaymentTtlMs + 1);
+        expect(await data.expireUnpaidOrders()).toBe(1);
+        expect(await data.expireUnpaidOrders()).toBe(0);
+        expect(await kinds(seller.id)).toEqual(["order_cancelled", "order_expired"]);
+        expect(await kinds(buyer.id)).toEqual(["order_expired"]);
+        expect((await data.listNotifications(buyer.id)).items[0].payload).toMatchObject({ orderId: o2.id, role: "buyer" });
+      });
+
+      it("commande payée annulée par le vendeur : l'acheteur est prévenu et remboursé ; jamais d'auto-notification", async () => {
+        const { seller, buyer, order } = await paidOrder("Acheteur P3", "+243821000303");
+        await data.cancelOrder(order.id, seller.id);
+        const n = (await data.listNotifications(buyer.id)).items;
+        expect(n.map((x) => x.kind)).toEqual(["order_cancelled"]);
+        expect(n[0].payload).toMatchObject({ role: "buyer", refunded: true });
+        expect((await kinds(seller.id)).includes("order_cancelled")).toBe(false);
+      });
+
+      it("commande payée jamais remise, remboursée automatiquement : les deux parties sont prévenues", async () => {
+        const { seller, buyer, order } = await paidOrder("Acheteur P4", "+243821000304");
+        env.advance(FEES.unhandedOrderMs + 1000);
+        expect(await data.expireStalePaidOrders()).toBe(1);
+        expect(await data.expireStalePaidOrders()).toBe(0);
+        expect((await data.listNotifications(buyer.id)).items.map((n) => [n.kind, n.payload.auto])).toEqual([["order_cancelled", true]]);
+        expect((await kinds(seller.id)).filter((k) => k === "order_cancelled")).toHaveLength(1);
+        void order;
+      });
+
+      it("litige : ouverture (l'autre partie), messages (l'autre partie ; assistance : les deux), résolution (les deux, pas l'assistance)", async () => {
+        const { seller, buyer, order } = await paidOrder("Acheteur L9", "+243821000309", 10_000);
+        const d = await data.openDispute(order.id, buyer.id, { reason: "not_received", description: "Le vendeur ne s'est pas présenté." });
+        expect((await kinds(seller.id)).filter((k) => k === "dispute_opened")).toHaveLength(1);
+        expect(await kinds(buyer.id)).toEqual([]);
+        await data.addDisputeNote(d.id, seller.id, "J'étais bien au rendez-vous.");
+        expect(await kinds(buyer.id)).toEqual(["dispute_message"]);
+        expect((await kinds(seller.id)).includes("dispute_message")).toBe(false);
+        await data.addDisputeNote(d.id, staff(), "Pouvez-vous envoyer une preuve ?");
+        expect((await kinds(buyer.id)).filter((k) => k === "dispute_message")).toHaveLength(2);
+        expect((await kinds(seller.id)).filter((k) => k === "dispute_message")).toHaveLength(1);
+        expect(await kinds(staff())).toEqual([]);
+        await data.resolveDispute(staff(), d.id, "refund_buyer", "Remboursement.");
+        for (const id of [buyer.id, seller.id]) {
+          const r = (await data.listNotifications(id)).items.filter((n) => n.kind === "dispute_resolved");
+          expect(r).toHaveLength(1);
+          expect(r[0].payload).toMatchObject({ disputeId: d.id, orderId: order.id, outcome: "refund_buyer" });
+        }
+        expect(await kinds(staff())).toEqual([]);
+      });
+
+      it("signalement traité : le signaleur est remercié sans détail ; suspension : le membre suspendu est prévenu", async () => {
+        const reporter = await signup("0821000195", "Signaleur N");
+        const target = await signup("0811000196", "Vendeur Signalé");
+        const it2 = await listing(target.id);
+        const r1 = await data.createReport(reporter.id, { targetType: "user", targetId: target.id, reason: "scam", details: "Détail confidentiel du signalement" });
+        expect(await kinds(reporter.id)).toEqual([]);
+        await data.handleReport(moderator(), r1.id, "suspend_user");
+        const mine = (await data.listNotifications(reporter.id)).items;
+        expect(mine.map((n) => n.kind)).toEqual(["report_handled"]);
+        expect(mine[0].payload).toEqual({}); // aucun détail sur la décision
+        const sus = (await data.listNotifications(target.id)).items;
+        expect(sus.map((n) => n.kind)).toEqual(["suspension"]);
+        expect(sus[0].payload.until).toBe(env.now() + 7 * 86_400_000);
+        const r2 = await data.createReport(reporter.id, { targetType: "item", targetId: it2.id, reason: "other", details: "" });
+        await data.handleReport(moderator(), r2.id, "dismiss");
+        expect(await kinds(reporter.id)).toEqual(["report_handled", "report_handled"]);
+        expect(await kinds(moderator())).toEqual([]);
+      });
+
+      it("lecture : marquer lue est idempotent, tout marquer comme lu, non lues d'abord", async () => {
+        const seller = await signup("0811000197", "Vendeuse Lecture");
+        const buyer = await signup("0821000198", "Acheteur Lecture");
+        const a = await listing(seller.id, { title: "Robe A" });
+        const b = await listing(seller.id, { title: "Robe B" });
+        const ca = await data.startConversation(buyer.id, a.id);
+        const cb = await data.startConversation(buyer.id, b.id);
+        await data.sendMessage(ca.id, buyer.id, "Question A");
+        env.advance(1000);
+        await data.sendMessage(cb.id, buyer.id, "Question B");
+        const l = await data.listNotifications(seller.id);
+        expect(l.items.map((n) => n.payload.itemTitle)).toEqual(["Robe B", "Robe A"]); // plus récente d'abord
+        await data.markNotificationRead(seller.id, l.items[0].id);
+        await data.markNotificationRead(seller.id, l.items[0].id); // idempotent
+        expect(await data.countUnreadNotifications(seller.id)).toBe(1);
+        const after = await data.listNotifications(seller.id);
+        expect(after.items.map((n) => n.read)).toEqual([false, true]); // non lues d'abord
+        expect(after.unreadCount).toBe(1);
+        expect(await data.markAllNotificationsRead(seller.id)).toBe(1);
+        expect(await data.markAllNotificationsRead(seller.id)).toBe(0);
+        expect(await data.countUnreadNotifications(seller.id)).toBe(0);
+      });
+
+      it("isolation : un membre ne voit ni ne modifie les notifications d'un autre (404, liste vide)", async () => {
+        const { seller, buyer, item } = await duo("0811000199", "0821000200");
+        const conv = await data.startConversation(buyer.id, item.id);
+        await data.sendMessage(conv.id, buyer.id, "Bonjour");
+        const tiers = await signup("0831000201", "Tiers Notif");
+        const id = (await data.listNotifications(seller.id)).items[0].id;
+        expect(code(await rejects(data.markNotificationRead(tiers.id, id)))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.markNotificationRead(buyer.id, id)))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.markNotificationRead(seller.id, "00000000-0000-4000-8000-000000000000")))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.markNotificationRead(seller.id, "pas-un-identifiant")))).toBe("NOT_FOUND");
+        expect((await data.listNotifications(tiers.id))).toEqual({ items: [], unreadCount: 0 });
+        expect(await data.markAllNotificationsRead(tiers.id)).toBe(0);
+        expect((await data.listNotifications(seller.id)).unreadCount).toBe(1); // intacte
+      });
+
+      it("SMS : commande payée (vendeur) et litige ouvert ou résolu, texte court sans donnée sensible ; rien pour messages, avis, annulation", async () => {
+        const seller = (await data.getUser(marie()))!;
+        const { buyer, order } = await paidOrder("Acheteur S1", "+243821000311", 12_345);
+        await env.settleSms();
+        expect(notifSms().map((s) => s.to)).toEqual([seller.phone]);
+        const code6 = deriveHandoverCode(order.id);
+        const d = await data.openDispute(order.id, buyer.id, { reason: "damaged", description: "Écran fissuré à la remise." });
+        await env.settleSms();
+        expect(notifSms().map((s) => s.to)).toEqual([seller.phone, seller.phone]);
+        await data.resolveDispute(staff(), d.id, "release_seller", "Paiement du vendeur.");
+        await env.settleSms();
+        expect(notifSms().map((s) => s.to).sort()).toEqual([seller.phone, seller.phone, seller.phone, (await data.getUser(buyer.id))!.phone].sort());
+        for (const s of notifSms()) {
+          expect(s.text.length).toBeLessThanOrEqual(160);
+          expect(s.text).not.toContain(code6);
+          expect(s.text).not.toMatch(/\d/); // ni montant, ni code, ni numéro
+          expect(s.text).not.toMatch(/Robe test|Acheteur S1|Marie/);
+        }
+        // pas de SMS pour un message, un avis ni une annulation
+        const before = notifSms().length;
+        const conv = await data.startConversation(buyer.id, (await listing(seller.id)).id);
+        await data.sendMessage(conv.id, buyer.id, "Bonjour");
+        await data.createReview(order.id, buyer.id, { rating: 5, comment: "" });
+        const o2 = await data.createOrder(buyer.id, { itemIds: [(await listing(seller.id)).id], deliveryMethod: "hand_delivery" });
+        await data.cancelOrder(o2.id, buyer.id);
+        await env.settleSms();
+        expect(notifSms()).toHaveLength(before);
+      });
+
+      it("préférences SMS : par catégorie ; désactivés, plus de SMS mais la notification interne reste ; les valeurs invalides sont ignorées", async () => {
+        const seller = (await data.getUser(marie()))!;
+        expect(await data.getNotificationPreferences(seller.id)).toEqual({ orders: true, disputes: true });
+        expect(await data.updateNotificationPreferences(seller.id, { orders: false })).toEqual({ orders: false, disputes: true });
+        expect(await data.getNotificationPreferences(seller.id)).toEqual({ orders: false, disputes: true });
+        const { buyer, order } = await paidOrder("Acheteur S2", "+243821000312");
+        await env.settleSms();
+        expect(notifSms()).toHaveLength(0);
+        expect(await kinds(seller.id)).toEqual(["order_paid"]);
+        // les litiges restent activés
+        await data.openDispute(order.id, buyer.id, { reason: "other", description: "Un autre problème à signaler." });
+        await env.settleSms();
+        expect(notifSms()).toHaveLength(1);
+        // couper les litiges aussi, puis réactiver les commandes
+        expect(await data.updateNotificationPreferences(seller.id, { disputes: false })).toEqual({ orders: false, disputes: false });
+        expect(await data.updateNotificationPreferences(seller.id, { orders: true })).toEqual({ orders: true, disputes: false });
+        await paidOrder("Acheteur S3", "+243821000313");
+        await env.settleSms();
+        expect(notifSms()).toHaveLength(2);
+        // les préférences d'un membre n'affectent pas celles d'un autre ; compte inconnu : 404
+        const autre = await signup("0831000202", "Autre Pref");
+        expect(await data.getNotificationPreferences(autre.id)).toEqual({ orders: true, disputes: true });
+        expect(code(await rejects(data.getNotificationPreferences(S("user-inconnu"))))).toBe("NOT_FOUND");
+      });
+
+      it("SMS : plafond quotidien par numéro (les notifications internes continuent), puis reprise le lendemain", async () => {
+        const seller = (await data.getUser(marie()))!;
+        for (let i = 0; i < 6; i++) await paidOrder(`Acheteur Q${i}`, `+24382100033${i}`);
+        await env.settleSms();
+        expect(notifSms()).toHaveLength(5);
+        expect((await kinds(seller.id)).filter((k) => k === "order_paid")).toHaveLength(6);
+        env.advance(86_400_000 + 1000);
+        await paidOrder("Acheteur Q9", "+243821000339");
+        await env.settleSms();
+        expect(notifSms()).toHaveLength(6);
+      });
+
+      it("un échec d'envoi SMS ne casse jamais l'événement métier", async () => {
+        const seller = (await data.getUser(marie()))!;
+        // On fait échouer le fournisseur SMS le temps de l'événement.
+        const provider = (data as unknown as { __sms: { send(to: string, text: string): Promise<void> } }).__sms;
+        const original = provider.send.bind(provider);
+        provider.send = async (to, text) => { if (/ton code/.test(text)) return original(to, text); throw new Error("fournisseur indisponible"); }; // les codes de connexion passent encore (inscriptions du test)
+        try {
+          const { order } = await paidOrder("Acheteur S4", "+243821000314");
+          await env.settleSms();
+          expect((await data.getOrder(order.id, seller.id)).status).toBe("paid");
+          expect(await kinds(seller.id)).toEqual(["order_paid"]);
+        } finally {
+          provider.send = original;
+        }
+      });
+
+      it("membre supprimé : ses notifications disparaissent et il n'en reçoit plus", async () => {
+        const { seller, buyer, order } = await paidOrder("Acheteur D1", "+243821000321");
+        await data.confirmDelivery(order.id, seller.id, deriveHandoverCode(order.id));
+        expect(await kinds(buyer.id)).toEqual(["order_completed"]);
+        await data.deleteAccount(buyer.id);
+        expect(await data.listNotifications(buyer.id)).toEqual({ items: [], unreadCount: 0 });
+        await data.createReview(order.id, seller.id, { rating: 5, comment: "Acheteur ponctuel." }); // la cible est supprimée : aucune erreur
+        expect(await data.listNotifications(buyer.id)).toEqual({ items: [], unreadCount: 0 });
+        await env.settleSms();
+        expect(notifSms().filter((s) => s.to === "+243821000321")).toEqual([]);
+      });
+
+      it("rétention : seules les notifications LUES depuis plus de 90 jours sont supprimées", async () => {
+        const seller = await signup("0811000203", "Vendeuse Purge");
+        const buyer = await signup("0821000204", "Acheteur Purge");
+        const a = await listing(seller.id, { title: "Robe PA" });
+        const b = await listing(seller.id, { title: "Robe PB" });
+        const ca = await data.startConversation(buyer.id, a.id);
+        const cb = await data.startConversation(buyer.id, b.id);
+        await data.sendMessage(ca.id, buyer.id, "A");
+        await data.sendMessage(cb.id, buyer.id, "B");
+        await data.getConversation(ca.id, seller.id); // A lue maintenant, B reste non lue
+        env.advance(89 * 86_400_000);
+        expect(await data.purgeOldNotifications()).toBe(0);
+        env.advance(2 * 86_400_000);
+        expect(await data.purgeOldNotifications()).toBe(1);
+        const left = await data.listNotifications(seller.id);
+        expect(left.items.map((n) => n.payload.itemTitle)).toEqual(["Robe PB"]); // la non lue est conservée, quel que soit son âge
+        expect(await data.purgeOldNotifications()).toBe(0);
+      });
+    });
+    // ---- fin agent C : notifications
+
+    // ---- agent F : notifications manquantes (annulation encadrée, coursier, messagerie, preuves, modération)
+    describe("notifications ajoutées (agent F)", () => {
+      const HOUR = 3_600_000;
+      const COURIER = { courierName: "Papy Moto", courierPhone: "0899000111", trackingRef: "MOTO-42" };
+      const SAFE_KEYS = new Set(["conversationId", "orderId", "itemId", "disputeId", "itemTitle", "senderName", "count", "role", "auto", "refunded", "outcome", "rating", "until"]);
+      const notifSms = () => env.sentSms().filter((s) => !/ton code/.test(s.text));
+      const list = async (id: string) => (await data.listNotifications(id)).items;
+      const ofKind = async (id: string, kind: string) => (await list(id)).filter((n) => n.kind === kind);
+      const kinds = async (id: string) => (await list(id)).map((n) => n.kind).sort();
+      const marieId = () => S("user-marie");
+      /** Aucun contenu sensible : clés connues seulement, ni numéro de téléphone, ni code de remise, ni montant dans la charge utile ou le texte. */
+      async function expectSafe(userId: string, orderIds: string[] = []) {
+        for (const n of await list(userId)) {
+          for (const k of Object.keys(n.payload)) expect(SAFE_KEYS.has(k), `${n.kind}.${k}`).toBe(true);
+          const json = JSON.stringify(n.payload);
+          expect(json, n.kind).not.toMatch(/\+?243\d{6}|\b0[89]\d{8}\b/);
+          for (const id of orderIds) expect(json, n.kind).not.toContain(deriveHandoverCode(id));
+          const d = describeNotification(n);
+          expect(`${d.title} ${d.body}`, n.kind).not.toMatch(/\$|USD|CDF|FC|\d{3,}/);
+        }
+      }
+      async function courierOrder(phone: string) {
+        const seller = (await data.getUser(marieId()))!;
+        const buyer = await signup(phone, "Acheteur Coursier F");
+        const item = await listing(seller.id, { priceMinor: 10_000 });
+        const order = await data.createOrder(buyer.id, { itemIds: [item.id], deliveryMethod: "courier", deliveryAreaId: S("area-com-limete"), deliveryLandmark: "Avenue de la Paix, portail bleu" });
+        await data.startPayment(order.id, buyer.id, { method: "mpesa", msisdn: "0821111111", idempotencyKey: `k-${order.id}` });
+        await env.flush();
+        return { seller, buyer, item, order };
+      }
+      async function shipped(phone: string) {
+        const o = await courierOrder(phone);
+        await data.shipOrder(o.order.id, o.seller.id, COURIER);
+        return o;
+      }
+      async function inTransit(phone: string) {
+        const o = await shipped(phone);
+        await data.markInTransit(o.order.id, o.seller.id);
+        return o;
+      }
+      async function received(phone: string) {
+        const o = await inTransit(phone);
+        await data.confirmReceived(o.order.id, o.buyer.id);
+        return o;
+      }
+
+      // ------------------------------------------------------------------ annulation encadrée
+      it("demande d'annulation : le vendeur est prévenu (notification + SMS), jamais l'acheteur ; rejouer ne crée rien", async () => {
+        const { order, buyer, seller } = await paidOrder("Acheteur F1", "+243821900101");
+        await data.requestCancellation(order.id, buyer.id);
+        const got = await ofKind(seller.id, "cancel_requested");
+        expect(got).toHaveLength(1);
+        expect(got[0].payload).toEqual({ orderId: order.id, itemTitle: "Robe test", role: "seller" });
+        expect(describeNotification(got[0]).href).toBe(`/orders/${order.id}`);
+        expect(await kinds(buyer.id)).toEqual([]);
+        // l'événement rejoué (double clic, nouvelle tentative réseau) : refusé, aucune notification de plus
+        expect(code(await rejects(data.requestCancellation(order.id, buyer.id)))).toBe("CANCEL_REQUEST_EXISTS");
+        expect(await ofKind(seller.id, "cancel_requested")).toHaveLength(1);
+        await env.settleSms();
+        const sms = notifSms().filter((s) => /demande l'annulation/.test(s.text));
+        expect(sms).toHaveLength(1);
+        expect(sms[0].to).toBe(seller.phone);
+        expect(sms[0].text).not.toMatch(/\d/);
+        await expectSafe(seller.id, [order.id]);
+      });
+
+      it("demande d'annulation : la préférence SMS « commandes » coupe le SMS mais pas la notification", async () => {
+        const { order, buyer, seller } = await paidOrder("Acheteur F2", "+243821900102");
+        await data.updateNotificationPreferences(seller.id, { orders: false });
+        await data.requestCancellation(order.id, buyer.id);
+        await env.settleSms();
+        expect(await ofKind(seller.id, "cancel_requested")).toHaveLength(1);
+        expect(notifSms().filter((s) => /demande l'annulation/.test(s.text))).toEqual([]);
+      });
+
+      it("demande retirée : le vendeur est prévenu, pas l'acheteur ; une nouvelle demande crée une nouvelle notification", async () => {
+        const { order, buyer, seller } = await paidOrder("Acheteur F3", "+243821900103");
+        await data.requestCancellation(order.id, buyer.id);
+        await data.withdrawCancellation(order.id, buyer.id);
+        const w = await ofKind(seller.id, "cancel_withdrawn");
+        expect(w).toHaveLength(1);
+        expect(w[0].payload).toMatchObject({ orderId: order.id, role: "seller" });
+        expect(describeNotification(w[0]).href).toBe(`/orders/${order.id}`);
+        expect((await kinds(buyer.id)).filter((k) => k.startsWith("cancel_"))).toEqual([]);
+        expect(code(await rejects(data.withdrawCancellation(order.id, buyer.id)))).toBe("CANCEL_REQUEST_NONE");
+        expect(await ofKind(seller.id, "cancel_withdrawn")).toHaveLength(1);
+        await data.requestCancellation(order.id, buyer.id);
+        expect(await ofKind(seller.id, "cancel_requested")).toHaveLength(2); // deux demandes distinctes, deux événements
+      });
+
+      it("demande acceptée : l'acheteur apprend que la commande est annulée et remboursée ; pas le vendeur", async () => {
+        const { order, buyer, seller } = await paidOrder("Acheteur F4", "+243821900104");
+        await data.requestCancellation(order.id, buyer.id);
+        await data.acceptCancellation(order.id, seller.id);
+        const a = await ofKind(buyer.id, "cancel_accepted");
+        expect(a).toHaveLength(1);
+        expect(a[0].payload).toMatchObject({ orderId: order.id, role: "buyer", refunded: true });
+        const d = describeNotification(a[0]);
+        expect(d.body).toContain("remboursé");
+        expect(d.href).toBe(`/orders/${order.id}`);
+        expect((await kinds(seller.id)).filter((k) => k.startsWith("cancel_") && k !== "cancel_requested")).toEqual([]);
+        expect(code(await rejects(data.acceptCancellation(order.id, seller.id)))).toBe("INVALID_STATE");
+        expect(await ofKind(buyer.id, "cancel_accepted")).toHaveLength(1);
+        await expectSafe(buyer.id, [order.id]);
+      });
+
+      it("demande refusée : l'acheteur est prévenu et peut ouvrir un litige ; pas le vendeur", async () => {
+        const { order, buyer, seller } = await paidOrder("Acheteur F5", "+243821900105");
+        await data.requestCancellation(order.id, buyer.id);
+        await data.declineCancellation(order.id, seller.id);
+        const n = await ofKind(buyer.id, "cancel_declined");
+        expect(n).toHaveLength(1);
+        expect(n[0].payload).toMatchObject({ orderId: order.id, role: "buyer" });
+        expect(describeNotification(n[0]).body).toContain("litige");
+        expect((await kinds(seller.id)).filter((k) => k === "cancel_declined")).toEqual([]);
+        expect(code(await rejects(data.declineCancellation(order.id, seller.id)))).toBe("CANCEL_REQUEST_NONE");
+        expect(await ofKind(buyer.id, "cancel_declined")).toHaveLength(1);
+      });
+
+      it("demande sans réponse : les deux parties sont prévenues une seule fois, seulement après le délai, jamais si la demande est résolue", async () => {
+        const { order, buyer, seller } = await paidOrder("Acheteur F6", "+243821900106");
+        await data.requestCancellation(order.id, buyer.id);
+        env.advance(FEES.cancelRequestTtlMs - 60_000);
+        expect(await data.notifyExpiredCancelRequests()).toBe(0);
+        env.advance(120_000);
+        expect(await data.notifyExpiredCancelRequests()).toBe(1);
+        const b = await ofKind(buyer.id, "cancel_expired");
+        const s = await ofKind(seller.id, "cancel_expired");
+        expect([b.length, s.length]).toEqual([1, 1]);
+        expect(b[0].payload).toMatchObject({ orderId: order.id, role: "buyer" });
+        expect(s[0].payload).toMatchObject({ orderId: order.id, role: "seller" });
+        expect(describeNotification(b[0]).body).toContain("refusée");
+        // tâche rejouée : rien de plus
+        expect(await data.notifyExpiredCancelRequests()).toBe(0);
+        expect(await ofKind(buyer.id, "cancel_expired")).toHaveLength(1);
+        expect(await ofKind(seller.id, "cancel_expired")).toHaveLength(1);
+        await expectSafe(buyer.id, [order.id]);
+        // une demande retirée ou refusée avant le délai n'expire jamais
+        const o2 = await paidOrder("Acheteur F6b", "+243821900107");
+        await data.requestCancellation(o2.order.id, o2.buyer.id);
+        await data.withdrawCancellation(o2.order.id, o2.buyer.id);
+        const o3 = await paidOrder("Acheteur F6c", "+243821900108");
+        await data.requestCancellation(o3.order.id, o3.buyer.id);
+        await data.declineCancellation(o3.order.id, o3.seller.id);
+        env.advance(FEES.cancelRequestTtlMs + HOUR);
+        expect(await data.notifyExpiredCancelRequests()).toBe(0);
+        expect(await ofKind(o2.buyer.id, "cancel_expired")).toEqual([]);
+        expect(await ofKind(o3.buyer.id, "cancel_expired")).toEqual([]);
+      });
+
+      // ------------------------------------------------------------------ livraison par coursier
+      it("colis remis au coursier : l'acheteur est prévenu (notification + SMS), pas le vendeur ; rejouer ne crée rien", async () => {
+        const { order, buyer, seller } = await shipped("+243821900111");
+        const n = await ofKind(buyer.id, "parcel_handed");
+        expect(n).toHaveLength(1);
+        expect(n[0].payload).toEqual({ orderId: order.id, itemTitle: "Robe test", role: "buyer" });
+        expect(describeNotification(n[0]).href).toBe(`/orders/${order.id}`);
+        expect(await ofKind(seller.id, "parcel_handed")).toEqual([]);
+        expect(code(await rejects(data.shipOrder(order.id, seller.id, COURIER)))).toBe("INVALID_STATE");
+        expect(await ofKind(buyer.id, "parcel_handed")).toHaveLength(1);
+        await env.settleSms();
+        const sms = notifSms().filter((s) => /remis au coursier/.test(s.text));
+        expect(sms).toHaveLength(1);
+        expect(sms[0].to).toBe(buyer.phone);
+        expect(sms[0].text).not.toMatch(/\d/);
+        // seuls « commande payée » (vendeur) et « colis remis » (acheteur) partent par SMS dans tout ce parcours
+        expect(notifSms()).toHaveLength(2);
+        await expectSafe(buyer.id, [order.id]);
+      });
+
+      it("colis en route : l'acheteur est prévenu, sans SMS ; rejouer ne crée rien", async () => {
+        const { order, buyer, seller } = await inTransit("+243821900112");
+        const n = await ofKind(buyer.id, "parcel_in_transit");
+        expect(n).toHaveLength(1);
+        expect(n[0].payload).toMatchObject({ orderId: order.id, role: "buyer" });
+        expect(await ofKind(seller.id, "parcel_in_transit")).toEqual([]);
+        expect(code(await rejects(data.markInTransit(order.id, seller.id)))).toBe("INVALID_STATE");
+        expect(await ofKind(buyer.id, "parcel_in_transit")).toHaveLength(1);
+        await env.settleSms();
+        expect(notifSms()).toHaveLength(2); // commande payée + colis remis, rien de plus
+      });
+
+      it("colis reçu : le vendeur est prévenu (la fenêtre démarre), pas l'acheteur ; rejouer ne crée rien", async () => {
+        const { order, buyer, seller } = await received("+243821900113");
+        const n = await ofKind(seller.id, "parcel_received");
+        expect(n).toHaveLength(1);
+        expect(n[0].payload).toEqual({ orderId: order.id, itemTitle: "Robe test", role: "seller" });
+        expect(describeNotification(n[0]).body).toContain("48 heures");
+        expect(await ofKind(buyer.id, "parcel_received")).toEqual([]);
+        expect(code(await rejects(data.confirmReceived(order.id, buyer.id)))).toBe("INVALID_STATE");
+        expect(await ofKind(seller.id, "parcel_received")).toHaveLength(1);
+        await expectSafe(seller.id, [order.id]);
+      });
+
+      it("rappel à l'acheteur : seulement à mi-fenêtre, une seule fois, pas après la libération, jamais au vendeur", async () => {
+        const { order, buyer, seller } = await received("+243821900114");
+        expect(await data.remindClaimWindows()).toBe(0); // 48 h restantes
+        env.advance(FEES.claimWindowMs / 2 - 60_000);
+        expect(await data.remindClaimWindows()).toBe(0); // un peu plus de la moitié restante
+        env.advance(120_000);
+        expect(await data.remindClaimWindows()).toBe(1);
+        const n = await ofKind(buyer.id, "claim_reminder");
+        expect(n).toHaveLength(1);
+        expect(n[0].payload).toEqual({ orderId: order.id, itemTitle: "Robe test", role: "buyer" });
+        expect(describeNotification(n[0]).body).toContain("litige");
+        expect(await data.remindClaimWindows()).toBe(0); // rejouée
+        expect(await ofKind(buyer.id, "claim_reminder")).toHaveLength(1);
+        expect(await ofKind(seller.id, "claim_reminder")).toEqual([]);
+        // après la fin de la fenêtre, plus de rappel (la libération a lieu)
+        const o2 = await received("+243821900115");
+        env.advance(FEES.claimWindowMs + HOUR);
+        expect(await data.remindClaimWindows()).toBe(0);
+        expect(await ofKind(o2.buyer.id, "claim_reminder")).toEqual([]);
+      });
+
+      it("libération automatique : les deux parties sont prévenues une seule fois, sans montant ; le vendeur apprend que l'argent est disponible", async () => {
+        const { order, buyer, seller } = await received("+243821900116");
+        expect(await data.releaseDeliveredOrders({ at: env.now() + FEES.claimWindowMs - 1 })).toBe(0);
+        expect(await ofKind(seller.id, "order_auto_released")).toEqual([]);
+        env.advance(FEES.claimWindowMs + 1);
+        expect(await data.releaseDeliveredOrders()).toBe(1);
+        const s = await ofKind(seller.id, "order_auto_released");
+        const b = await ofKind(buyer.id, "order_auto_released");
+        expect([s.length, b.length]).toEqual([1, 1]);
+        expect(s[0].payload).toEqual({ orderId: order.id, itemTitle: "Robe test", role: "seller" });
+        expect(describeNotification(s[0]).body).toContain("portefeuille");
+        expect(describeNotification(b[0]).body).toContain("finalisée");
+        expect(await data.releaseDeliveredOrders()).toBe(0); // tâche rejouée
+        expect(await ofKind(seller.id, "order_auto_released")).toHaveLength(1);
+        expect(await ofKind(buyer.id, "order_auto_released")).toHaveLength(1);
+        await env.settleSms();
+        expect(notifSms()).toHaveLength(2); // aucun SMS pour la libération
+        await expectSafe(seller.id, [order.id]);
+        await expectSafe(buyer.id, [order.id]);
+      });
+
+      it("colis non reçu ou perdu : l'autre partie est prévenue (sous ce type, pas en « litige ouvert »), jamais l'auteur", async () => {
+        const a = await inTransit("+243821900117");
+        await data.reportParcelLost(a.order.id, a.buyer.id, { description: "Le colis n'est jamais arrivé chez moi." });
+        const n = await ofKind(a.seller.id, "parcel_lost");
+        expect(n).toHaveLength(1);
+        expect(n[0].payload).toMatchObject({ orderId: a.order.id, itemTitle: "Robe test" });
+        expect(describeNotification(n[0]).href).toBe(`/orders/${a.order.id}/dispute`);
+        expect(await ofKind(a.seller.id, "dispute_opened")).toEqual([]);
+        expect(await kinds(a.buyer.id).then((k) => k.filter((x) => x === "parcel_lost" || x === "dispute_opened"))).toEqual([]);
+        expect(code(await rejects(data.reportParcelLost(a.order.id, a.buyer.id, { description: "Le colis n'est jamais arrivé chez moi." })))).toBe("INVALID_STATE");
+        expect(await ofKind(a.seller.id, "parcel_lost")).toHaveLength(1);
+        // signalé par le vendeur : c'est l'acheteur qui est prévenu
+        const b = await inTransit("+243821900118");
+        await data.reportParcelLost(b.order.id, b.seller.id, { description: "Le coursier ne répond plus du tout." });
+        expect(await ofKind(b.buyer.id, "parcel_lost")).toHaveLength(1);
+        expect((await ofKind(b.seller.id, "parcel_lost")).filter((x) => x.payload.orderId === b.order.id)).toEqual([]); // le vendeur (auteur) n'est pas prévenu de SON signalement
+        await expectSafe(b.buyer.id, [b.order.id]);
+      });
+
+      it("remboursement automatique d'un colis resté chez le coursier : les deux parties sont prévenues une seule fois", async () => {
+        const { order, buyer, seller } = await shipped("+243821900119");
+        env.advance(FEES.courierStaleMs - HOUR);
+        expect(await data.refundStaleCourierOrders()).toBe(0);
+        expect(await ofKind(buyer.id, "parcel_auto_refunded")).toEqual([]);
+        env.advance(2 * HOUR);
+        expect(await data.refundStaleCourierOrders()).toBe(1);
+        const b = await ofKind(buyer.id, "parcel_auto_refunded");
+        const s = await ofKind(seller.id, "parcel_auto_refunded");
+        expect([b.length, s.length]).toEqual([1, 1]);
+        expect(b[0].payload).toEqual({ orderId: order.id, itemTitle: "Robe test", role: "buyer" });
+        expect(describeNotification(b[0]).body).toContain("remboursé");
+        expect(await data.refundStaleCourierOrders()).toBe(0);
+        expect(await ofKind(buyer.id, "parcel_auto_refunded")).toHaveLength(1);
+        await expectSafe(buyer.id, [order.id]);
+        await expectSafe(seller.id, [order.id]);
+      });
+
+      // ------------------------------------------------------------------ messagerie et preuves
+      it("photo reçue : notifie comme un message, dans la même notification regroupée de la conversation, jamais l'auteur", async () => {
+        const seller = await signup("0811900121", "Vendeuse Photo F");
+        const buyer = await signup("0821900122", "Acheteur Photo F");
+        const item = await listing(seller.id);
+        const conv = await data.startConversation(buyer.id, item.id);
+        await data.sendMessage(conv.id, buyer.id, "Voici ma question.");
+        await data.sendPhotoMessage(conv.id, buyer.id, { body: "", photo: PHOTO });
+        const l = await data.listNotifications(seller.id);
+        expect(l.items).toHaveLength(1);
+        expect(l.items[0]).toMatchObject({ kind: "message_received", read: false });
+        expect(l.items[0].payload).toMatchObject({ conversationId: conv.id, count: 2, senderName: "Acheteur Photo F" });
+        expect(await kinds(buyer.id)).toEqual([]);
+        // photo seule : crée la notification de la conversation, puis la réponse photo prévient l'autre côté
+        const item2 = await listing(seller.id, { title: "Robe F2" });
+        const conv2 = await data.startConversation(buyer.id, item2.id);
+        await data.sendPhotoMessage(conv2.id, seller.id, { body: "Voilà", photo: PHOTO });
+        expect((await list(buyer.id)).filter((n) => n.payload.conversationId === conv2.id)).toHaveLength(1);
+        expect((await list(seller.id)).filter((n) => n.payload.conversationId === conv2.id)).toEqual([]);
+        // ouvrir la conversation lit la notification ; la photo suivante en crée une nouvelle
+        await data.getConversation(conv.id, seller.id);
+        expect((await data.listNotifications(seller.id)).unreadCount).toBe(0);
+        await data.sendPhotoMessage(conv.id, buyer.id, { body: "", photo: PHOTO });
+        expect((await data.listNotifications(seller.id)).unreadCount).toBe(1);
+        await expectSafe(seller.id);
+      });
+
+      it("preuve ajoutée à un litige : l'autre partie est prévenue (les deux si c'est l'assistance), jamais l'auteur ; une notification par preuve", async () => {
+        const { seller, buyer, order } = await paidOrder("Acheteur F7", "+243821900131");
+        const d = await data.openDispute(order.id, buyer.id, { reason: "not_as_described", description: "La robe ne ressemble pas aux photos." });
+        await data.addDisputeEvidence(d.id, buyer.id, { photo: PHOTO, note: "Détail de la tache" });
+        const n = await ofKind(seller.id, "dispute_evidence");
+        expect(n).toHaveLength(1);
+        expect(n[0].payload).toEqual({ orderId: order.id, disputeId: d.id, itemTitle: "Robe test" });
+        expect(describeNotification(n[0]).href).toBe(`/orders/${order.id}/dispute`);
+        expect(await ofKind(buyer.id, "dispute_evidence")).toEqual([]);
+        await data.addDisputeEvidence(d.id, buyer.id, { photo: PHOTO });
+        expect(await ofKind(seller.id, "dispute_evidence")).toHaveLength(2);
+        await data.addDisputeEvidence(d.id, seller.id, { photo: PHOTO });
+        expect(await ofKind(buyer.id, "dispute_evidence")).toHaveLength(1);
+        expect(await ofKind(seller.id, "dispute_evidence")).toHaveLength(2);
+        // l'assistance ajoute une preuve : les deux parties sont prévenues
+        await data.addDisputeEvidence(d.id, S("user-support-1"), { photo: PHOTO });
+        expect(await ofKind(buyer.id, "dispute_evidence")).toHaveLength(2);
+        expect(await ofKind(seller.id, "dispute_evidence")).toHaveLength(3);
+        // une preuve refusée (litige clos) ne notifie personne
+        await data.resolveDispute(S("user-support-1"), d.id, "refund_buyer", "Remboursement.");
+        expect(code(await rejects(data.addDisputeEvidence(d.id, buyer.id, { photo: PHOTO })))).toBe("INVALID_STATE");
+        expect(await ofKind(seller.id, "dispute_evidence")).toHaveLength(3);
+        await expectSafe(seller.id, [order.id]);
+      });
+
+      // ------------------------------------------------------------------ modération
+      it("annonce masquée par la modération : son vendeur est prévenu, sans détail du signalement ; ni le signaleur, ni l'assistance", async () => {
+        const seller = await signup("0811900141", "Vendeur Masqué");
+        const reporter = await signup("0821900142", "Signaleur Masque");
+        const item = await listing(seller.id, { title: "Montre test" });
+        const r = await data.createReport(reporter.id, { targetType: "item", targetId: item.id, reason: "scam", details: "Demande un paiement hors application, voici son numéro 0899123456." });
+        await data.handleReport(S("user-support-2"), r.id, "hide_item");
+        const n = await ofKind(seller.id, "listing_hidden");
+        expect(n).toHaveLength(1);
+        expect(n[0].payload).toEqual({ itemId: item.id, itemTitle: "Montre test" });
+        const d = describeNotification(n[0]);
+        expect(d.href).toBe(`/items/${item.id}`);
+        expect(`${d.title} ${d.body}`).not.toMatch(/scam|arnaque|paiement|0899|signal/i);
+        expect(await ofKind(reporter.id, "listing_hidden")).toEqual([]);
+        expect(await ofKind(S("user-support-2"), "listing_hidden")).toEqual([]);
+        expect(code(await rejects(data.handleReport(S("user-support-2"), r.id, "hide_item")))).toBe("INVALID_STATE");
+        expect(await ofKind(seller.id, "listing_hidden")).toHaveLength(1);
+        // classé sans suite : le vendeur n'apprend rien
+        const item2 = await listing(seller.id, { title: "Sac test" });
+        const r2 = await data.createReport(reporter.id, { targetType: "item", targetId: item2.id, reason: "other", details: "" });
+        await data.handleReport(S("user-support-2"), r2.id, "dismiss");
+        expect(await ofKind(seller.id, "listing_hidden")).toHaveLength(1);
+        await expectSafe(seller.id);
+      });
+    });
+    // ---- fin agent F
+
+    // ---- agent G : frais de livraison par coursier (qui règle le coursier ?)
+    describe("frais de livraison : le vendeur ou la plateforme règle le coursier", () => {
+      const admin = () => S("user-admin-1");
+      const support = () => S("user-support-1");
+      const COURIER = { courierName: "Papy Moto", courierPhone: "0899000111", trackingRef: "MOTO-42" };
+      const walletOf = async (userId: string, cur: "USD" | "CDF" = "USD") => (await data.getWallet(userId)).balances.find((b) => b.currency === cur)?.availableMinor ?? 0;
+      const sumAll = async () => {
+        expect(await ledgerSum("USD")).toBe(0);
+        expect(await ledgerSum("CDF")).toBe(0);
+      };
+      const payoutFeeOf = (amount: number) => Math.round((amount * FEES.payout.pctBps) / 10_000);
+
+      async function order(phone: string, opts: { currency?: "USD" | "CDF"; priceMinor?: number; step?: "paid" | "in_transit" | "received" } = {}) {
+        const seller = (await data.getUser(S("user-marie")))!;
+        const buyer = await signup(phone, "Acheteur Livraison");
+        const item = await listing(seller.id, { priceMinor: opts.priceMinor ?? 10_000, currency: opts.currency ?? "USD" });
+        const o = await data.createOrder(buyer.id, { itemIds: [item.id], deliveryMethod: "courier", deliveryAreaId: S("area-com-limete"), deliveryLandmark: "Avenue de la Paix, portail bleu" });
+        await data.startPayment(o.id, buyer.id, { method: "mpesa", msisdn: "0821111111", idempotencyKey: `k-${o.id}` });
+        await env.flush();
+        const step = opts.step ?? "paid";
+        if (step !== "paid") {
+          await data.shipOrder(o.id, seller.id, COURIER);
+          await data.markInTransit(o.id, seller.id);
+        }
+        if (step === "received") await data.confirmReceived(o.id, buyer.id);
+        return { seller, buyer, order: o };
+      }
+      /** Libération automatique après la fenêtre de réclamation. */
+      async function releaseAll() {
+        env.advance(FEES.claimWindowMs + 1000);
+        expect(await data.releaseDeliveredOrders()).toBe(1);
+      }
+
+      it("le mode par défaut est « seller » ; seul un administrateur le change, et seulement vers une valeur connue", async () => {
+        expect(await data.getCourierFeeMode()).toBe("seller");
+        const m = await signup("0831000401", "Membre");
+        expect(code(await rejects(data.setCourierFeeMode(m.id, "platform")))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.setCourierFeeMode(support(), "platform")))).toBe("NOT_FOUND"); // l'assistance ne change pas le flux d'argent
+        expect(code(await rejects(data.setCourierFeeMode(admin(), "autre" as never)))).toBe("VALIDATION");
+        expect(await data.setCourierFeeMode(admin(), "platform")).toBe("platform");
+        expect(await data.getCourierFeeMode()).toBe("platform");
+        expect(await data.setCourierFeeMode(admin(), "seller")).toBe("seller");
+      });
+
+      it("mode seller : à la libération, le vendeur reçoit articles + livraison ; shipping_payable reste nul ; grand livre équilibré", async () => {
+        const { seller, buyer, order: o } = await order("+243831000402", { step: "received" });
+        const ship = o.shippingMinor;
+        expect(ship).toBeGreaterThan(0);
+        // avant la libération, l'écran du vendeur annonce déjà ce qu'il recevra
+        expect((await data.getOrder(o.id, seller.id)).shippingToSellerMinor).toBe(ship);
+        expect((await data.getOrder(o.id, buyer.id)).shippingToSellerMinor).toBe(0); // l'acheteur n'a pas à le voir
+        await releaseAll();
+        expect(await walletOf(seller.id)).toBe(10_000 + ship);
+        expect(await account("shipping_payable")).toBe(0);
+        expect(await account("order_escrow")).toBe(0);
+        expect(await account("platform_revenue")).toBe(-o.protectionFeeMinor);
+        expect((await data.getOrder(o.id, seller.id)).shippingToSellerMinor).toBe(ship);
+        // l'historique distingue articles et livraison
+        const labels = (await data.getWallet(seller.id)).entries.filter((e) => e.amountMinor > 0).map((e) => [e.label, e.amountMinor]);
+        expect(labels).toEqual(expect.arrayContaining([["Vente", 10_000], ["Frais de livraison à remettre au coursier", ship]]));
+        expect(await data.listCourierDues(support())).toEqual([]); // rien à régler : le vendeur paie le coursier
+        await sumAll();
+      });
+
+      it("mode seller : les règles de retrait (minimum, frais) s'appliquent normalement au montant total, livraison comprise", async () => {
+        const { seller, order: o } = await order("+243831000403", { step: "received" });
+        await releaseAll();
+        const balance = 10_000 + o.shippingMinor;
+        const base = { currency: "USD" as const, method: "mpesa" as const, msisdn: "0810000001" };
+        // on ne peut pas retirer plus que (solde - frais)
+        expect(code(await rejects(data.requestPayout(seller.id, { ...base, amountMinor: balance, idempotencyKey: "g-1" })))).toBe("INSUFFICIENT_FUNDS");
+        expect(code(await rejects(data.requestPayout(seller.id, { ...base, amountMinor: FEES.payout.minMinor.USD - 1, idempotencyKey: "g-1b" })))).toBe("BELOW_MINIMUM");
+        const amount = balance - payoutFeeOf(balance) - 100;
+        const p = await data.requestPayout(seller.id, { ...base, amountMinor: amount, idempotencyKey: "g-2" });
+        expect(p.feeMinor).toBe(payoutFeeOf(amount));
+        expect(await walletOf(seller.id)).toBe(balance - amount - p.feeMinor);
+        await sumAll();
+      });
+
+      it("mode platform : la livraison reste sur shipping_payable, le vendeur ne reçoit que les articles", async () => {
+        await data.setCourierFeeMode(admin(), "platform");
+        const { seller, order: o } = await order("+243831000404", { step: "received" });
+        expect((await data.getOrder(o.id, seller.id)).shippingToSellerMinor).toBe(0);
+        await releaseAll();
+        expect(await walletOf(seller.id)).toBe(10_000);
+        expect(await account("shipping_payable")).toBe(-o.shippingMinor);
+        expect((await data.getWallet(seller.id)).entries.map((e) => e.label)).toEqual(["Vente"]);
+        const dues = await data.listCourierDues(support());
+        expect(dues).toEqual([expect.objectContaining({ orderId: o.id, amountMinor: o.shippingMinor, currency: "USD", courierName: "Papy Moto" })]);
+        await sumAll();
+      });
+
+      it("mode platform : « marquer comme réglé » solde shipping_payable vers courier_paid, une seule fois, par l'assistance seulement", async () => {
+        await data.setCourierFeeMode(admin(), "platform");
+        const { seller, order: o } = await order("+243831000405", { step: "received" });
+        await releaseAll();
+        const m = await signup("0831000406", "Membre Curieux");
+        expect(code(await rejects(data.settleCourierFee(m.id, o.id)))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.listCourierDues(m.id)))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.settleCourierFee(seller.id, o.id)))).toBe("NOT_FOUND"); // le vendeur ne se règle pas lui-même
+        expect(await data.settleCourierFee(support(), o.id)).toEqual({ orderId: o.id, amountMinor: o.shippingMinor, currency: "USD" });
+        expect(await account("shipping_payable")).toBe(0);
+        expect(await account("courier_paid")).toBe(-o.shippingMinor);
+        expect(await data.listCourierDues(support())).toEqual([]);
+        expect(code(await rejects(data.settleCourierFee(support(), o.id)))).toBe("INVALID_STATE"); // pas de double règlement
+        expect(await account("courier_paid")).toBe(-o.shippingMinor);
+        expect(await walletOf(seller.id)).toBe(10_000); // le portefeuille du vendeur n'a pas bougé
+        await sumAll();
+      });
+
+      it("mode platform : règlement refusé tant que la commande n'est pas libérée", async () => {
+        await data.setCourierFeeMode(admin(), "platform");
+        const a = await order("+243831000407", { step: "received" });
+        expect(code(await rejects(data.settleCourierFee(support(), a.order.id)))).toBe("INVALID_STATE"); // l'argent est encore au séquestre
+        expect(code(await rejects(data.settleCourierFee(support(), "pas-un-uuid")))).toBe("NOT_FOUND");
+        expect(await data.listCourierDues(support())).toEqual([]);
+      });
+
+      it("changer de mode ne touche pas ce qui est déjà libéré, et agit sur la libération suivante", async () => {
+        await data.setCourierFeeMode(admin(), "platform");
+        const a = await order("+243831000408", { step: "received" });
+        await releaseAll();
+        await data.setCourierFeeMode(admin(), "seller");
+        expect(await account("shipping_payable")).toBe(-a.order.shippingMinor); // reste dû, indépendamment du mode
+        expect(await data.listCourierDues(support())).toHaveLength(1);
+        const b = await order("+243831000409", { step: "received" });
+        await releaseAll();
+        expect(await account("shipping_payable")).toBe(-a.order.shippingMinor);
+        expect(await walletOf(b.seller.id)).toBe(20_000 + b.order.shippingMinor);
+        await sumAll();
+      });
+
+      for (const mode of ["seller", "platform"] as const) {
+        describe(`mode ${mode} : aucun frais versé quand la commande n'est pas menée à terme`, () => {
+          beforeEach(async () => {
+            await data.setCourierFeeMode(admin(), mode);
+          });
+          const untouched = async (sellerId: string) => {
+            expect(await walletOf(sellerId)).toBe(0);
+            expect(await account("shipping_payable")).toBe(0);
+            expect(await account("order_escrow")).toBe(0);
+            expect(await account("courier_paid")).toBe(0);
+            expect(await account("platform_revenue")).toBe(0);
+            await sumAll();
+          };
+
+          it("annulation par le vendeur après paiement : l'acheteur est remboursé du total complet", async () => {
+            const { seller, buyer, order: o } = await order("+243831000410");
+            await data.cancelOrder(o.id, seller.id);
+            expect((await data.getOrder(o.id, buyer.id)).status).toBe("cancelled");
+            expect(env.refunds()).toBe(1);
+            expect(await account("psp_clearing")).toBe(0); // encaissé puis remboursé en entier, livraison et protection comprises
+            await untouched(seller.id);
+          });
+
+          it("litige résolu en faveur de l'acheteur : remboursement du total, livraison comprise", async () => {
+            const { seller, buyer, order: o } = await order("+243831000411", { step: "in_transit" });
+            const d = await data.openDispute(o.id, buyer.id, { reason: "not_as_described", description: "Le colis est arrivé abîmé." });
+            await data.resolveDispute(support(), d.id, "refund_buyer");
+            expect((await data.getOrder(o.id, buyer.id)).status).toBe("refunded");
+            expect(env.refunds()).toBe(1);
+            expect(await account("psp_clearing")).toBe(0);
+            await untouched(seller.id);
+          });
+
+          it("colis perdu : signalement, argent gelé, puis remboursement du total sans frais versés", async () => {
+            const { seller, buyer, order: o } = await order("+243831000412", { step: "in_transit" });
+            const d = await data.reportParcelLost(o.id, buyer.id);
+            expect(await walletOf(seller.id)).toBe(0); // gelé : rien n'est versé
+            expect(await account("shipping_payable")).toBe(0);
+            await data.resolveDispute(support(), d.id, "refund_buyer");
+            expect(await account("psp_clearing")).toBe(0);
+            await untouched(seller.id);
+          });
+
+          it("colis jamais livré : remboursement automatique du total au bout du délai", async () => {
+            const { seller, order: o } = await order("+243831000413", { step: "in_transit" });
+            env.advance(FEES.courierStaleMs + 1000);
+            expect(await data.refundStaleCourierOrders()).toBe(1);
+            expect(env.refunds()).toBe(1);
+            expect(await account("psp_clearing")).toBe(0);
+            expect((await data.getOrder(o.id, seller.id)).shippingToSellerMinor).toBe(0);
+            await untouched(seller.id);
+          });
+
+          it("commande jamais remise : remboursement automatique du total", async () => {
+            const { seller } = await order("+243831000414");
+            env.advance(FEES.unhandedOrderMs + 1000);
+            expect(await data.expireStalePaidOrders()).toBe(1);
+            expect(await account("psp_clearing")).toBe(0);
+            await untouched(seller.id);
+          });
+
+          it("litige résolu en faveur du vendeur : mêmes règles que la libération normale", async () => {
+            const { seller, buyer, order: o } = await order("+243831000415", { step: "in_transit" });
+            const d = await data.openDispute(o.id, buyer.id, { reason: "other", description: "Je conteste cette livraison." });
+            await data.resolveDispute(support(), d.id, "release_seller");
+            const ship = o.shippingMinor;
+            expect(await walletOf(seller.id)).toBe(mode === "seller" ? 10_000 + ship : 10_000);
+            expect(await account("shipping_payable")).toBe(mode === "seller" ? 0 : -ship);
+            expect(await account("order_escrow")).toBe(0);
+            expect(env.refunds()).toBe(0);
+            await sumAll();
+          });
+        });
+      }
+
+      it("CDF : même règle, et la somme du grand livre est nulle séparément en USD et en CDF", async () => {
+        const usd = await order("+243831000416", { step: "received" });
+        const cdf = await order("+243831000417", { step: "received", currency: "CDF", priceMinor: 5_000_000 });
+        env.advance(FEES.claimWindowMs + 1000);
+        expect(await data.releaseDeliveredOrders()).toBe(2);
+        expect(cdf.order.shippingMinor).toBe(FEES.shippingGrid.sameCity.CDF);
+        expect(await walletOf(cdf.seller.id, "CDF")).toBe(5_000_000 + cdf.order.shippingMinor);
+        expect(await walletOf(usd.seller.id, "USD")).toBe(10_000 + usd.order.shippingMinor);
+        await sumAll();
+        // mode platform en CDF : dû en francs, jamais mélangé aux dollars
+        await data.setCourierFeeMode(admin(), "platform");
+        const cdf2 = await order("+243831000418", { step: "received", currency: "CDF", priceMinor: 5_000_000 });
+        await releaseAll();
+        expect(await account("shipping_payable", "CDF")).toBe(-cdf2.order.shippingMinor);
+        expect(await account("shipping_payable", "USD")).toBe(0);
+        await data.settleCourierFee(support(), cdf2.order.id);
+        expect(await account("courier_paid", "CDF")).toBe(-cdf2.order.shippingMinor);
+        expect(await account("courier_paid", "USD")).toBe(0);
+        await sumAll();
+      });
+
+      it("remise en main propre : aucun frais de livraison, rien ne change dans les deux modes", async () => {
+        for (const [mode, phone] of [["seller", "+243831000419"], ["platform", "+243831000420"]] as const) {
+          await data.setCourierFeeMode(admin(), mode);
+          const { seller, order: o } = await paidOrder("Acheteur Main", phone);
+          expect(o.shippingMinor).toBe(0);
+          await data.confirmDelivery(o.id, seller.id, deriveHandoverCode(o.id));
+        }
+        expect(await account("shipping_payable")).toBe(0);
+        expect(await data.listCourierDues(support())).toEqual([]);
+        await sumAll();
+      });
+    });
+    // ---- fin agent G
+
+    // ---- agent J : lots (panier d'un même vendeur)
+    describe("lots : plusieurs articles d'un même vendeur, une seule commande", () => {
+      const MARIE = () => S("user-marie");
+      const handDelivery = { deliveryMethod: "hand_delivery" as const };
+      /** n articles du même vendeur (par défaut Marie), chacun à `price`. */
+      async function lot(n: number, price = 2500, over: Record<string, unknown> = {}, sellerId = MARIE()) {
+        const out = [];
+        for (let i = 0; i < n; i++) out.push(await listing(sellerId, { title: `Article de lot ${i + 1}`, priceMinor: price, ...over }));
+        return out;
+      }
+      const statuses = async (ids: string[]) => Promise.all(ids.map(async (id) => (await data.getItem(id))!.status));
+      async function payLot(buyerId: string, orderId: string) {
+        await data.startPayment(orderId, buyerId, { method: "mpesa", msisdn: "0821111111", idempotencyKey: `k-${orderId}` });
+        await env.flush();
+      }
+
+      it("trois articles : une commande, frais de protection calculés sur le total, tous réservés", async () => {
+        const buyer = await signup("0821000401", "Acheteur Lot");
+        const items = await lot(3, 4000);
+        const o = await data.createOrder(buyer.id, { itemIds: items.map((i) => i.id), ...handDelivery });
+        expect(o.itemsMinor).toBe(12_000);
+        expect(o.protectionFeeMinor).toBe(600); // 5 % de 120 $, pas trois fois le minimum
+        expect(o.totalMinor).toBe(12_600);
+        expect([...o.itemIds].sort()).toEqual(items.map((i) => i.id).sort());
+        expect(await statuses(items.map((i) => i.id))).toEqual(["reserved", "reserved", "reserved"]);
+        const v = await data.getOrder(o.id, buyer.id);
+        expect(v.items).toHaveLength(3);
+        expect(v.items.reduce((s, x) => s + x.priceMinor, 0)).toBe(12_000);
+        expect((await data.listMyOrders(buyer.id)).filter((x) => x.id === o.id)).toHaveLength(1);
+      });
+
+      it("le minimum des frais de protection s'applique au TOTAL du lot (pas à chaque article)", async () => {
+        const buyer = await signup("0821000402", "Acheteur Minimum");
+        const items = await lot(3, 100); // 3 x 1 $ : 5 % de 3 $ = 0,15 $ < minimum de 0,50 $
+        const o = await data.createOrder(buyer.id, { itemIds: items.map((i) => i.id), ...handDelivery });
+        expect(o.itemsMinor).toBe(300);
+        expect(o.protectionFeeMinor).toBe(FEES.buyerProtection.fixedMinor.USD);
+        expect(o.totalMinor).toBe(300 + FEES.buyerProtection.fixedMinor.USD);
+      });
+
+      it("un paiement, un code de remise : à la remise les trois articles passent « Vendu », le vendeur reçoit la somme, le grand livre est équilibré", async () => {
+        const buyer = await signup("0821000403", "Acheteur Remise");
+        const items = await lot(3, 4000);
+        const o = await data.createOrder(buyer.id, { itemIds: items.map((i) => i.id), ...handDelivery });
+        await payLot(buyer.id, o.id);
+        expect(await account("order_escrow")).toBe(-12_600);
+        expect(await data.getHandoverCode(o.id, buyer.id)).toBe(deriveHandoverCode(o.id));
+        expect(await statuses(items.map((i) => i.id))).toEqual(["reserved", "reserved", "reserved"]);
+        const done = await data.confirmDelivery(o.id, MARIE(), deriveHandoverCode(o.id));
+        expect(done.status).toBe("completed");
+        expect(await statuses(items.map((i) => i.id))).toEqual(["sold", "sold", "sold"]);
+        expect((await data.getWallet(MARIE())).balances.find((b) => b.currency === "USD")?.availableMinor).toBe(12_000);
+        expect(await account("order_escrow")).toBe(0);
+        expect(await ledgerSum("USD")).toBe(0);
+        // un seul avis par commande, quel que soit le nombre d'articles
+        await data.createReview(o.id, buyer.id, { rating: 5, comment: "Lot complet." });
+        expect(code(await rejects(data.createReview(o.id, buyer.id, { rating: 4, comment: "" })))).toBe("REVIEW_EXISTS");
+      });
+
+      it("refus de deux devises : 422 « Choisis des articles dans la même devise », rien n'est réservé", async () => {
+        const buyer = await signup("0821000404", "Acheteur Devises");
+        const usd = await lot(2, 2500);
+        const cdf = await lot(1, 3_500_000, { currency: "CDF" });
+        const e = await rejects(data.createOrder(buyer.id, { itemIds: [...usd, ...cdf].map((i) => i.id), ...handDelivery }));
+        expect(e.code).toBe("MIXED_CURRENCY");
+        expect(e.status).toBe(422);
+        expect(e.message).toBe("Choisis des articles dans la même devise.");
+        expect(await statuses([...usd, ...cdf].map((i) => i.id))).toEqual(["active", "active", "active"]);
+      });
+
+      it("refus de deux vendeurs : rien n'est réservé", async () => {
+        const buyer = await signup("0821000405", "Acheteur Vendeurs");
+        const a = (await lot(1))[0];
+        const b = (await lot(1, 2500, {}, S("user-patrick")))[0];
+        const e = await rejects(data.createOrder(buyer.id, { itemIds: [a.id, b.id], ...handDelivery }));
+        expect(e.code).toBe("MIXED_SELLERS");
+        expect(await statuses([a.id, b.id])).toEqual(["active", "active"]);
+      });
+
+      it("un article réservé ou vendu dans le lot : la commande échoue en entier, nomme les articles, ne réserve aucun autre", async () => {
+        const buyer = await signup("0821000406", "Acheteur Entier");
+        const rival = await signup("0821000407", "Acheteur Rival");
+        const [a, b, c] = await lot(3, 2000);
+        await data.createOrder(rival.id, { itemIds: [b.id], ...handDelivery }); // b est réservé par un autre
+        const e = await rejects(data.createOrder(buyer.id, { itemIds: [a.id, b.id, c.id], ...handDelivery }));
+        expect(e.code).toBe("ITEM_UNAVAILABLE");
+        expect(e.status).toBe(409);
+        expect(e.message).toContain(b.title);
+        expect(e.details?.itemIds).toBe(b.id);
+        expect(await statuses([a.id, b.id, c.id])).toEqual(["active", "reserved", "active"]);
+        expect(await data.listMyOrders(buyer.id)).toEqual([]);
+      });
+
+      it("le vendeur ne peut pas acheter son propre lot", async () => {
+        const items = await lot(2);
+        expect(code(await rejects(data.createOrder(MARIE(), { itemIds: items.map((i) => i.id), ...handDelivery })))).toBe("SELF_PURCHASE");
+        expect(await statuses(items.map((i) => i.id))).toEqual(["active", "active"]);
+      });
+
+      it("plafond de valeur par commande appliqué au TOTAL : 3 articles de 400 $ dépassent 1 000 $", async () => {
+        const buyer = await signup("0821000408", "Acheteur Plafond");
+        const items = await lot(3, 40_000);
+        const e = await rejects(data.createOrder(buyer.id, { itemIds: items.map((i) => i.id), ...handDelivery }));
+        expect(e.code).toBe("ORDER_TOO_LARGE");
+        expect(e.status).toBe(422);
+        expect(await statuses(items.map((i) => i.id))).toEqual(["active", "active", "active"]);
+        // deux articles (800 $) passent ; un article au plafond exact passe aussi
+        const ok = await data.createOrder(buyer.id, { itemIds: items.slice(0, 2).map((i) => i.id), ...handDelivery });
+        expect(ok.itemsMinor).toBe(80_000);
+        const top = (await lot(1, FEES.maxItemValueUsdMinor))[0];
+        expect((await data.createOrder(buyer.id, { itemIds: [top.id], ...handDelivery })).itemsMinor).toBe(FEES.maxItemValueUsdMinor);
+      });
+
+      it("plafond appliqué aussi en francs : le total converti est comparé au maximum", async () => {
+        const buyer = await signup("0821000409", "Acheteur Francs");
+        const items = await lot(3, 100_000_000, { currency: "CDF" }); // 1 000 000 FC chacun, soit environ 357 $ : trois dépassent 1 000 $
+        expect(code(await rejects(data.createOrder(buyer.id, { itemIds: items.map((i) => i.id), ...handDelivery })))).toBe("ORDER_TOO_LARGE");
+        const two = await data.createOrder(buyer.id, { itemIds: items.slice(0, 2).map((i) => i.id), ...handDelivery });
+        expect(two.currency).toBe("CDF");
+      });
+
+      it("annulation avant paiement et expiration libèrent TOUS les articles", async () => {
+        const buyer = await signup("0821000410", "Acheteur Libère");
+        const items = await lot(3);
+        const o1 = await data.createOrder(buyer.id, { itemIds: items.map((i) => i.id), ...handDelivery });
+        await data.cancelOrder(o1.id, buyer.id);
+        expect(await statuses(items.map((i) => i.id))).toEqual(["active", "active", "active"]);
+        const o2 = await data.createOrder(buyer.id, { itemIds: items.map((i) => i.id), ...handDelivery });
+        env.advance(FEES.orderPaymentTtlMs + 1);
+        expect((await data.getOrder(o2.id, buyer.id)).status).toBe("expired");
+        expect(await statuses(items.map((i) => i.id))).toEqual(["active", "active", "active"]);
+        // ils peuvent être recommandés immédiatement
+        const o3 = await data.createOrder(buyer.id, { itemIds: items.map((i) => i.id), ...handDelivery });
+        expect(o3.status).toBe("pending_payment");
+      });
+
+      it("annulation par le vendeur après paiement : remboursement intégral, tous les articles remis en vente, grand livre équilibré", async () => {
+        const buyer = await signup("0821000411", "Acheteur Rembourse");
+        const items = await lot(3, 4000);
+        const o = await data.createOrder(buyer.id, { itemIds: items.map((i) => i.id), ...handDelivery });
+        await payLot(buyer.id, o.id);
+        await data.cancelOrder(o.id, MARIE());
+        expect((await data.getOrder(o.id, buyer.id)).status).toBe("cancelled");
+        expect(await statuses(items.map((i) => i.id))).toEqual(["active", "active", "active"]);
+        expect(await account("order_escrow")).toBe(0);
+        expect(await account("seller_available")).toBe(0);
+        expect(await ledgerSum("USD")).toBe(0);
+        expect(env.refunds()).toBe(1);
+      });
+
+      it("un seul litige pour le lot : remboursement libère les trois articles, versement au vendeur les vend tous ; grand livre équilibré", async () => {
+        const buyer = await signup("0821000412", "Acheteur Litige");
+        const items = await lot(3, 4000);
+        const o = await data.createOrder(buyer.id, { itemIds: items.map((i) => i.id), ...handDelivery });
+        await payLot(buyer.id, o.id);
+        const d = await data.openDispute(o.id, buyer.id, { reason: "not_as_described", description: "Deux des trois articles sont abîmés." });
+        expect(code(await rejects(data.openDispute(o.id, MARIE(), { reason: "other", description: "Contestation du vendeur." })))).toBe("DISPUTE_EXISTS");
+        await data.resolveDispute(S("user-support-1"), d.id, "refund_buyer");
+        expect(await statuses(items.map((i) => i.id))).toEqual(["active", "active", "active"]);
+        expect(await account("order_escrow")).toBe(0);
+        expect(await ledgerSum("USD")).toBe(0);
+
+        const buyer2 = await signup("0821000413", "Acheteur Litige 2");
+        const o2 = await data.createOrder(buyer2.id, { itemIds: items.map((i) => i.id), ...handDelivery });
+        await payLot(buyer2.id, o2.id);
+        const d2 = await data.openDispute(o2.id, buyer2.id, { reason: "not_received", description: "Le vendeur ne s'est pas présenté." });
+        await data.resolveDispute(S("user-support-1"), d2.id, "release_seller");
+        expect(await statuses(items.map((i) => i.id))).toEqual(["sold", "sold", "sold"]);
+        expect(await account("order_escrow")).toBe(0);
+        expect(await ledgerSum("USD")).toBe(0);
+      });
+
+      it("commande payée jamais remise : le remboursement automatique libère tous les articles", async () => {
+        const buyer = await signup("0821000414", "Acheteur Oublie");
+        const items = await lot(2, 4000);
+        const o = await data.createOrder(buyer.id, { itemIds: items.map((i) => i.id), ...handDelivery });
+        await payLot(buyer.id, o.id);
+        env.advance(FEES.unhandedOrderMs + 1);
+        expect(await data.expireStalePaidOrders()).toBe(1);
+        expect(await statuses(items.map((i) => i.id))).toEqual(["active", "active"]);
+        expect(await ledgerSum("USD")).toBe(0);
+      });
+
+      it("livraison par coursier : frais calculés UNE fois pour la commande, égaux à ceux d'un article seul", async () => {
+        const buyer = await signup("0821000415", "Acheteur Coursier Lot");
+        const items = await lot(3, 3000);
+        const delivery = { deliveryMethod: "courier" as const, deliveryAreaId: S("area-com-limete"), deliveryLandmark: "Avenue de la Paix, portail bleu" };
+        const o = await data.createOrder(buyer.id, { itemIds: items.map((i) => i.id), ...delivery });
+        const single = await data.createOrder(buyer.id, { itemIds: (await lot(1, 3000)).map((i) => i.id), ...delivery });
+        expect(o.shippingMinor).toBeGreaterThan(0);
+        expect(o.shippingMinor).toBe(single.shippingMinor);
+        expect(o.totalMinor).toBe(o.itemsMinor + o.protectionFeeMinor + o.shippingMinor);
+        await payLot(buyer.id, o.id);
+        expect(await ledgerSum("USD")).toBe(0);
+        await data.shipOrder(o.id, MARIE(), { courierName: "Papy Moto", courierPhone: "0899000111" });
+        await data.confirmReceived(o.id, buyer.id);
+        env.advance(FEES.claimWindowMs + 1);
+        expect(await data.releaseDeliveredOrders()).toBe(1);
+        expect(await statuses(items.map((i) => i.id))).toEqual(["sold", "sold", "sold"]);
+        expect(await account("order_escrow")).toBe(0);
+        expect(await ledgerSum("USD")).toBe(0);
+      });
+
+      describe("panier", () => {
+        it("un panier vide est vide ; ajout, doublon refusé, retrait idempotent", async () => {
+          const buyer = await signup("0821000420", "Acheteur Panier");
+          expect(await data.getCart(buyer.id)).toEqual({ count: 0, lots: [] });
+          const [a, b] = await lot(2, 2000);
+          const c1 = await data.addToCart(buyer.id, a.id);
+          expect(c1.count).toBe(1);
+          expect(code(await rejects(data.addToCart(buyer.id, a.id)))).toBe("ALREADY_IN_CART");
+          const c2 = await data.addToCart(buyer.id, b.id);
+          expect(c2.lots).toHaveLength(1);
+          expect(c2.lots[0]).toMatchObject({ sellerId: MARIE(), currency: "USD", itemsMinor: 4000, protectionFeeMinor: protectionFee(4000, "USD"), totalMinor: 4000 + protectionFee(4000, "USD"), overLimit: false });
+          expect(c2.lots[0].lines.map((l) => l.itemId).sort()).toEqual([a.id, b.id].sort());
+          expect(c2.lots[0].quoteItemId).toBe([a.id, b.id].sort()[0]);
+          const c3 = await data.removeFromCart(buyer.id, a.id);
+          expect(c3.count).toBe(1);
+          expect((await data.removeFromCart(buyer.id, a.id)).count).toBe(1); // absent : pas d'erreur
+          expect(await data.getCart(S("user-patrick"))).toEqual({ count: 0, lots: [] }); // le panier d'un autre membre n'est pas le mien
+        });
+
+        it("refuse son propre article, un article vendu ou réservé, un article inconnu", async () => {
+          const buyer = await signup("0821000421", "Acheteur Refus");
+          const other = await signup("0821000422", "Acheteur Autre");
+          const mine = (await lot(1, 2000, {}, buyer.id))[0];
+          expect(code(await rejects(data.addToCart(buyer.id, mine.id)))).toBe("SELF_PURCHASE");
+          const [r, s] = await lot(2, 2000);
+          await data.createOrder(other.id, { itemIds: [r.id], ...handDelivery });
+          expect(code(await rejects(data.addToCart(buyer.id, r.id)))).toBe("ITEM_UNAVAILABLE");
+          const o = await data.createOrder(other.id, { itemIds: [s.id], ...handDelivery });
+          await payLot(other.id, o.id);
+          await data.confirmDelivery(o.id, MARIE(), deriveHandoverCode(o.id));
+          expect((await rejects(data.addToCart(buyer.id, s.id))).message).toMatch(/vendu/);
+          expect(code(await rejects(data.addToCart(buyer.id, "00000000-0000-4000-8000-000000000000")))).toBe("NOT_FOUND");
+          expect((await data.getCart(buyer.id)).count).toBe(0);
+        });
+
+        it("20 articles au plus", async () => {
+          const buyer = await signup("0821000423", "Acheteur Plein");
+          const items = await lot(21, 500);
+          for (const it of items.slice(0, 20)) await data.addToCart(buyer.id, it.id);
+          expect(code(await rejects(data.addToCart(buyer.id, items[20].id)))).toBe("CART_FULL");
+          expect((await data.getCart(buyer.id)).count).toBe(20);
+          // et pas plus de 20 articles dans une commande
+          expect(code(await rejects(data.createOrder(buyer.id, { itemIds: items.map((i) => i.id), ...handDelivery })))).toBe("VALIDATION");
+        });
+
+        it("un lot par vendeur ET par devise ; les frais sont ceux du lot, jamais mélangés", async () => {
+          const buyer = await signup("0821000424", "Acheteur Groupes");
+          const [a] = await lot(1, 2000);
+          const [b] = await lot(1, 3_500_000, { currency: "CDF" });
+          const [c] = await lot(1, 1500, {}, S("user-patrick"));
+          for (const it of [a, b, c]) await data.addToCart(buyer.id, it.id);
+          const cart = await data.getCart(buyer.id);
+          expect(cart.count).toBe(3);
+          expect(cart.lots.map((l) => [l.sellerId, l.currency]).sort()).toEqual([[MARIE(), "CDF"], [MARIE(), "USD"], [S("user-patrick"), "USD"]].sort());
+          const cdf = cart.lots.find((l) => l.currency === "CDF")!;
+          expect(cdf.protectionFeeMinor).toBe(protectionFee(3_500_000, "CDF"));
+        });
+
+        it("un article devenu indisponible est signalé et exclu du total ; la commande refuse tout le lot et nomme l'article", async () => {
+          const buyer = await signup("0821000425", "Acheteur Signalé");
+          const rival = await signup("0821000426", "Acheteur Concurrent");
+          const [a, b, c] = await lot(3, 2000);
+          for (const it of [a, b, c]) await data.addToCart(buyer.id, it.id);
+          await data.createOrder(rival.id, { itemIds: [b.id], ...handDelivery });
+          const cart = await data.getCart(buyer.id);
+          const l = cart.lots[0];
+          expect(l.lines.find((x) => x.itemId === b.id)).toMatchObject({ available: false, reason: "reserved" });
+          expect(l.itemsMinor).toBe(4000);
+          expect(l.orderableItemIds.sort()).toEqual([a.id, c.id].sort());
+          const e = await rejects(data.createOrder(buyer.id, { itemIds: [a.id, b.id, c.id], ...handDelivery }));
+          expect(e.code).toBe("ITEM_UNAVAILABLE");
+          expect(e.message).toContain(b.title);
+          expect(await statuses([a.id, c.id])).toEqual(["active", "active"]);
+          // le retrait de l'article puis la commande du reste réussissent
+          await data.removeFromCart(buyer.id, b.id);
+          const ok = await data.createOrder(buyer.id, { itemIds: (await data.getCart(buyer.id)).lots[0].orderableItemIds, ...handDelivery });
+          expect(ok.itemsMinor).toBe(4000);
+        });
+
+        it("commander un lot vide le panier de ces articles seulement ; un article libéré peut être ajouté de nouveau", async () => {
+          const buyer = await signup("0821000427", "Acheteur Vide");
+          const [a, b] = await lot(2, 2000);
+          const [p] = await lot(1, 1500, {}, S("user-patrick"));
+          for (const it of [a, b, p]) await data.addToCart(buyer.id, it.id);
+          const o = await data.createOrder(buyer.id, { itemIds: [a.id, b.id], ...handDelivery });
+          const left = await data.getCart(buyer.id);
+          expect(left.count).toBe(1);
+          expect(left.lots[0].sellerId).toBe(S("user-patrick"));
+          await data.cancelOrder(o.id, buyer.id);
+          expect((await data.addToCart(buyer.id, a.id)).count).toBe(2);
+        });
+
+        it("suppression du compte : le panier disparaît", async () => {
+          const buyer = await signup("0821000428", "Acheteur Parti");
+          const [a] = await lot(1, 2000);
+          await data.addToCart(buyer.id, a.id);
+          await data.deleteAccount(buyer.id);
+          expect(code(await rejects(data.addToCart(buyer.id, a.id)))).toBe("NOT_FOUND");
+          expect((await data.getCart(buyer.id)).count).toBe(0);
+        });
+
+        it("annonce retirée par son vendeur : signalée « plus disponible » dans le panier", async () => {
+          const buyer = await signup("0821000429", "Acheteur Retrait");
+          const seller = await signup("0811000430", "Vendeur Partant");
+          const [a, b] = await lot(2, 2000, {}, seller.id);
+          await data.addToCart(buyer.id, a.id);
+          await data.addToCart(buyer.id, b.id);
+          await data.deleteAccount(seller.id);
+          const cart = await data.getCart(buyer.id);
+          expect(cart.lots[0].lines.every((x) => !x.available && x.reason === "unavailable")).toBe(true);
+          expect(cart.lots[0].orderableItemIds).toEqual([]);
+        });
+      });
+    });
+    // ---- fin agent J
+
+    // ---- agent H : découverte (favoris, tri, marques et tailles suivies)
+    describe("découverte : favoris, tri, suivis", () => {
+      const moderator = () => S("user-support-2");
+      /** Annonces d'un test, isolées des données de démonstration par un mot-clé unique. */
+      const word = "zorglub";
+
+      describe("favoris", () => {
+        it("idempotent : une seule ligne par membre, compteur exact, état propre à chaque membre", async () => {
+          const seller = await signup("0811000401", "Vendeuse Fav");
+          const a = await signup("0821000402", "Membre Fav A");
+          const b = await signup("0821000403", "Membre Fav B");
+          const item = await listing(seller.id, { title: `Robe ${word} un` });
+          expect(await data.addFavourite(a.id, item.id)).toEqual({ favourited: true, favouriteCount: 1 });
+          expect(await data.addFavourite(a.id, item.id)).toEqual({ favourited: true, favouriteCount: 1 });
+          expect((await data.getItem(item.id, a.id))).toMatchObject({ favourited: true, favouriteCount: 1, own: false });
+          expect((await data.getItem(item.id, b.id))).toMatchObject({ favourited: false, favouriteCount: 1 });
+          expect((await data.getItem(item.id, null))).toMatchObject({ favourited: false, favouriteCount: 1 });
+          expect((await data.getItem(item.id, seller.id))).toMatchObject({ favourited: false, own: true });
+          expect(await data.addFavourite(b.id, item.id)).toEqual({ favourited: true, favouriteCount: 2 });
+          const card = (viewerId: string | null) => data.listItems({ q: word, viewerId }).then((l) => l.find((c) => c.id === item.id)!);
+          expect(await card(a.id)).toMatchObject({ favourited: true, favouriteCount: 2, own: false });
+          expect(await card(null)).toMatchObject({ favourited: false, favouriteCount: 2 });
+          expect(await card(seller.id)).toMatchObject({ own: true });
+          expect(await data.removeFavourite(a.id, item.id)).toEqual({ favourited: false, favouriteCount: 1 });
+          expect(await data.removeFavourite(a.id, item.id)).toEqual({ favourited: false, favouriteCount: 1 }); // idempotent
+          expect((await card(a.id)).favourited).toBe(false);
+        });
+
+        it("sa propre annonce : 409 ; annonce inconnue ou identifiant invalide : 404", async () => {
+          const seller = await signup("0811000404", "Vendeur Propre");
+          const item = await listing(seller.id);
+          const e = await rejects(data.addFavourite(seller.id, item.id));
+          expect([e.code, e.status]).toEqual(["CANNOT_FAVOURITE_OWN", 409]);
+          expect(code(await rejects(data.addFavourite(seller.id, S("annonce-inconnue"))))).toBe("NOT_FOUND");
+          expect(code(await rejects(data.addFavourite(seller.id, "pas-un-uuid")))).toBe("NOT_FOUND");
+          expect(await data.listFavourites(seller.id)).toEqual([]);
+        });
+
+        it("un membre ne voit que SES favoris, les plus récents d'abord", async () => {
+          const seller = await signup("0811000405", "Vendeuse Liste");
+          const a = await signup("0821000406", "Lectrice A");
+          const b = await signup("0821000407", "Lecteur B");
+          const i1 = await listing(seller.id, { title: "Robe liste 1" });
+          const i2 = await listing(seller.id, { title: "Robe liste 2" });
+          const i3 = await listing(seller.id, { title: "Robe liste 3" });
+          await data.addFavourite(a.id, i1.id);
+          env.advance(1000);
+          await data.addFavourite(a.id, i3.id);
+          env.advance(1000);
+          await data.addFavourite(b.id, i2.id);
+          expect((await data.listFavourites(a.id)).map((c) => c.id)).toEqual([i3.id, i1.id]);
+          expect((await data.listFavourites(b.id)).map((c) => c.id)).toEqual([i2.id]);
+          expect((await data.listFavourites(a.id)).every((c) => c.favourited)).toBe(true);
+          expect(await data.listFavourites(seller.id)).toEqual([]);
+        });
+
+        it("annonce masquée par la modération : disparaît des favoris, ne peut plus être ajoutée, mais se retire quand même", async () => {
+          const seller = await signup("0811000408", "Vendeur Masqué");
+          const a = await signup("0821000409", "Lectrice Masque");
+          const reporter = await signup("0821000410", "Signaleuse Masque");
+          const keep = await listing(seller.id, { title: "Robe gardée" });
+          const hide = await listing(seller.id, { title: "Robe masquée" });
+          await data.addFavourite(a.id, keep.id);
+          await data.addFavourite(a.id, hide.id);
+          expect((await data.listFavourites(a.id)).map((c) => c.id).sort()).toEqual([keep.id, hide.id].sort());
+          const r = await data.createReport(reporter.id, { targetType: "item", targetId: hide.id, reason: "prohibited", details: "" });
+          await data.handleReport(moderator(), r.id, "hide_item");
+          expect((await data.listFavourites(a.id)).map((c) => c.id)).toEqual([keep.id]);
+          expect(code(await rejects(data.addFavourite(reporter.id, hide.id)))).toBe("NOT_FOUND");
+          expect((await data.removeFavourite(a.id, hide.id)).favourited).toBe(false);
+        });
+
+        it("annonce vendue : reste dans les favoris, avec son statut", async () => {
+          const { seller, item, order } = await paidOrder("Acheteur Fav", "+243821000411");
+          const fan = await signup("0821000412", "Admiratrice");
+          await data.addFavourite(fan.id, item.id);
+          expect((await data.listFavourites(fan.id))[0]).toMatchObject({ id: item.id, status: "reserved" });
+          await data.confirmDelivery(order.id, seller.id, deriveHandoverCode(order.id));
+          expect((await data.listFavourites(fan.id))[0]).toMatchObject({ id: item.id, status: "sold" });
+        });
+
+        it("suppression de compte : les favoris du membre disparaissent et le compteur des annonces redescend", async () => {
+          const seller = await signup("0811000413", "Vendeuse Compteur");
+          const leaver = await signup("0821000414", "Partante");
+          const stayer = await signup("0821000415", "Restante");
+          const item = await listing(seller.id);
+          await data.addFavourite(leaver.id, item.id);
+          await data.addFavourite(stayer.id, item.id);
+          expect((await data.getItem(item.id))!.favouriteCount).toBe(2);
+          await data.deleteAccount(leaver.id);
+          expect((await data.getItem(item.id))!.favouriteCount).toBe(1);
+          expect(await data.listFavourites(leaver.id)).toEqual([]);
+          expect((await data.listFavourites(stayer.id)).map((c) => c.id)).toEqual([item.id]);
+        });
+      });
+
+      describe("tri de la recherche", () => {
+        // Prix en dollars équivalents (1 USD = 2 800 FC) : 8 $ < 12,50 $ (35 000 FC) < 15 $ < 20 $ (56 000 FC) < 25 $.
+        async function mixed() {
+          const seller = await signup("0811000420", "Vendeur Tri");
+          const make = async (n: string, priceMinor: number, currency: "USD" | "CDF") => {
+            env.advance(1000);
+            return (await listing(seller.id, { title: `Robe ${word} ${n}`, priceMinor, currency })).id;
+          };
+          const p15 = await make("quinze", 1500, "USD");
+          const p12 = await make("douze", 3_500_000, "CDF");
+          const p8 = await make("huit", 800, "USD");
+          const p20 = await make("vingt", 5_600_000, "CDF");
+          const p25 = await make("vingt-cinq", 2500, "USD");
+          return { seller, p15, p12, p8, p20, p25 };
+        }
+        const ids = async (sort?: "recent" | "price_asc" | "price_desc" | "favourites", extra: Record<string, unknown> = {}) =>
+          (await data.listItems({ q: word, sort, ...extra })).map((c) => c.id);
+
+        it("prix croissant et décroissant : ordre exact, USD et CDF mélangés", async () => {
+          const m = await mixed();
+          expect(await ids("price_asc")).toEqual([m.p8, m.p12, m.p15, m.p20, m.p25]);
+          expect(await ids("price_desc")).toEqual([m.p25, m.p20, m.p15, m.p12, m.p8]);
+        });
+
+        it("plus récent est le tri par défaut ; un tri inconnu côté appelant (undefined) vaut le défaut", async () => {
+          const m = await mixed();
+          const newestFirst = [m.p25, m.p20, m.p8, m.p12, m.p15];
+          expect(await ids()).toEqual(newestFirst);
+          expect(await ids("recent")).toEqual(newestFirst);
+        });
+
+        it("les plus aimés d'abord, puis les plus récents", async () => {
+          const m = await mixed();
+          const fans = [await signup("0821000421", "Fan Un"), await signup("0821000422", "Fan Deux"), await signup("0821000423", "Fan Trois")];
+          for (const f of fans) await data.addFavourite(f.id, m.p12);
+          await data.addFavourite(fans[0].id, m.p8);
+          await data.addFavourite(fans[1].id, m.p8);
+          await data.addFavourite(fans[0].id, m.p25);
+          // 3 favoris : douze ; 2 : huit ; 1 : vingt-cinq ; 0 : vingt puis quinze (le plus récent d'abord)
+          expect(await ids("favourites")).toEqual([m.p12, m.p8, m.p25, m.p20, m.p15]);
+        });
+
+        it("pagination stable : pages successives = liste complète, appels répétés identiques, ex æquo départagés par date puis identifiant", async () => {
+          const seller = await signup("0811000424", "Vendeur Stable");
+          // Trois annonces au même prix ET à la même seconde : seul l'identifiant les départage.
+          const same = [] as string[];
+          for (let n = 0; n < 3; n++) same.push((await listing(seller.id, { title: `Robe ${word} jumelle ${n}`, priceMinor: 1000 })).id);
+          env.advance(1000);
+          const newer = (await listing(seller.id, { title: `Robe ${word} jumelle récente`, priceMinor: 1000 })).id;
+          for (const sort of ["recent", "price_asc", "price_desc", "favourites"] as const) {
+            const full = await ids(sort);
+            expect(full).toHaveLength(4);
+            expect(full[0]).toBe(newer); // même prix, même nombre de favoris : le plus récent d'abord
+            expect(full.slice(1)).toEqual([...same].sort().reverse()); // puis l'identifiant décroissant
+            expect(await ids(sort)).toEqual(full);
+            const pages = [...(await ids(sort, { limit: 2, offset: 0 })), ...(await ids(sort, { limit: 2, offset: 2 }))];
+            expect(pages).toEqual(full);
+          }
+        });
+
+        it("le tri se combine aux filtres (prix maximum en dollars) et à l'état favori du membre", async () => {
+          const m = await mixed();
+          const fan = await signup("0821000425", "Fan Filtre");
+          await data.addFavourite(fan.id, m.p12);
+          const list = await data.listItems({ q: word, sort: "price_desc", maxPriceUsdMinor: 1600, viewerId: fan.id });
+          expect(list.map((c) => c.id)).toEqual([m.p15, m.p12, m.p8]);
+          expect(list.map((c) => c.favourited)).toEqual([false, true, false]);
+        });
+      });
+
+      describe("marques et tailles suivies", () => {
+        it("ajout idempotent sans accent ni casse, texte nettoyé, retrait idempotent", async () => {
+          const me = await signup("0821000430", "Suiveuse");
+          expect(await data.getFollows(me.id)).toEqual({ brands: [], sizes: [] });
+          await data.addFollow(me.id, "brand", "  Zéphyr \u0000 Paris ");
+          await data.addFollow(me.id, "brand", "zephyr paris");
+          const f = await data.addFollow(me.id, "brand", "ZÉPHYR   PARIS");
+          expect(f).toEqual({ brands: ["Zéphyr Paris"], sizes: [] });
+          await data.addFollow(me.id, "size", "m");
+          expect(await data.getFollows(me.id)).toEqual({ brands: ["Zéphyr Paris"], sizes: ["m"] });
+          await data.removeFollow(me.id, "brand", "ZEPHYR paris");
+          expect(await data.removeFollow(me.id, "brand", "ZEPHYR paris")).toEqual({ brands: [], sizes: ["m"] });
+        });
+
+        it("vide ou trop long : 422 ; 10 marques et 10 tailles au plus, indépendamment, un retrait libère une place", async () => {
+          const me = await signup("0821000431", "Suiveuse Limite");
+          expect(code(await rejects(data.addFollow(me.id, "brand", "   ")))).toBe("VALIDATION");
+          expect(code(await rejects(data.addFollow(me.id, "brand", "x".repeat(41))))).toBe("VALIDATION");
+          expect(code(await rejects(data.addFollow(me.id, "size", "x".repeat(21))))).toBe("VALIDATION");
+          for (let i = 1; i <= 10; i++) await data.addFollow(me.id, "brand", `Marque ${i}`);
+          const e = await rejects(data.addFollow(me.id, "brand", "Marque 11"));
+          expect([e.code, e.status]).toEqual(["FOLLOW_LIMIT", 422]);
+          await data.addFollow(me.id, "brand", "marque 3"); // déjà suivie : pas un nouvel ajout, donc pas de refus
+          for (let i = 1; i <= 10; i++) await data.addFollow(me.id, "size", `T${i}`); // les tailles ont leur propre plafond
+          expect(code(await rejects(data.addFollow(me.id, "size", "T11")))).toBe("FOLLOW_LIMIT");
+          await data.removeFollow(me.id, "brand", "Marque 1");
+          expect((await data.addFollow(me.id, "brand", "Marque 11")).brands).toHaveLength(10);
+        });
+
+        it("« Pour toi » : marque OU taille, sans accent ni casse, jamais mes annonces ni les annonces inactives, 12 au plus, récentes d'abord", async () => {
+          const seller = await signup("0811000432", "Vendeuse Pour Toi");
+          const me = await signup("0821000433", "Lectrice Pour Toi");
+          expect(await data.listForYou(me.id)).toEqual([]); // rien de suivi
+          const mk = async (title: string, over: Record<string, unknown>, who = seller.id) => {
+            env.advance(1000);
+            return (await listing(who, { title, ...over })).id;
+          };
+          const byBrand = await mk("Robe marque", { brand: "Zéphyrine", sizeLabel: "XL" });
+          const bySize = await mk("Robe taille", { brand: "Autre", sizeLabel: "zq9" });
+          const none = await mk("Robe hors suivi", { brand: "Autre", sizeLabel: "S" });
+          const mine = await mk("Ma robe", { brand: "Zephyrine", sizeLabel: "ZQ9" }, me.id);
+          const hiddenRep = await signup("0821000434", "Signaleuse Pour Toi");
+          const hidden = await mk("Robe masquée", { brand: "ZEPHYRINE" });
+          await data.handleReport(moderator(), (await data.createReport(hiddenRep.id, { targetType: "item", targetId: hidden, reason: "prohibited", details: "" })).id, "hide_item");
+          await data.addFollow(me.id, "brand", "zephyrine");
+          await data.addFollow(me.id, "size", "ZQ9 ");
+          const feed = (await data.listForYou(me.id)).map((c) => c.id);
+          expect(feed).toEqual([bySize, byBrand]); // plus récent d'abord
+          expect(feed).not.toContain(none);
+          expect(feed).not.toContain(mine);
+          expect(feed).not.toContain(hidden);
+          // Les suivis d'un autre membre ne changent rien.
+          expect(await data.listForYou(seller.id)).toEqual([]);
+          // Plafond de 12.
+          for (let i = 0; i < 14; i++) await mk(`Robe suivie ${i}`, { brand: "Zephyrine" });
+          const many = await data.listForYou(me.id);
+          expect(many).toHaveLength(12);
+          expect(many.every((c) => c.status === "active" && !c.own)).toBe(true);
+        });
+
+        it("suppression de compte : les suivis disparaissent", async () => {
+          const me = await signup("0821000435", "Suiveuse Partante");
+          await data.addFollow(me.id, "brand", "Nike");
+          await data.addFollow(me.id, "size", "42");
+          await data.deleteAccount(me.id);
+          expect(await data.getFollows(me.id)).toEqual({ brands: [], sizes: [] });
+          expect(await data.listForYou(me.id)).toEqual([]);
+        });
+      });
+    });
+    // ---- fin agent H
+  });
+}
