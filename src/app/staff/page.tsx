@@ -56,6 +56,7 @@ export default async function StaffPage() {
             </ul>
           )}
         </section>
+        {canDispute && <p><Link href="/staff/courier-fees">Frais de livraison à régler</Link></p>}
         <p><Link href="/staff/rules">Règles d&apos;articles interdits</Link></p>
       </div>
     </div>

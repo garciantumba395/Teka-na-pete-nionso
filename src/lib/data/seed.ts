@@ -82,6 +82,9 @@ export const STAFF_DEMO_PHONES = [
   ...Array.from({ length: 16 }, (_, i) => `08999998${String(10 + i)}`),
 ];
 
+/** Comptes administrateur de DÉMONSTRATION (changent le réglage « qui règle le coursier »). Plusieurs, pour la même raison que l'assistance : 3 codes par numéro et par 10 minutes. */
+export const ADMIN_DEMO_PHONES = ["0899999900", "0899999901", "0899999902", "0899999903", "0899999904"];
+
 export function seedUsers(now: number): User[] {
   const base = { areaId: seedId("area-com-gombe"), verificationLevel: "phone" as const, createdAt: now - 90 * 86400_000 };
   return [
@@ -89,6 +92,7 @@ export function seedUsers(now: number): User[] {
     { ...base, id: seedId("user-patrick"), phone: SEED_PHONES.patrick, displayName: "Patrick M.", bio: "", ratingAvg: null, ratingCount: 0, areaId: seedId("area-com-lemba") },
     // Compte de l'équipe d'assistance, DÉMONSTRATION seulement (le seed de démonstration est interdit en production).
     ...STAFF_DEMO_PHONES.map((p, i) => ({ ...base, id: seedId(`user-support-${i + 1}`), phone: `+243${p.slice(1)}`, displayName: `Assistance ${i + 1}`, bio: "", ratingAvg: null, ratingCount: 0, role: "support" as const })),
+    ...ADMIN_DEMO_PHONES.map((p, i) => ({ ...base, id: seedId(`user-admin-${i + 1}`), phone: `+243${p.slice(1)}`, displayName: `Administration ${i + 1}`, bio: "", ratingAvg: null, ratingCount: 0, role: "admin" as const })),
     { ...base, id: seedId("user-jp"), phone: SEED_PHONES.jp, displayName: "Jean-Paul B.", bio: "Électronique et maison.", ratingAvg: 4.5, ratingCount: 12, areaId: seedId("area-com-ngaliema") },
   ];
 }

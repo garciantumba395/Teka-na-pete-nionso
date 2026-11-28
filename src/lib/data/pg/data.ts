@@ -1,10 +1,10 @@
 import { createHash, createHmac, randomBytes, randomInt, randomUUID, timingSafeEqual } from "node:crypto";
 import { APP_NAME } from "../../copy";
-import { payoutFee, protectionFee, shippingFee, shippingZone, type ShippingZone } from "../../fees";
+import { COURIER_FEE_MODES, payoutFee, protectionFee, shippingFee, shippingZone, type CourierFeeMode, type ShippingZone } from "../../fees";
 import { coarsen } from "../../geo";
 import { checkAttempt, codesEqual, deriveHandoverCode, hashCode } from "../../handover";
 import {
-  assertBalanced, holdEntries, payoutFailedEntries, payoutPaidEntries, payoutRequestEntries, refundEntries,
+  assertBalanced, courierSettleEntries, holdEntries, payoutFailedEntries, payoutPaidEntries, payoutRequestEntries, refundEntries,
   releaseEntries, type NewEntry,
 } from "../../ledger";
 import { USD_CDF_PLACEHOLDER } from "../../money";
@@ -19,7 +19,7 @@ import {
 } from "../../notifications";
 import { ConsoleSmsProvider, type SmsProvider } from "../../sms/provider";
 import {
-  AppError, type Area, type Category, type ChatMessage, type Condition, type ConversationSummary, type DisputeNote, type DisputeOutcome, type DisputeSummary, type DisputeView, type ReportAction, type ReportView, type Review, type UserRole, type Currency, type Item, type ItemCard, type ItemDetail, type LedgerEntry, type Order, type OrderAction, type OrderView, type CancelRequestStatus, type Payment, type PaymentMethod, type DisputeEvidence,
+  AppError, type Area, type Category, type ChatMessage, type Condition, type ConversationSummary, type DisputeNote, type DisputeOutcome, type DisputeSummary, type CourierDue, type DisputeView, type ReportAction, type ReportView, type Review, type UserRole, type Currency, type Item, type ItemCard, type ItemDetail, type LedgerEntry, type Order, type OrderAction, type OrderView, type CancelRequestStatus, type Payment, type PaymentMethod, type DisputeEvidence,
   type PaymentStatus, type Payout, type PayoutStatus, type ProviderEvent, type PublicProfile, type User, type Wallet,
   type ShipmentEventKind, type ShipmentView, type ShippingQuote,
 } from "../../types";
@@ -306,7 +306,19 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
         if (!last || (last.status === "pending" && !live)) return null;
         return { status: (last.expired ? "expired" : last.status) as CancelRequestStatus, requestedAt: last.at, expiresAt: last.at + cr.ttl };
       })(),
+      shippingToSellerMinor: role === "seller" ? await shippingToSellerOf(q, order, fees.courierFeeMode) : 0,
     };
+  }
+
+  // ---- agent G : part « livraison » versée au vendeur (lue dans le grand livre une fois la commande terminée)
+  async function shippingToSellerOf(q: Queryable, order: Order, mode: CourierFeeMode): Promise<number> {
+    if (order.shippingMinor <= 0) return 0;
+    if (order.status === "completed") {
+      const r = await q.query(`select coalesce(sum(amount_minor), 0) as s from ledger_entries where ref_id = $1 and ref_type = 'order_shipping' and account = 'seller_available'`, [order.id]);
+      return -Number(r.rows[0].s);
+    }
+    if (order.status === "cancelled" || order.status === "refunded" || order.status === "expired") return 0;
+    return mode === "seller" ? order.shippingMinor : 0;
   }
 
   function cardOf(r: Row, fees: Awaited<ReturnType<typeof getFees>>, dist: number | null = null): ItemCard {
@@ -985,7 +997,7 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
         await c.query(`update orders set status = 'delivered', delivered_at = $2 where id = $1`, [orderId, ts(now())]);
         await c.query(`update orders set status = 'completed', completed_at = $2 where id = $1`, [orderId, ts(now())]);
         await closePendingTx(c, orderId); // agent A : le code vaut acceptation, la demande d'annulation est close
-        await post(c, releaseEntries(ctx("order", orderId, order.currency), { sellerId: order.sellerId, itemsMinor: order.itemsMinor, shippingMinor: order.shippingMinor, feeMinor: order.protectionFeeMinor }));
+        await post(c, releaseEntries(ctx("order", orderId, order.currency), { sellerId: order.sellerId, itemsMinor: order.itemsMinor, shippingMinor: order.shippingMinor, feeMinor: order.protectionFeeMinor, courierFeeMode: (await getFees()).courierFeeMode }));
         await notifyTx(c, { userId: order.buyerId, kind: "order_completed", payload: { orderId, itemTitle: await orderTitleOf(c, orderId), role: "buyer" }, eventKey: `order_completed:${orderId}` });
         return { ok: true };
       });
@@ -999,7 +1011,7 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
         if (order.buyerId !== buyerId) throw notFound("Commande");
         if (order.status !== "delivered") throw new AppError("INVALID_STATE", "Tu pourras accepter l'article une fois qu'il est livré.", 409);
         await c.query(`update orders set status = 'completed', completed_at = $2 where id = $1`, [orderId, ts(now())]);
-        await post(c, releaseEntries(ctx("order", orderId, order.currency), { sellerId: order.sellerId, itemsMinor: order.itemsMinor, shippingMinor: order.shippingMinor, feeMinor: order.protectionFeeMinor }));
+        await post(c, releaseEntries(ctx("order", orderId, order.currency), { sellerId: order.sellerId, itemsMinor: order.itemsMinor, shippingMinor: order.shippingMinor, feeMinor: order.protectionFeeMinor, courierFeeMode: (await getFees()).courierFeeMode }));
         await notifyTx(c, { userId: order.sellerId, kind: "order_completed", payload: { orderId, itemTitle: await orderTitleOf(c, orderId), role: "seller" }, eventKey: `order_completed:${orderId}` });
       });
       return buildView(pool, await loadOrder(pool, orderId), buyerId);
@@ -1370,6 +1382,44 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
       return disputeViewOf(pool, disputeId, authorId);
     },
 
+    // ---- agent G : frais de livraison par coursier
+    async getCourierFeeMode() {
+      return (await getFees()).courierFeeMode;
+    },
+    async setCourierFeeMode(adminId, mode) {
+      await requireRole(pool, adminId, ["admin"]);
+      if (!COURIER_FEE_MODES.includes(mode)) throw new AppError("VALIDATION", "Mode inconnu.", 422);
+      await pool.query(
+        `insert into settings (key, value, updated_at) values ('courier_fee_mode', $1, now()) on conflict (key) do update set value = excluded.value, updated_at = now()`,
+        [JSON.stringify(mode)]);
+      getFees.invalidate();
+      return mode;
+    },
+    async listCourierDues(staffId) {
+      await requireRole(pool, staffId, ["support", "admin"]);
+      const r = await pool.query(
+        `select l.ref_id as order_id, l.currency, -sum(l.amount_minor) as due, o.completed_at, o.created_at, s.courier_name, s.courier_phone,
+           (select i.title from order_items oi join items i on i.id = oi.item_id where oi.order_id = o.id order by i.id limit 1) as item_title
+         from ledger_entries l join orders o on o.id = l.ref_id left join shipments s on s.order_id = o.id
+         where l.account = 'shipping_payable' group by l.ref_id, l.currency, o.id, s.courier_name, s.courier_phone having sum(l.amount_minor) < 0
+         order by coalesce(o.completed_at, o.created_at) limit 500`);
+      return r.rows.map((x): CourierDue => ({
+        orderId: x.order_id, itemTitle: x.item_title ?? "Article", currency: x.currency, amountMinor: Number(x.due),
+        courierName: x.courier_name ?? null, courierPhone: x.courier_phone ?? null, releasedAt: (x.completed_at ?? x.created_at).getTime(),
+      }));
+    },
+    async settleCourierFee(staffId, orderId) {
+      await requireRole(pool, staffId, ["support", "admin"]);
+      return withTx(pool, async (c) => {
+        const order = await loadOrder(c, orderId, true); // verrou de la commande : deux règlements simultanés se sérialisent
+        const due = -Number((await c.query(`select coalesce(sum(amount_minor), 0) as s from ledger_entries where account = 'shipping_payable' and ref_id = $1`, [orderId])).rows[0].s);
+        if (due <= 0) throw new AppError("INVALID_STATE", "Aucun frais de livraison à régler pour cette commande.", 409);
+        await c.query(`insert into courier_settlements (order_id, settled_by, amount_minor, currency, settled_at) values ($1,$2,$3,$4,$5)`, [orderId, staffId, due, order.currency, ts(now())]);
+        await post(c, courierSettleEntries(ctx("order", orderId, order.currency), due));
+        return { orderId, amountMinor: due, currency: order.currency };
+      });
+    },
+
     async listOpenDisputes(staffId) {
       await requireRole(pool, staffId, ["support", "admin"]);
       const r = await pool.query(
@@ -1397,7 +1447,7 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
         } else {
           await c.query(`update shipments set status = 'delivered', delivered_confirmed_by = 'auto' where order_id = $1`, [order.id]).catch(() => undefined);
           await c.query(`update orders set status = 'completed', completed_at = $2, delivered_at = coalesce(delivered_at, $2) where id = $1`, [order.id, at]);
-          await post(c, releaseEntries(ctx("order", order.id, order.currency), { sellerId: order.sellerId, itemsMinor: order.itemsMinor, shippingMinor: order.shippingMinor, feeMinor: order.protectionFeeMinor }));
+          await post(c, releaseEntries(ctx("order", order.id, order.currency), { sellerId: order.sellerId, itemsMinor: order.itemsMinor, shippingMinor: order.shippingMinor, feeMinor: order.protectionFeeMinor, courierFeeMode: (await getFees()).courierFeeMode }));
         }
         await c.query(`update disputes set status = $2, resolved_by = $3, resolved_at = $4, updated_at = $4 where id = $1`,
           [disputeId, outcome === "refund_buyer" ? "resolved_refund" : "resolved_release", staffId, at]);
@@ -1547,7 +1597,7 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
         .filter((b) => b.availableMinor !== 0 || b.pendingMinor !== 0 || e.rows.some((x) => x.currency === b.currency));
       const entries: Wallet["entries"] = e.rows.map((x) => ({
         id: x.id, at: x.created_at.getTime(), currency: x.currency, amountMinor: -x.amount_minor,
-        label: x.ref_type === "order" ? "Vente" : x.ref_type === "payout" ? (x.amount_minor > 0 ? "Retrait" : "Retrait annulé") : "Ajustement",
+        label: x.ref_type === "order" ? "Vente" : x.ref_type === "order_shipping" ? "Frais de livraison à remettre au coursier" : x.ref_type === "payout" ? (x.amount_minor > 0 ? "Retrait" : "Retrait annulé") : "Ajustement",
       }));
       return { balances, entries };
     },
@@ -1819,7 +1869,7 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
           const order = await loadOrder(c, id, true);
           if (order.status !== "delivered" || order.autoReleaseAt == null || order.autoReleaseAt > at) return false;
           await c.query(`update orders set status = 'completed', completed_at = $2 where id = $1`, [id, ts(now())]);
-          await post(c, releaseEntries(ctx("order", id, order.currency), { sellerId: order.sellerId, itemsMinor: order.itemsMinor, shippingMinor: order.shippingMinor, feeMinor: order.protectionFeeMinor }));
+          await post(c, releaseEntries(ctx("order", id, order.currency), { sellerId: order.sellerId, itemsMinor: order.itemsMinor, shippingMinor: order.shippingMinor, feeMinor: order.protectionFeeMinor, courierFeeMode: (await getFees()).courierFeeMode }));
           const ship = (await c.query(`select id from shipments where order_id = $1`, [id])).rows[0];
           if (ship) await logShipment(c, ship.id, id, "auto_released", null);
           const title = await orderTitleOf(c, id);

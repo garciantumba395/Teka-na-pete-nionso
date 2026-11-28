@@ -103,7 +103,7 @@ test.describe("F10 Livraison par coursier", () => {
     await buyer.page.getByRole("button", { name: "Tout est bon, libérer l'argent" }).click();
     await expect(buyer.page.getByText("Article reçu")).toBeVisible();
     await open(seller.page, "/wallet");
-    expect(money(await seller.page.getByTestId("balance-USD").innerText())).toBe("25 $"); // articles seulement : livraison et frais ne vont pas au vendeur
+    expect(money(await seller.page.getByTestId("balance-USD").innerText())).toBe("29 $"); // agent G : articles (25 $) + frais de livraison (4 $) à remettre au coursier ; les frais de protection restent à la plateforme
     await open(seller.page, `/orders/${orderId}`);
     await expect(seller.page.getByText("Vente terminée")).toBeVisible();
     if (isPg()) {
@@ -131,7 +131,7 @@ test.describe("F10 Livraison par coursier", () => {
     const again = await job(buyer.request, "release_delivered_orders", PLUS_49H());
     expect((await again.json()).result.released).toBe(0);
     await open(seller.page, "/wallet");
-    expect(money(await seller.page.getByTestId("balance-USD").innerText())).toBe("25 $");
+    expect(money(await seller.page.getByTestId("balance-USD").innerText())).toBe("29 $"); // agent G : articles + livraison
     await open(buyer.page, `/orders/${orderId}`);
     await expect(buyer.page.getByText("Article reçu")).toBeVisible();
     await expect(buyer.page.getByText("Argent libéré au vendeur automatiquement (aucun litige dans le délai)")).toBeVisible();
@@ -164,7 +164,7 @@ test.describe("F10 Livraison par coursier", () => {
     await expect(staff.page.getByText("Clos : vendeur payé")).toBeVisible();
     expect((await view(buyer, orderId)).status).toBe("completed");
     await open(seller.page, "/wallet");
-    expect(money(await seller.page.getByTestId("balance-USD").innerText())).toBe("25 $");
+    expect(money(await seller.page.getByTestId("balance-USD").innerText())).toBe("29 $"); // agent G : articles + livraison
   });
 
   test("F10-E2 après « reçu » : seul l'acheteur peut ouvrir un litige", async ({ makeActor }) => {

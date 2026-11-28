@@ -1,5 +1,5 @@
 import { writeFileSync } from "node:fs";
-import { ID, PHOTO, apiBuyAndPay, apiCode, apiListing, apiOrder, apiPay, expect, noHorizontalScroll, open, scan, staffPhone, test, uniquePhone, waitForStatus, type A11yIssue } from "./support";
+import { ID, PHOTO, adminPhone, apiBuyAndPay, apiCode, apiListing, apiOrder, apiPay, expect, noHorizontalScroll, open, scan, staffPhone, test, uniquePhone, waitForStatus, type A11yIssue } from "./support";
 
 /** Écrans à analyser : un parcours complet crée les données nécessaires. */
 export function defineA11y(label: string) {
@@ -84,7 +84,10 @@ export function defineA11y(label: string) {
         await bp.getByRole("alert").filter({ hasText: "n'a pas pu être lue" }).waitFor(); // l'image minimale n'est pas décodable : l'erreur s'affiche
       });
       const staff = await makeActor("Assistance access", staffPhone());
+      const admin = await makeActor("Admin access", adminPhone()); // agent G
       await check("S12 assistance : litige avec preuves", staff.page, `/staff/disputes/${disputeId}`);
+      await check("Frais de livraison à régler (assistance)", staff.page, "/staff/courier-fees"); // agent G
+      await check("Frais de livraison à régler (administrateur : réglage du mode)", admin.page, "/staff/courier-fees"); // agent G
       // on clôt ce litige : la file de l'assistance doit rester vide pour les tests qui la parcourent
       expect((await staff.request.post(`/api/v1/staff/disputes/${disputeId}/resolve`, { data: { outcome: "refund_buyer" } })).status()).toBe(200);
 

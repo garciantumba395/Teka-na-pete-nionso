@@ -3,7 +3,7 @@ import { test as base, expect, type APIRequestContext, type Browser, type Browse
 import { randomUUID } from "node:crypto";
 import { Pool } from "pg";
 import { seedId } from "../src/lib/data/ids";
-import { STAFF_DEMO_PHONES } from "../src/lib/data/seed";
+import { ADMIN_DEMO_PHONES, STAFF_DEMO_PHONES } from "../src/lib/data/seed";
 
 export { expect };
 
@@ -35,6 +35,9 @@ export const uniqueTitle = (base = "Robe") => `${base} ${Date.now().toString(36)
 const STAFF_PHONES = STAFF_DEMO_PHONES;
 let staffTurn = Math.floor(Math.random() * STAFF_PHONES.length);
 export const staffPhone = () => STAFF_PHONES[staffTurn++ % STAFF_PHONES.length];
+/** agent G : comptes administrateur de démonstration, à tour de rôle. */
+let adminTurn = Math.floor(Math.random() * ADMIN_DEMO_PHONES.length);
+export const adminPhone = () => ADMIN_DEMO_PHONES[adminTurn++ % ADMIN_DEMO_PHONES.length];
 
 export interface Actor {
   name: string;

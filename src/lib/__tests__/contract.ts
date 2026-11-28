@@ -1174,11 +1174,11 @@ export function defineContract(label: string, factory: () => Promise<ContractEnv
         // grand livre : le paiement bloque le total complet, la libération ventile articles, livraison et frais
         const o = await received("+243821000205");
         await data.acceptOrder(o.order.id, o.buyer.id);
-        expect(await account("shipping_payable")).toBe(-o.order.shippingMinor);
+        expect(await account("shipping_payable")).toBe(0); // agent G : mode par défaut « seller », la livraison est versée au vendeur
         expect(await account("platform_revenue")).toBe(-o.order.protectionFeeMinor);
         expect(await account("order_escrow")).toBe(0);
         expect(await ledgerSum("USD")).toBe(0);
-        expect(await usdAvailable(o.seller.id)).toBe(10_000);
+        expect(await usdAvailable(o.seller.id)).toBe(10_000 + o.order.shippingMinor);
       });
 
       it("création : commune et repère obligatoires, commune valide seulement, point relais pas encore disponible", async () => {
@@ -1230,15 +1230,15 @@ export function defineContract(label: string, factory: () => Promise<ContractEnv
 
         const done = await data.acceptOrder(order.id, buyer.id);
         expect(done.status).toBe("completed");
-        expect(await usdAvailable(seller.id)).toBe(10_000);
+        expect(await usdAvailable(seller.id)).toBe(10_000 + order.shippingMinor);
         expect(code(await rejects(data.acceptOrder(order.id, buyer.id)))).toBe("INVALID_STATE");
-        expect(await usdAvailable(seller.id)).toBe(10_000);
+        expect(await usdAvailable(seller.id)).toBe(10_000 + order.shippingMinor);
         expect(done.shipment?.events.map((e) => e.kind)).toEqual(["paid", "handed_to_courier", "in_transit", "received"]);
         expect(await ledgerSum("USD")).toBe(0);
         // la tâche automatique ne touche pas à une commande déjà terminée
         env.advance(FEES.claimWindowMs + HOUR);
         expect(await data.releaseDeliveredOrders()).toBe(0);
-        expect(await usdAvailable(seller.id)).toBe(10_000);
+        expect(await usdAvailable(seller.id)).toBe(10_000 + order.shippingMinor);
       });
 
       it("pas de code de remise pour le coursier ; la remise en main propre reste inchangée", async () => {
@@ -1309,7 +1309,7 @@ export function defineContract(label: string, factory: () => Promise<ContractEnv
         expect(v.status).toBe("completed");
         expect(v.completedAt).not.toBeNull();
         expect(v.shipment?.events.map((e) => e.kind)).toEqual(["paid", "handed_to_courier", "in_transit", "received", "auto_released"]);
-        expect(await usdAvailable(seller.id)).toBe(10_000);
+        expect(await usdAvailable(seller.id)).toBe(10_000 + order.shippingMinor);
         expect(await account("order_escrow")).toBe(0);
         expect(await ledgerSum("USD")).toBe(0);
         expect((await data.getItem((await data.getOrder(order.id, buyer.id)).items[0].id))!.status).toBe("sold");
@@ -1338,14 +1338,14 @@ export function defineContract(label: string, factory: () => Promise<ContractEnv
         // le vendeur est payé par l'assistance : libération depuis le statut « livrée »
         await data.resolveDispute(staffD(), da.id, "release_seller", "Le colis était intact à la livraison.");
         expect((await data.getOrder(a.order.id, a.buyer.id)).status).toBe("completed");
-        expect(await usdAvailable(a.seller.id)).toBe(10_000);
+        expect(await usdAvailable(a.seller.id)).toBe(10_000 + a.order.shippingMinor);
         // l'acheteur est remboursé
         await data.resolveDispute(staffD(), db2.id, "refund_buyer");
         const vb = await data.getOrder(b.order.id, b.buyer.id);
         expect(vb.status).toBe("refunded");
         expect(env.refunds()).toBe(1);
         expect(await data.releaseDeliveredOrders()).toBe(0);
-        expect(await usdAvailable(a.seller.id)).toBe(10_000);
+        expect(await usdAvailable(a.seller.id)).toBe(10_000 + a.order.shippingMinor);
         expect(await account("order_escrow")).toBe(0);
         expect(await ledgerSum("USD")).toBe(0);
       });
@@ -1357,7 +1357,7 @@ export function defineContract(label: string, factory: () => Promise<ContractEnv
         expect((await data.getOrder(order.id, buyer.id)).actions).not.toContain("issue");
         expect(code(await rejects(data.openDispute(order.id, buyer.id, { reason: "other", description: "Trop tard pour réclamer." })))).toBe("INVALID_STATE");
         expect(await data.releaseDeliveredOrders()).toBe(1);
-        expect(await usdAvailable(seller.id)).toBe(10_000);
+        expect(await usdAvailable(seller.id)).toBe(10_000 + order.shippingMinor);
       });
 
       it("colis perdu : acheteur ou vendeur signale, litige non reçu, argent gelé ; remboursement par l'assistance", async () => {
@@ -1409,7 +1409,7 @@ export function defineContract(label: string, factory: () => Promise<ContractEnv
         // une commande déjà reçue n'est jamais remboursée : elle est libérée
         expect((await data.getOrder(quick.order.id, quick.buyer.id)).status).toBe("delivered");
         expect(await data.releaseDeliveredOrders()).toBe(1);
-        expect(await usdAvailable(quick.seller.id)).toBe(10_000);
+        expect(await usdAvailable(quick.seller.id)).toBe(10_000 + quick.order.shippingMinor);
         expect(await account("order_escrow")).toBe(0);
         expect(await ledgerSum("USD")).toBe(0);
       });
@@ -2063,5 +2063,247 @@ export function defineContract(label: string, factory: () => Promise<ContractEnv
       });
     });
     // ---- fin agent F
+
+    // ---- agent G : frais de livraison par coursier (qui règle le coursier ?)
+    describe("frais de livraison : le vendeur ou la plateforme règle le coursier", () => {
+      const admin = () => S("user-admin-1");
+      const support = () => S("user-support-1");
+      const COURIER = { courierName: "Papy Moto", courierPhone: "0899000111", trackingRef: "MOTO-42" };
+      const walletOf = async (userId: string, cur: "USD" | "CDF" = "USD") => (await data.getWallet(userId)).balances.find((b) => b.currency === cur)?.availableMinor ?? 0;
+      const sumAll = async () => {
+        expect(await ledgerSum("USD")).toBe(0);
+        expect(await ledgerSum("CDF")).toBe(0);
+      };
+      const payoutFeeOf = (amount: number) => Math.round((amount * FEES.payout.pctBps) / 10_000);
+
+      async function order(phone: string, opts: { currency?: "USD" | "CDF"; priceMinor?: number; step?: "paid" | "in_transit" | "received" } = {}) {
+        const seller = (await data.getUser(S("user-marie")))!;
+        const buyer = await signup(phone, "Acheteur Livraison");
+        const item = await listing(seller.id, { priceMinor: opts.priceMinor ?? 10_000, currency: opts.currency ?? "USD" });
+        const o = await data.createOrder(buyer.id, { itemIds: [item.id], deliveryMethod: "courier", deliveryAreaId: S("area-com-limete"), deliveryLandmark: "Avenue de la Paix, portail bleu" });
+        await data.startPayment(o.id, buyer.id, { method: "mpesa", msisdn: "0821111111", idempotencyKey: `k-${o.id}` });
+        await env.flush();
+        const step = opts.step ?? "paid";
+        if (step !== "paid") {
+          await data.shipOrder(o.id, seller.id, COURIER);
+          await data.markInTransit(o.id, seller.id);
+        }
+        if (step === "received") await data.confirmReceived(o.id, buyer.id);
+        return { seller, buyer, order: o };
+      }
+      /** Libération automatique après la fenêtre de réclamation. */
+      async function releaseAll() {
+        env.advance(FEES.claimWindowMs + 1000);
+        expect(await data.releaseDeliveredOrders()).toBe(1);
+      }
+
+      it("le mode par défaut est « seller » ; seul un administrateur le change, et seulement vers une valeur connue", async () => {
+        expect(await data.getCourierFeeMode()).toBe("seller");
+        const m = await signup("0831000401", "Membre");
+        expect(code(await rejects(data.setCourierFeeMode(m.id, "platform")))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.setCourierFeeMode(support(), "platform")))).toBe("NOT_FOUND"); // l'assistance ne change pas le flux d'argent
+        expect(code(await rejects(data.setCourierFeeMode(admin(), "autre" as never)))).toBe("VALIDATION");
+        expect(await data.setCourierFeeMode(admin(), "platform")).toBe("platform");
+        expect(await data.getCourierFeeMode()).toBe("platform");
+        expect(await data.setCourierFeeMode(admin(), "seller")).toBe("seller");
+      });
+
+      it("mode seller : à la libération, le vendeur reçoit articles + livraison ; shipping_payable reste nul ; grand livre équilibré", async () => {
+        const { seller, buyer, order: o } = await order("+243831000402", { step: "received" });
+        const ship = o.shippingMinor;
+        expect(ship).toBeGreaterThan(0);
+        // avant la libération, l'écran du vendeur annonce déjà ce qu'il recevra
+        expect((await data.getOrder(o.id, seller.id)).shippingToSellerMinor).toBe(ship);
+        expect((await data.getOrder(o.id, buyer.id)).shippingToSellerMinor).toBe(0); // l'acheteur n'a pas à le voir
+        await releaseAll();
+        expect(await walletOf(seller.id)).toBe(10_000 + ship);
+        expect(await account("shipping_payable")).toBe(0);
+        expect(await account("order_escrow")).toBe(0);
+        expect(await account("platform_revenue")).toBe(-o.protectionFeeMinor);
+        expect((await data.getOrder(o.id, seller.id)).shippingToSellerMinor).toBe(ship);
+        // l'historique distingue articles et livraison
+        const labels = (await data.getWallet(seller.id)).entries.filter((e) => e.amountMinor > 0).map((e) => [e.label, e.amountMinor]);
+        expect(labels).toEqual(expect.arrayContaining([["Vente", 10_000], ["Frais de livraison à remettre au coursier", ship]]));
+        expect(await data.listCourierDues(support())).toEqual([]); // rien à régler : le vendeur paie le coursier
+        await sumAll();
+      });
+
+      it("mode seller : les règles de retrait (minimum, frais) s'appliquent normalement au montant total, livraison comprise", async () => {
+        const { seller, order: o } = await order("+243831000403", { step: "received" });
+        await releaseAll();
+        const balance = 10_000 + o.shippingMinor;
+        const base = { currency: "USD" as const, method: "mpesa" as const, msisdn: "0810000001" };
+        // on ne peut pas retirer plus que (solde - frais)
+        expect(code(await rejects(data.requestPayout(seller.id, { ...base, amountMinor: balance, idempotencyKey: "g-1" })))).toBe("INSUFFICIENT_FUNDS");
+        expect(code(await rejects(data.requestPayout(seller.id, { ...base, amountMinor: FEES.payout.minMinor.USD - 1, idempotencyKey: "g-1b" })))).toBe("BELOW_MINIMUM");
+        const amount = balance - payoutFeeOf(balance) - 100;
+        const p = await data.requestPayout(seller.id, { ...base, amountMinor: amount, idempotencyKey: "g-2" });
+        expect(p.feeMinor).toBe(payoutFeeOf(amount));
+        expect(await walletOf(seller.id)).toBe(balance - amount - p.feeMinor);
+        await sumAll();
+      });
+
+      it("mode platform : la livraison reste sur shipping_payable, le vendeur ne reçoit que les articles", async () => {
+        await data.setCourierFeeMode(admin(), "platform");
+        const { seller, order: o } = await order("+243831000404", { step: "received" });
+        expect((await data.getOrder(o.id, seller.id)).shippingToSellerMinor).toBe(0);
+        await releaseAll();
+        expect(await walletOf(seller.id)).toBe(10_000);
+        expect(await account("shipping_payable")).toBe(-o.shippingMinor);
+        expect((await data.getWallet(seller.id)).entries.map((e) => e.label)).toEqual(["Vente"]);
+        const dues = await data.listCourierDues(support());
+        expect(dues).toEqual([expect.objectContaining({ orderId: o.id, amountMinor: o.shippingMinor, currency: "USD", courierName: "Papy Moto" })]);
+        await sumAll();
+      });
+
+      it("mode platform : « marquer comme réglé » solde shipping_payable vers courier_paid, une seule fois, par l'assistance seulement", async () => {
+        await data.setCourierFeeMode(admin(), "platform");
+        const { seller, order: o } = await order("+243831000405", { step: "received" });
+        await releaseAll();
+        const m = await signup("0831000406", "Membre Curieux");
+        expect(code(await rejects(data.settleCourierFee(m.id, o.id)))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.listCourierDues(m.id)))).toBe("NOT_FOUND");
+        expect(code(await rejects(data.settleCourierFee(seller.id, o.id)))).toBe("NOT_FOUND"); // le vendeur ne se règle pas lui-même
+        expect(await data.settleCourierFee(support(), o.id)).toEqual({ orderId: o.id, amountMinor: o.shippingMinor, currency: "USD" });
+        expect(await account("shipping_payable")).toBe(0);
+        expect(await account("courier_paid")).toBe(-o.shippingMinor);
+        expect(await data.listCourierDues(support())).toEqual([]);
+        expect(code(await rejects(data.settleCourierFee(support(), o.id)))).toBe("INVALID_STATE"); // pas de double règlement
+        expect(await account("courier_paid")).toBe(-o.shippingMinor);
+        expect(await walletOf(seller.id)).toBe(10_000); // le portefeuille du vendeur n'a pas bougé
+        await sumAll();
+      });
+
+      it("mode platform : règlement refusé tant que la commande n'est pas libérée", async () => {
+        await data.setCourierFeeMode(admin(), "platform");
+        const a = await order("+243831000407", { step: "received" });
+        expect(code(await rejects(data.settleCourierFee(support(), a.order.id)))).toBe("INVALID_STATE"); // l'argent est encore au séquestre
+        expect(code(await rejects(data.settleCourierFee(support(), "pas-un-uuid")))).toBe("NOT_FOUND");
+        expect(await data.listCourierDues(support())).toEqual([]);
+      });
+
+      it("changer de mode ne touche pas ce qui est déjà libéré, et agit sur la libération suivante", async () => {
+        await data.setCourierFeeMode(admin(), "platform");
+        const a = await order("+243831000408", { step: "received" });
+        await releaseAll();
+        await data.setCourierFeeMode(admin(), "seller");
+        expect(await account("shipping_payable")).toBe(-a.order.shippingMinor); // reste dû, indépendamment du mode
+        expect(await data.listCourierDues(support())).toHaveLength(1);
+        const b = await order("+243831000409", { step: "received" });
+        await releaseAll();
+        expect(await account("shipping_payable")).toBe(-a.order.shippingMinor);
+        expect(await walletOf(b.seller.id)).toBe(20_000 + b.order.shippingMinor);
+        await sumAll();
+      });
+
+      for (const mode of ["seller", "platform"] as const) {
+        describe(`mode ${mode} : aucun frais versé quand la commande n'est pas menée à terme`, () => {
+          beforeEach(async () => {
+            await data.setCourierFeeMode(admin(), mode);
+          });
+          const untouched = async (sellerId: string) => {
+            expect(await walletOf(sellerId)).toBe(0);
+            expect(await account("shipping_payable")).toBe(0);
+            expect(await account("order_escrow")).toBe(0);
+            expect(await account("courier_paid")).toBe(0);
+            expect(await account("platform_revenue")).toBe(0);
+            await sumAll();
+          };
+
+          it("annulation par le vendeur après paiement : l'acheteur est remboursé du total complet", async () => {
+            const { seller, buyer, order: o } = await order("+243831000410");
+            await data.cancelOrder(o.id, seller.id);
+            expect((await data.getOrder(o.id, buyer.id)).status).toBe("cancelled");
+            expect(env.refunds()).toBe(1);
+            expect(await account("psp_clearing")).toBe(0); // encaissé puis remboursé en entier, livraison et protection comprises
+            await untouched(seller.id);
+          });
+
+          it("litige résolu en faveur de l'acheteur : remboursement du total, livraison comprise", async () => {
+            const { seller, buyer, order: o } = await order("+243831000411", { step: "in_transit" });
+            const d = await data.openDispute(o.id, buyer.id, { reason: "not_as_described", description: "Le colis est arrivé abîmé." });
+            await data.resolveDispute(support(), d.id, "refund_buyer");
+            expect((await data.getOrder(o.id, buyer.id)).status).toBe("refunded");
+            expect(env.refunds()).toBe(1);
+            expect(await account("psp_clearing")).toBe(0);
+            await untouched(seller.id);
+          });
+
+          it("colis perdu : signalement, argent gelé, puis remboursement du total sans frais versés", async () => {
+            const { seller, buyer, order: o } = await order("+243831000412", { step: "in_transit" });
+            const d = await data.reportParcelLost(o.id, buyer.id);
+            expect(await walletOf(seller.id)).toBe(0); // gelé : rien n'est versé
+            expect(await account("shipping_payable")).toBe(0);
+            await data.resolveDispute(support(), d.id, "refund_buyer");
+            expect(await account("psp_clearing")).toBe(0);
+            await untouched(seller.id);
+          });
+
+          it("colis jamais livré : remboursement automatique du total au bout du délai", async () => {
+            const { seller, order: o } = await order("+243831000413", { step: "in_transit" });
+            env.advance(FEES.courierStaleMs + 1000);
+            expect(await data.refundStaleCourierOrders()).toBe(1);
+            expect(env.refunds()).toBe(1);
+            expect(await account("psp_clearing")).toBe(0);
+            expect((await data.getOrder(o.id, seller.id)).shippingToSellerMinor).toBe(0);
+            await untouched(seller.id);
+          });
+
+          it("commande jamais remise : remboursement automatique du total", async () => {
+            const { seller } = await order("+243831000414");
+            env.advance(FEES.unhandedOrderMs + 1000);
+            expect(await data.expireStalePaidOrders()).toBe(1);
+            expect(await account("psp_clearing")).toBe(0);
+            await untouched(seller.id);
+          });
+
+          it("litige résolu en faveur du vendeur : mêmes règles que la libération normale", async () => {
+            const { seller, buyer, order: o } = await order("+243831000415", { step: "in_transit" });
+            const d = await data.openDispute(o.id, buyer.id, { reason: "other", description: "Je conteste cette livraison." });
+            await data.resolveDispute(support(), d.id, "release_seller");
+            const ship = o.shippingMinor;
+            expect(await walletOf(seller.id)).toBe(mode === "seller" ? 10_000 + ship : 10_000);
+            expect(await account("shipping_payable")).toBe(mode === "seller" ? 0 : -ship);
+            expect(await account("order_escrow")).toBe(0);
+            expect(env.refunds()).toBe(0);
+            await sumAll();
+          });
+        });
+      }
+
+      it("CDF : même règle, et la somme du grand livre est nulle séparément en USD et en CDF", async () => {
+        const usd = await order("+243831000416", { step: "received" });
+        const cdf = await order("+243831000417", { step: "received", currency: "CDF", priceMinor: 5_000_000 });
+        env.advance(FEES.claimWindowMs + 1000);
+        expect(await data.releaseDeliveredOrders()).toBe(2);
+        expect(cdf.order.shippingMinor).toBe(FEES.shippingGrid.sameCity.CDF);
+        expect(await walletOf(cdf.seller.id, "CDF")).toBe(5_000_000 + cdf.order.shippingMinor);
+        expect(await walletOf(usd.seller.id, "USD")).toBe(10_000 + usd.order.shippingMinor);
+        await sumAll();
+        // mode platform en CDF : dû en francs, jamais mélangé aux dollars
+        await data.setCourierFeeMode(admin(), "platform");
+        const cdf2 = await order("+243831000418", { step: "received", currency: "CDF", priceMinor: 5_000_000 });
+        await releaseAll();
+        expect(await account("shipping_payable", "CDF")).toBe(-cdf2.order.shippingMinor);
+        expect(await account("shipping_payable", "USD")).toBe(0);
+        await data.settleCourierFee(support(), cdf2.order.id);
+        expect(await account("courier_paid", "CDF")).toBe(-cdf2.order.shippingMinor);
+        expect(await account("courier_paid", "USD")).toBe(0);
+        await sumAll();
+      });
+
+      it("remise en main propre : aucun frais de livraison, rien ne change dans les deux modes", async () => {
+        for (const [mode, phone] of [["seller", "+243831000419"], ["platform", "+243831000420"]] as const) {
+          await data.setCourierFeeMode(admin(), mode);
+          const { seller, order: o } = await paidOrder("Acheteur Main", phone);
+          expect(o.shippingMinor).toBe(0);
+          await data.confirmDelivery(o.id, seller.id, deriveHandoverCode(o.id));
+        }
+        expect(await account("shipping_payable")).toBe(0);
+        expect(await data.listCourierDues(support())).toEqual([]);
+        await sumAll();
+      });
+    });
+    // ---- fin agent G
   });
 }

@@ -168,9 +168,21 @@ export default async function OrderPage({ params }: { params: Promise<{ id: stri
             <dt>Articles</dt><dd className="tnum">{formatMoney(order.itemsMinor, order.currency)}</dd>
             {buyer && order.shippingMinor > 0 && <><dt>Livraison</dt><dd className="tnum">{formatMoney(order.shippingMinor, order.currency)}</dd></>}
             {buyer && <><dt>Protection acheteur</dt><dd className="tnum">{formatMoney(order.protectionFeeMinor, order.currency)}</dd></>}
+            {!buyer && order.shippingMinor > 0 && order.shippingToSellerMinor > 0 && (
+              <><dt>Frais de livraison à remettre au coursier</dt><dd className="tnum" data-testid="seller-shipping">{formatMoney(order.shippingToSellerMinor, order.currency)}</dd></>
+            )}
+            {!buyer && order.shippingMinor > 0 && order.shippingToSellerMinor === 0 && order.status !== "cancelled" && order.status !== "refunded" && order.status !== "expired" && (
+              <><dt>Livraison</dt><dd data-testid="seller-shipping-platform">Réglée par la plateforme</dd></>
+            )}
             <dt className="total">{buyer ? "Total payé" : "Tu reçois"}</dt>
-            <dd className="total tnum">{formatMoney(buyer ? order.totalMinor : order.itemsMinor, order.currency)}</dd>
+            <dd className="total tnum">{formatMoney(buyer ? order.totalMinor : order.itemsMinor + order.shippingToSellerMinor, order.currency)}</dd>
           </dl>
+          {!buyer && order.shippingToSellerMinor > 0 && (
+            <p className="hint" data-testid="seller-receives" style={{ margin: 0 }}>
+              Tu reçois {formatMoney(order.itemsMinor, order.currency)} (articles) + {formatMoney(order.shippingToSellerMinor, order.currency)} (frais de livraison à remettre au coursier).
+              C&apos;est à toi de payer le coursier de la main à la main.
+            </p>
+          )}
         </section>
 
         {courier && (

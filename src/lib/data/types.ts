@@ -1,5 +1,7 @@
+import type { CourierFeeMode } from "../fees";
 import type {
   Area,
+  CourierDue,
   Category,
   ChatMessage,
   ConversationSummary,
@@ -158,6 +160,16 @@ export interface DataLayer {
 
   // Portefeuille
   getWallet(userId: string): Promise<Wallet>;
+
+  // ---- agent G : frais de livraison par coursier
+  /** Mode courant : `seller` (le vendeur règle le coursier) ou `platform` (la plateforme règle). */
+  getCourierFeeMode(): Promise<CourierFeeMode>;
+  /** Administrateur seulement. Ne change que les libérations FUTURES : les frais déjà versés ou en attente restent tels quels. */
+  setCourierFeeMode(adminId: string, mode: CourierFeeMode): Promise<CourierFeeMode>;
+  /** Assistance : frais de livraison en attente de règlement au coursier (mode `platform`), un par commande menée à terme. */
+  listCourierDues(staffId: string): Promise<CourierDue[]>;
+  /** Assistance : solde `shipping_payable` de la commande vers `courier_paid`. Idempotent : un second appel renvoie 409. */
+  settleCourierFee(staffId: string, orderId: string): Promise<{ orderId: string; amountMinor: number; currency: Currency }>;
   requestPayout(
     userId: string,
     input: { amountMinor: number; currency: Currency; method: PaymentMethod; msisdn: string; idempotencyKey: string },

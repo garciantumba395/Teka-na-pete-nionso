@@ -47,8 +47,8 @@ describe("livraison par coursier : règles pures", () => {
     expect(canTransition("delivered", "refunded")).toBe(false);
     expect(canTransition("in_delivery", "delivered")).toBe(true);
   });
-  it("grand livre : libération avec livraison équilibrée, la livraison va au compte « à payer aux coursiers »", () => {
-    const e = releaseEntries({ txnId: "t", currency: "USD", refType: "order", refId: "o" }, { sellerId: "s", itemsMinor: 10_000, shippingMinor: 400, feeMinor: 500 });
+  it("grand livre : libération avec livraison équilibrée, en mode « platform » la livraison va au compte « à payer aux coursiers »", () => {
+    const e = releaseEntries({ txnId: "t", currency: "USD", refType: "order", refId: "o" }, { sellerId: "s", itemsMinor: 10_000, shippingMinor: 400, feeMinor: 500, courierFeeMode: "platform" });
     expect(() => assertBalanced(e)).not.toThrow();
     expect(e.find((x) => x.account === "shipping_payable")?.amountMinor).toBe(-400);
   });
