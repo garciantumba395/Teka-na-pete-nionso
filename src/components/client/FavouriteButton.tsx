@@ -59,7 +59,7 @@ export function FavouriteButton({
         disabled={!hydrated} /* pas « disabled » pendant l'appel : le clavier perdrait le focus */
       >
         <Icon name="heart" fill={on} />
-        {n > 0 ? <span className="fav-n tnum" aria-hidden="true">{n}</span> : null}
+        {/* le nombre est dessiné en CSS (data-count) : du texte visible dans le bouton devrait faire partie de son nom accessible */}
       </button>
       <span id={descId} className="sr-only">{n === 0 ? "Aucun favori" : `${n} favori${n > 1 ? "s" : ""}`}</span>
       {error ? <span className="error fav-error" role="alert">{error}</span> : null}

@@ -23,7 +23,7 @@ test.describe("H Découverte", () => {
     expect(p.url()).toBe(before); // le cœur n'a pas ouvert l'annonce
     await expect(on).toBeFocused(); // le focus reste sur le bouton
     await expect(card(p, item.title).getByText("1 favori")).toHaveCount(1); // compteur (texte réservé aux lecteurs d'écran)
-    await expect(on).toContainText("1");
+    await expect(on).toHaveAttribute("data-count", "1");
     // Aller-retour à la barre d'espace.
     await p.keyboard.press("Space");
     await expect(card(p, item.title).getByRole("button", { name: "Ajouter aux favoris" })).toHaveAttribute("aria-pressed", "false");
