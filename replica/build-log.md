@@ -139,3 +139,30 @@ Cinq agents ont travaillé dans des copies de travail isolées (une branche, des
 - Photos stockées en base (bytea), cache `private, max-age=3600` : sur un appareil partagé, une photo peut rester lisible après déconnexion.
 - La pastille ne se met pas à jour en direct (à la navigation seulement).
 - Service worker non testé sur un vrai téléphone ; `beforeinstallprompt` n'existe pas sur Safari (explication iOS à la place).
+
+## Mise à jour : `/replica-build`, tranche 4 — cinq agents en parallèle (2026-11-28)
+
+Même méthode que la tranche 3 : copies de travail isolées, un brief commun (`replica/agent-brief.md`), un port et une migration par agent, fusion par le chef de projet puis suite complète sur le résultat. Les quatre agents de code ont été coupés une fois par la limite d'utilisation de 5 heures, puis relancés ; leur travail a été conservé.
+
+| Agent | Livré | Migration |
+| --- | --- | --- |
+| F | **Notifications manquantes** (comble le trou de la tranche 3) : demande d'annulation, retrait, acceptation, refus, expiration ; coursier remis, en route, reçu, libération automatique, colis perdu, remboursement automatique ; photo reçue ; preuve de litige ; annonce masquée. 14 types de plus (22 au total), SMS ajoutés pour « demande d'annulation » et « colis remis » | aucune |
+| G | **Règlement des frais de livraison** : par défaut le vendeur reçoit les frais et règle le coursier ; mode `platform` configurable (administrateur) avec écran `/staff/courier-fees` pour régler le coursier une seule fois par commande. Remboursements intégraux dans tous les cas, grand livre équilibré par devise | 0010 `courier_settlements`, comptes `courier_paid` |
+| H | **Favoris** (cœur sur les cartes et la fiche, page `/favourites`), **tri** de la recherche (récent, prix croissant et décroissant, favoris ; USD et CDF comparés sans arrondi), **fil « Pour toi »** (10 marques et 10 tailles suivies) | 0011 `member_follows` |
+| J | **Lots d'articles** : panier côté serveur (20 articles), page `/cart`, une commande = un paiement, un code, un litige, un avis ; réservation tout ou rien sous concurrence ; lot mixte USD/CDF refusé | 0012 `cart_items` |
+| I | **Dossiers de décision** (`replica/decisions/`) : fournisseur de paiement, fournisseur SMS, avis juridique, liste de passage en production. Aucun code | aucune |
+
+**Fusion** : zones de conflit encore une fois toutes dans des fichiers partagés où chaque agent ajoutait à la fin. Aucune fusion de logique nécessaire cette fois.
+
+**Défauts trouvés par les agents ou la fusion, corrigés**
+- **Nombre de favoris dans le bouton cœur** : violation axe grave `label-content-name-mismatch` ; le nombre est dessiné en CSS (`data-count`).
+- **Frais lus pendant une transaction** (agent J) : demandait une seconde connexion du pool et bloquait 21 ajouts simultanés au panier ; lus avant la transaction.
+- **B-H2** (photo jointe au clavier) : le test donnait le focus à un bouton encore inactif ; attend maintenant qu'il soit actif. Il échoue encore sous forte charge mais passe sur une machine calme.
+
+**Nouvelles tâches planifiées à programmer** : `send_order_reminders` (rappels et expirations notifiés). Liste complète à jour dans `replica/decisions/04-liste-mise-en-production.md`.
+
+**Décisions à relire**
+- **Qui règle le coursier** : défaut « le vendeur règle » (simple), au prix d'un risque : il peut retirer les frais de livraison avant d'avoir payé le coursier. Le mode `platform` supprime ce risque mais ajoute une opération manuelle.
+- **Rappel à l'acheteur** avant la libération automatique : planifié à mi-fenêtre (24 h avant), car l'acheteur est l'auteur de « reçu » et n'est jamais notifié de sa propre action.
+- Le « colis perdu » ne déclenche plus de SMS « litige » côté couche factice, pour s'aligner sur PostgreSQL.
+- **Frais de livraison d'un lot** : calculés une fois, d'après l'article de plus petit identifiant.

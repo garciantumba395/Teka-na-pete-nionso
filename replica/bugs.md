@@ -84,6 +84,11 @@ Origine côté test : `apiPay` fabriquait ses clés avec `Date.now()` et un comp
 
 ## À vérifier (non reproduit, pas des défauts)
 
+- **Lots** : un article du panier vendu à quelqu'un d'autre reste dans le panier, signalé « indisponible » (borné à 20 par membre) ; aucune tâche de nettoyage. Après « Ajouter au panier », le bouton est remplacé par un lien « Dans ton panier » : le focus clavier retombe sur le corps de la page (S4 probable, à reproduire).
+- **Cœur des favoris** : son nom accessible est le libellé seul, sans le titre de l'annonce : plusieurs boutons portent le même nom sur une page (lecteur d'écran) ; compteur de favoris sans anti-abus au-delà de la limite de débit.
+- **Mode des frais de livraison** : réglage global avec cache de 30 s : un autre processus peut garder l'ancien mode jusqu'à 30 s ; appliqué à la libération, pas à la commande. Les commandes déjà libérées en mode plateforme restent dues après un retour au mode vendeur.
+- **Instabilité sous charge** : plusieurs tests e2e (B-H2, F03-H1, F03-E1, X-1, F02-E2…) ont échoué par intermittence quand 5 agents faisaient tourner leurs suites en même temps (charge machine de 12 à 24). Sur une machine calme : 0 échec sur deux passages complets. Pas de cause application établie.
+
 - **Montant non vérifié sur les webhooks de paiement** (relevé par lecture du code, non reproduit) : l'événement du PSP ne porte ni montant ni devise (`src/lib/schemas.ts` webhookEvent) ; avec un vrai PSP, un encaissement d'un montant erroné serait accepté. À corriger AVANT de brancher un fournisseur (S2 latent).
 - **Route de webhook limitée au fournisseur factice** (`src/app/api/v1/webhooks/psp/[provider]/route.ts`) : à étendre en même temps que l'adaptateur.
 - **`seed-demo` ne se protège que par `NODE_ENV`** du shell qui le lance : lancé depuis un poste avec la `DATABASE_URL` de production et sans `NODE_ENV=production`, il s'exécuterait. À durcir (S3 latent).

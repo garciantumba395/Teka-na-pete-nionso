@@ -239,19 +239,29 @@ Deux exécutions : **couche factice** (`npm run test:e2e`) et **PostgreSQL** (`n
 | contrat ×2 couches | E | annulation encadrée (12), photos (7), notifications (15), coursier (8), articles interdits (7) | contrat |
 | pg.idempotency | E | course sur la clé d'idempotence : 409, jamais 500 | PostgreSQL |
 
+## Cas ajoutés par la tranche 4 (agents F à J)
+
+| cas | type | attendu | auto |
+| --- | --- | --- | --- |
+| F11 (notifications manquantes) | H/E | demande d'annulation → pastille vendeur → page → lien ; coursier remis → acheteur ; préférences SMS ; aucune erreur d'hydratation | e2e + contrat ×2 |
+| G (frais de livraison) | H/E | le vendeur voit articles + frais dans son portefeuille ; mode plateforme : écran assistance, règlement unique ; remboursements intégraux ; grand livre équilibré par devise | e2e + contrat ×2 + PG |
+| H (découverte) | H/E | cœur au clavier sans naviguer, page favoris, tri USD/CDF mélangés stable, « Pour toi » sans doublon, limites des suivis sous concurrence | e2e + contrat ×2 + PG |
+| lots (J) | H/E/N | 3 articles → total → paiement → code → 3 « Vendu » ; lot mixte refusé ; article devenu indisponible ; 6 tours d'acheteurs concurrents ; 320 px | e2e + contrat ×2 + PG (courses répétées, vérifiées échouantes sans verrou) |
+
 ## Couverture
 
-Exécution du 2026-11-27 sur la branche `claude/upbeat-noether-vq7x7j` après fusion des cinq agents : 178 tests Playwright (projet mobile 390 px + projet bureau 1440 px).
+Exécution du 2026-11-28 sur la branche `claude/upbeat-noether-vq7x7j` après fusion des neuf agents, **sur une machine calme** (aucun autre test en parallèle) : 208 tests Playwright (projet mobile 390 px + projet bureau 1440 px).
 
 | Cible | Réussis | Échoués | Ignorés |
 | --- | --- | --- | --- |
-| Couche factice (`npm run test:e2e`) | 175 | 0 | 3 |
-| PostgreSQL (`npm run test:e2e:pg`) | 176 | 0 | 2 |
-| Unitaires + contrat des deux couches (`npm run test:pg`) | 315 | 0 | 0 |
+| Couche factice (`npm run test:e2e`) | 205 | 0 | 3 |
+| PostgreSQL (`npm run test:e2e:pg`) | 206 | 0 | 2 |
+| Unitaires + contrat des deux couches (`npm run test:pg`) | 488 | 0 | 0 |
 
-- **Ignorés** : par construction (contrôle fait une seule fois sur mobile ; vérifications de base seulement sur PostgreSQL), pas des échecs masqués.
-- **Instabilité connue** : sous forte charge, quelques tests e2e ont échoué par intermittence chez les agents (F02-E2, F02-E8, F02-E13, SEC-2). Une cause réelle a été trouvée et corrigée (BUG-011) ; les autres, dont SEC-2 (délai porté à 120 s), n'ont pas de cause application établie. Trois passages complets consécutifs sans échec sur chaque couche après les corrections.
-- **Défauts** : voir `bugs.md` (11 trouvés, tous corrigés, aucun S1).
-- **Non construits** : lots (pas d'interface), compte Pro, retours, favoris, étiquette prépayée, point relais, multilingue.
-- **Manuels, non exécutés** : les 6 points ci-dessus, plus service worker et bandeau d'installation sur un vrai téléphone, SMS réels, coursier réel.
-- **Pas couvert** : photos de preuve obligatoires, décision de litige partielle, paiement du coursier, performance sur appareil.
+- **Ignorés** : par construction (contrôle fait une seule fois sur mobile ; vérifications de base seulement sur PostgreSQL).
+- **Instabilité** : sous forte charge (plusieurs agents en parallèle), quelques tests échouent par intermittence (voir `bugs.md`) ; sur machine calme, deux passages complets consécutifs sans échec. À savoir pour l'intégration continue : ne pas lancer plusieurs suites sur la même machine.
+- **Audit d'accessibilité** : 48 écrans, 0 violation grave ou critique.
+- **Défauts** : 11 trouvés par `/replica-test` et la fusion, tous corrigés, aucun S1 (voir `bugs.md`) ; les agents en ont corrigé trois autres en cours de route.
+- **Non construits** : compte Pro, retours, étiquette prépayée, point relais, multilingue, offres de prix, carte.
+- **Manuels, non exécutés** : les 6 points ci-dessus, plus service worker et bandeau d'installation sur un vrai téléphone, SMS et paiement réels, coursier réel.
+- **Pas couvert** : photos de preuve obligatoires, décision de litige partielle, performance sur appareil.
