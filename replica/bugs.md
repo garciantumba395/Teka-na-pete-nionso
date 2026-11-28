@@ -84,6 +84,13 @@ Origine côté test : `apiPay` fabriquait ses clés avec `Date.now()` et un comp
 
 ## À vérifier (non reproduit, pas des défauts)
 
+- **Montant non vérifié sur les webhooks de paiement** (relevé par lecture du code, non reproduit) : l'événement du PSP ne porte ni montant ni devise (`src/lib/schemas.ts` webhookEvent) ; avec un vrai PSP, un encaissement d'un montant erroné serait accepté. À corriger AVANT de brancher un fournisseur (S2 latent).
+- **Route de webhook limitée au fournisseur factice** (`src/app/api/v1/webhooks/psp/[provider]/route.ts`) : à étendre en même temps que l'adaptateur.
+- **`seed-demo` ne se protège que par `NODE_ENV`** du shell qui le lance : lancé depuis un poste avec la `DATABASE_URL` de production et sans `NODE_ENV=production`, il s'exécuterait. À durcir (S3 latent).
+- **Suppression de compte** : numéros mobile money (`payments`, `payouts`), messages, photos privées et avis restent en base : à trancher avec le juriste (dossier 3).
+- **SMS n° 2** : « d'être payée » contient un caractère hors alphabet GSM standard, le message passe probablement en deux segments (coût) : à confirmer avec le fournisseur.
+- **Photos HEIC (iPhone)** : aucune gestion explicite ; à tester sur un vrai iPhone.
+
 - **Réservation sans paiement** (`build-log.md`) : un acheteur peut bloquer un article 15 min. La limite de 10 commandes par 10 min est testée (SEC-10) ; le plafond de réservations **simultanées** ne l'est pas.
 - **Lecteur d'écran réel**, **appareil bas de gamme en 3G**, **appareil photo natif**, **photos HEIC**, **SMS et PSP réels** : voir « À faire à la main » dans `test-plan.md`.
 - **Notifications manquantes** entre agents : demande d'annulation, colis remis, colis reçu, libération automatique. Le vendeur ne les voit qu'en ouvrant la commande.
