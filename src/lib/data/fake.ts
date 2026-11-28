@@ -1,11 +1,12 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { FEES, payoutFee, protectionFee, shippingFee, shippingZone } from "../fees";
+import type { CourierFeeMode } from "../fees";
+import { COURIER_FEE_MODES, FEES, payoutFee, protectionFee, shippingFee, shippingZone } from "../fees";
 import { assertTransition } from "../fsm";
 import { coarsen, distanceKm } from "../geo";
 import { codesEqual, checkAttempt, deriveHandoverCode, hashCode, type AttemptState } from "../handover";
 import {
   assertBalanced, holdEntries, payoutFailedEntries, payoutPaidEntries, payoutRequestEntries, refundEntries,
-  releaseEntries, sellerAvailable, sellerPending, type NewEntry,
+  courierSettleEntries, releaseEntries, sellerAvailable, sellerPending, type NewEntry,
 } from "../ledger";
 import { detectOffPlatform, MESSAGE_MAX } from "../messaging";
 import { normalizeDrcPhone } from "../phone";
@@ -17,7 +18,7 @@ import {
 import { ConsoleSmsProvider, type SmsProvider } from "../sms/provider";
 import { FakeMobileMoneyProvider } from "../payments/fake-provider";
 import {
-  AppError, type Area, type Category, type ChatMessage, type ConversationSummary, type Currency, type DisputeNote, type DisputeOutcome, type DisputeReason, type DisputeStatus, type DisputeSummary, type DisputeView, type ReportAction, type ReportReason, type ReportStatus, type ReportTarget, type ReportView, type Review, type UserRole, type Item, type ItemCard, type ItemDetail, type ItemQuery, type LedgerEntry, type Order, type OrderAction, type OrderView, type CancelRequestStatus, type Payment, type PaymentMethod, type Payout, type DisputeEvidence,
+  AppError, type Area, type Category, type ChatMessage, type ConversationSummary, type CourierDue, type Currency, type DisputeNote, type DisputeOutcome, type DisputeReason, type DisputeStatus, type DisputeSummary, type DisputeView, type ReportAction, type ReportReason, type ReportStatus, type ReportTarget, type ReportView, type Review, type UserRole, type Item, type ItemCard, type ItemDetail, type ItemQuery, type LedgerEntry, type Order, type OrderAction, type OrderView, type CancelRequestStatus, type Payment, type PaymentMethod, type Payout, type DisputeEvidence,
   type ProviderEvent, type PublicProfile, type User, type Wallet,
   type ShipmentEventKind, type ShipmentStatus, type ShipmentView, type ShippingQuote,
 } from "../types";
@@ -35,6 +36,8 @@ export interface FakeOptions {
   seed?: boolean;
   /** Fournisseur SMS des notifications critiques (par défaut : console factice). */
   sms?: SmsProvider;
+  /** agent G : qui règle le coursier (défaut : FEES.courierFeeMode). */
+  courierFeeMode?: CourierFeeMode;
 }
 
 export interface FakeData extends DataLayer {
@@ -226,9 +229,20 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
     }
   }
 
+  // ---- agent G : qui règle le coursier
+  let courierFeeMode: CourierFeeMode = opts.courierFeeMode ?? FEES.courierFeeMode;
+  const settledCourier = new Set<string>();
+  /** Part « livraison » réellement versée au vendeur pour cette commande (lue dans le grand livre une fois la commande terminée). */
+  function shippingToSeller(order: Order): number {
+    if (order.shippingMinor <= 0) return 0;
+    if (order.status === "completed") return -ledger.filter((e) => e.refId === order.id && e.refType === "order_shipping").reduce((s, e) => s + e.amountMinor, 0);
+    if (order.status === "cancelled" || order.status === "refunded" || order.status === "expired") return 0;
+    return courierFeeMode === "seller" ? order.shippingMinor : 0;
+  }
+
   function release(order: Order) {
     post(releaseEntries(ctx("order", order.id, order.currency), {
-      sellerId: order.sellerId, itemsMinor: order.itemsMinor, shippingMinor: order.shippingMinor, feeMinor: order.protectionFeeMinor,
+      sellerId: order.sellerId, itemsMinor: order.itemsMinor, shippingMinor: order.shippingMinor, feeMinor: order.protectionFeeMinor, courierFeeMode,
     }));
   }
 
@@ -317,6 +331,7 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
       actions,
       dispute: dsp ? { id: dsp.id, status: dsp.status } : null,
       cancelRequest: cancelRequestView(order),
+      shippingToSellerMinor: role === "seller" ? shippingToSeller(order) : 0,
     };
   }
 
@@ -1231,7 +1246,7 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
         .sort((a, b) => b.createdAt - a.createdAt)
         .map((e) => ({
           id: e.id, at: e.createdAt, currency: e.currency, amountMinor: -e.amountMinor,
-          label: e.refType === "order" ? "Vente" : e.refType === "payout" ? (e.amountMinor > 0 ? "Retrait" : "Retrait annulé") : "Ajustement",
+          label: e.refType === "order" ? "Vente" : e.refType === "order_shipping" ? "Frais de livraison à remettre au coursier" : e.refType === "payout" ? (e.amountMinor > 0 ? "Retrait" : "Retrait annulé") : "Ajustement",
         }));
       return { balances, entries };
     },
@@ -1378,6 +1393,44 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
         n++;
       }
       return n;
+    },
+
+    // ---- agent G : frais de livraison par coursier
+    async getCourierFeeMode() {
+      return courierFeeMode;
+    },
+    async setCourierFeeMode(adminId, mode) {
+      requireRole(adminId, ["admin"]);
+      if (!COURIER_FEE_MODES.includes(mode)) throw new AppError("VALIDATION", "Mode inconnu.", 422);
+      courierFeeMode = mode;
+      return courierFeeMode;
+    },
+    async listCourierDues(staffId) {
+      requireRole(staffId, ["support", "admin"]);
+      const byOrder = new Map<string, number>();
+      for (const e of ledger) if (e.account === "shipping_payable") byOrder.set(e.refId, (byOrder.get(e.refId) ?? 0) + e.amountMinor);
+      const dues: CourierDue[] = [];
+      for (const [orderId, sum] of byOrder) {
+        if (sum >= 0) continue; // crédit négatif : montant dû
+        const o = orders.get(orderId);
+        if (!o) continue;
+        const ship = shipments.get(orderId);
+        dues.push({
+          orderId, itemTitle: items.get(o.itemIds[0])?.title ?? "Article", currency: o.currency, amountMinor: -sum,
+          courierName: ship?.courierName ?? null, courierPhone: ship?.courierPhone ?? null, releasedAt: o.completedAt ?? o.createdAt,
+        });
+      }
+      return dues.sort((a, b) => a.releasedAt - b.releasedAt);
+    },
+    async settleCourierFee(staffId, orderId) {
+      requireRole(staffId, ["support", "admin"]);
+      const o = orders.get(orderId);
+      if (!o) throw notFound("Commande");
+      const due = -ledger.filter((e) => e.account === "shipping_payable" && e.refId === orderId).reduce((s, e) => s + e.amountMinor, 0);
+      if (due <= 0 || settledCourier.has(orderId)) throw new AppError("INVALID_STATE", "Aucun frais de livraison à régler pour cette commande.", 409);
+      settledCourier.add(orderId);
+      post(courierSettleEntries(ctx("order", orderId, o.currency), due));
+      return { orderId, amountMinor: due, currency: o.currency };
     },
 
     // ---- agent C : notifications

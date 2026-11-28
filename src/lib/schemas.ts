@@ -73,6 +73,8 @@ export const disputeResolve = z.object({
   outcome: z.enum(["refund_buyer", "release_seller"], { message: "Choisis une décision." }),
   note: z.string().transform(cleanText).pipe(z.string().trim().max(1000)).optional(),
 });
+// ---- agent G : frais de livraison par coursier
+export const courierFeeModeInput = z.object({ mode: z.enum(["seller", "platform"], { message: "Choisis un mode." }) });
 export const reviewCreate = z.object({
   rating: z.number({ message: "Choisis une note de 1 à 5." }).int("Choisis une note de 1 à 5.").min(1, "Choisis une note de 1 à 5.").max(5, "Choisis une note de 1 à 5."),
   comment: z.string().transform(cleanText).pipe(z.string().trim().max(500, "Un avis est limité à 500 caractères.")).default(""),

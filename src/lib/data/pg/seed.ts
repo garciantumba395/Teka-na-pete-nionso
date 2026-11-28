@@ -36,6 +36,7 @@ export async function seedReference(pool: Pool): Promise<void> {
     max_photos: FEES.maxPhotos,
     claim_window_hours: FEES.claimWindowMs / 3_600_000,
     courier_stale_days: FEES.courierStaleMs / 86_400_000,
+    courier_fee_mode: FEES.courierFeeMode,
     shipping_grid: { ...FEES.shippingGrid, _placeholder: true },
   };
   for (const [key, value] of Object.entries(settings)) {

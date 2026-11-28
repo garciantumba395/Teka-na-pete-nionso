@@ -17,7 +17,12 @@ export interface FeeConfig {
   shippingGrid: Record<ShippingZone, Record<Currency, number>>;
   /** Colis resté « remis au coursier » sans livraison au-delà de ce délai : remboursement automatique. */
   courierStaleMs: number;
+  /** Qui règle le coursier : `seller` (défaut, les frais de livraison sont versés au vendeur à la libération) ou `platform` (ils restent sur `shipping_payable` jusqu'au règlement par l'assistance). */
+  courierFeeMode: CourierFeeMode;
 }
+
+export type CourierFeeMode = "seller" | "platform";
+export const COURIER_FEE_MODES: CourierFeeMode[] = ["seller", "platform"];
 
 export type ShippingZone = "sameCommune" | "sameCity" | "otherCity";
 
@@ -41,6 +46,7 @@ export const FEES: FeeConfig = {
     otherCity: { USD: 1200, CDF: 3_000_000 },
   },
   courierStaleMs: 10 * 86_400_000, // PLACEHOLDER : 10 jours
+  courierFeeMode: "seller", // DÉCISION PAR DÉFAUT, modifiable par le propriétaire du produit (settings.courier_fee_mode)
 };
 
 /** Zone de tarification : même commune, même ville (même parent), ou autre ville. Origine ou destination inconnue : « même ville ». */

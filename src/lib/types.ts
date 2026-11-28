@@ -26,6 +26,7 @@ export type LedgerAccount =
   | "seller_available"
   | "payout_pending"
   | "shipping_payable"
+  | "courier_paid" // agent G : frais de livraison réglés au coursier par la plateforme (mode « platform »)
   | "platform_revenue"
   | "psp_fees";
 
@@ -36,7 +37,7 @@ export interface LedgerEntry {
   userId: string | null;
   currency: Currency;
   amountMinor: number; // débit positif, crédit négatif
-  refType: "order" | "payment" | "payout" | "dispute" | "bump" | "adjustment";
+  refType: "order" | "order_shipping" | "payment" | "payout" | "dispute" | "bump" | "adjustment";
   refId: string;
   createdAt: number;
 }
@@ -220,6 +221,19 @@ export interface OrderView extends Order {
   cancelRequest: { status: CancelRequestStatus; requestedAt: number; expiresAt: number } | null;
   /** Suivi du colis : seulement pour la livraison par coursier, et seulement après paiement. */
   shipment: ShipmentView | null;
+  /** agent G : part des frais de livraison versée au vendeur (à remettre au coursier). 0 si la plateforme règle le coursier ou sans livraison. */
+  shippingToSellerMinor: number;
+}
+
+/** agent G : frais de livraison dus au coursier (mode « platform »), un par commande menée à terme et non encore réglée. */
+export interface CourierDue {
+  orderId: string;
+  itemTitle: string;
+  currency: Currency;
+  amountMinor: number;
+  courierName: string | null;
+  courierPhone: string | null;
+  releasedAt: number;
 }
 
 export interface Payment {

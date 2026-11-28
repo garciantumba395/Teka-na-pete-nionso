@@ -1,3 +1,4 @@
+import type { CourierFeeMode } from "./fees";
 import type { Currency, LedgerAccount, LedgerEntry } from "./types";
 import { AppError } from "./types";
 
@@ -13,9 +14,9 @@ interface Ctx {
   refId: string;
 }
 
-function e(ctx: Ctx, account: LedgerAccount, amountMinor: number, userId: string | null = null): NewEntry | null {
+function e(ctx: Ctx, account: LedgerAccount, amountMinor: number, userId: string | null = null, refType: LedgerEntry["refType"] = ctx.refType): NewEntry | null {
   if (amountMinor === 0) return null; // le schéma interdit les lignes à zéro
-  return { txnId: ctx.txnId, account, userId, currency: ctx.currency, amountMinor, refType: ctx.refType, refId: ctx.refId };
+  return { txnId: ctx.txnId, account, userId, currency: ctx.currency, amountMinor, refType, refId: ctx.refId };
 }
 
 const compact = (xs: (NewEntry | null)[]): NewEntry[] => xs.filter((x): x is NewEntry => x !== null);
@@ -25,18 +26,28 @@ export function holdEntries(ctx: Ctx, totalMinor: number): NewEntry[] {
   return compact([e(ctx, "psp_clearing", totalMinor), e(ctx, "order_escrow", -totalMinor)]);
 }
 
-/** Libération au vendeur : T = articles I + livraison S + frais F. */
+/**
+ * Libération au vendeur : T = articles I + livraison S + frais F.
+ * Mode « seller » (défaut) : S est versé au vendeur (ligne séparée, ref_type `order_shipping`), qui règle le coursier lui-même.
+ * Mode « platform » : S reste sur `shipping_payable` jusqu'au règlement du coursier par la plateforme (courierSettleEntries).
+ */
 export function releaseEntries(
   ctx: Ctx,
-  p: { sellerId: string; itemsMinor: number; shippingMinor: number; feeMinor: number },
+  p: { sellerId: string; itemsMinor: number; shippingMinor: number; feeMinor: number; courierFeeMode?: CourierFeeMode },
 ): NewEntry[] {
   const total = p.itemsMinor + p.shippingMinor + p.feeMinor;
+  const toSeller = (p.courierFeeMode ?? "seller") === "seller";
   return compact([
     e(ctx, "order_escrow", total),
     e(ctx, "seller_available", -p.itemsMinor, p.sellerId),
-    e(ctx, "shipping_payable", -p.shippingMinor),
+    toSeller ? e(ctx, "seller_available", -p.shippingMinor, p.sellerId, "order_shipping") : e(ctx, "shipping_payable", -p.shippingMinor),
     e(ctx, "platform_revenue", -p.feeMinor),
   ]);
+}
+
+/** Règlement du coursier par la plateforme (mode « platform ») : solde `shipping_payable` de la commande vers `courier_paid`. */
+export function courierSettleEntries(ctx: Ctx, shippingMinor: number): NewEntry[] {
+  return compact([e(ctx, "shipping_payable", shippingMinor), e(ctx, "courier_paid", -shippingMinor)]);
 }
 
 /** Remboursement intégral à l'acheteur. */

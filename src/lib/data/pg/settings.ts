@@ -35,17 +35,21 @@ export function feesFromSettings(rows: { key: string; value: unknown }[]): FeeCo
       otherCity: money(sg.otherCity, FEES.shippingGrid.otherCity),
     },
     courierStaleMs: num("courier_stale_days", FEES.courierStaleMs / 86_400_000) * 86_400_000,
+    courierFeeMode: m.get("courier_fee_mode") === "platform" ? "platform" : m.get("courier_fee_mode") === "seller" ? "seller" : FEES.courierFeeMode,
   };
 }
 
 /** Lecture des paramètres avec un cache court : les frais se changent en base, sans redéployer. */
 export function createSettingsLoader(pool: Pool, now: () => number, ttlMs = 30_000) {
   let cache: { at: number; cfg: FeeConfig } | null = null;
-  return async function get(): Promise<FeeConfig> {
+  const get = async function (): Promise<FeeConfig> {
     const t = now();
     if (cache && t - cache.at < ttlMs) return cache.cfg;
     const r = await pool.query<{ key: string; value: unknown }>("select key, value from settings");
     cache = { at: t, cfg: feesFromSettings(r.rows) };
     return cache.cfg;
   };
+  /** Après une écriture dans `settings` par CE processus : la lecture suivante relit la base (les autres processus attendent leur délai). */
+  get.invalidate = () => { cache = null; };
+  return get;
 }
