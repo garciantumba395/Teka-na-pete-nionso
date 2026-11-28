@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { deriveHandoverCode } from "../handover";
-import { FEES } from "../fees";
+import { FEES, protectionFee } from "../fees";
 import { describeNotification } from "../notifications";
 import { AppError, type LedgerEntry, type ProviderEvent } from "../types";
 import { seedId as S } from "../data/ids";
@@ -2305,5 +2305,324 @@ export function defineContract(label: string, factory: () => Promise<ContractEnv
       });
     });
     // ---- fin agent G
+
+    // ---- agent J : lots (panier d'un même vendeur)
+    describe("lots : plusieurs articles d'un même vendeur, une seule commande", () => {
+      const MARIE = () => S("user-marie");
+      const handDelivery = { deliveryMethod: "hand_delivery" as const };
+      /** n articles du même vendeur (par défaut Marie), chacun à `price`. */
+      async function lot(n: number, price = 2500, over: Record<string, unknown> = {}, sellerId = MARIE()) {
+        const out = [];
+        for (let i = 0; i < n; i++) out.push(await listing(sellerId, { title: `Article de lot ${i + 1}`, priceMinor: price, ...over }));
+        return out;
+      }
+      const statuses = async (ids: string[]) => Promise.all(ids.map(async (id) => (await data.getItem(id))!.status));
+      async function payLot(buyerId: string, orderId: string) {
+        await data.startPayment(orderId, buyerId, { method: "mpesa", msisdn: "0821111111", idempotencyKey: `k-${orderId}` });
+        await env.flush();
+      }
+
+      it("trois articles : une commande, frais de protection calculés sur le total, tous réservés", async () => {
+        const buyer = await signup("0821000401", "Acheteur Lot");
+        const items = await lot(3, 4000);
+        const o = await data.createOrder(buyer.id, { itemIds: items.map((i) => i.id), ...handDelivery });
+        expect(o.itemsMinor).toBe(12_000);
+        expect(o.protectionFeeMinor).toBe(600); // 5 % de 120 $, pas trois fois le minimum
+        expect(o.totalMinor).toBe(12_600);
+        expect([...o.itemIds].sort()).toEqual(items.map((i) => i.id).sort());
+        expect(await statuses(items.map((i) => i.id))).toEqual(["reserved", "reserved", "reserved"]);
+        const v = await data.getOrder(o.id, buyer.id);
+        expect(v.items).toHaveLength(3);
+        expect(v.items.reduce((s, x) => s + x.priceMinor, 0)).toBe(12_000);
+        expect((await data.listMyOrders(buyer.id)).filter((x) => x.id === o.id)).toHaveLength(1);
+      });
+
+      it("le minimum des frais de protection s'applique au TOTAL du lot (pas à chaque article)", async () => {
+        const buyer = await signup("0821000402", "Acheteur Minimum");
+        const items = await lot(3, 100); // 3 x 1 $ : 5 % de 3 $ = 0,15 $ < minimum de 0,50 $
+        const o = await data.createOrder(buyer.id, { itemIds: items.map((i) => i.id), ...handDelivery });
+        expect(o.itemsMinor).toBe(300);
+        expect(o.protectionFeeMinor).toBe(FEES.buyerProtection.fixedMinor.USD);
+        expect(o.totalMinor).toBe(300 + FEES.buyerProtection.fixedMinor.USD);
+      });
+
+      it("un paiement, un code de remise : à la remise les trois articles passent « Vendu », le vendeur reçoit la somme, le grand livre est équilibré", async () => {
+        const buyer = await signup("0821000403", "Acheteur Remise");
+        const items = await lot(3, 4000);
+        const o = await data.createOrder(buyer.id, { itemIds: items.map((i) => i.id), ...handDelivery });
+        await payLot(buyer.id, o.id);
+        expect(await account("order_escrow")).toBe(-12_600);
+        expect(await data.getHandoverCode(o.id, buyer.id)).toBe(deriveHandoverCode(o.id));
+        expect(await statuses(items.map((i) => i.id))).toEqual(["reserved", "reserved", "reserved"]);
+        const done = await data.confirmDelivery(o.id, MARIE(), deriveHandoverCode(o.id));
+        expect(done.status).toBe("completed");
+        expect(await statuses(items.map((i) => i.id))).toEqual(["sold", "sold", "sold"]);
+        expect((await data.getWallet(MARIE())).balances.find((b) => b.currency === "USD")?.availableMinor).toBe(12_000);
+        expect(await account("order_escrow")).toBe(0);
+        expect(await ledgerSum("USD")).toBe(0);
+        // un seul avis par commande, quel que soit le nombre d'articles
+        await data.createReview(o.id, buyer.id, { rating: 5, comment: "Lot complet." });
+        expect(code(await rejects(data.createReview(o.id, buyer.id, { rating: 4, comment: "" })))).toBe("REVIEW_EXISTS");
+      });
+
+      it("refus de deux devises : 422 « Choisis des articles dans la même devise », rien n'est réservé", async () => {
+        const buyer = await signup("0821000404", "Acheteur Devises");
+        const usd = await lot(2, 2500);
+        const cdf = await lot(1, 3_500_000, { currency: "CDF" });
+        const e = await rejects(data.createOrder(buyer.id, { itemIds: [...usd, ...cdf].map((i) => i.id), ...handDelivery }));
+        expect(e.code).toBe("MIXED_CURRENCY");
+        expect(e.status).toBe(422);
+        expect(e.message).toBe("Choisis des articles dans la même devise.");
+        expect(await statuses([...usd, ...cdf].map((i) => i.id))).toEqual(["active", "active", "active"]);
+      });
+
+      it("refus de deux vendeurs : rien n'est réservé", async () => {
+        const buyer = await signup("0821000405", "Acheteur Vendeurs");
+        const a = (await lot(1))[0];
+        const b = (await lot(1, 2500, {}, S("user-patrick")))[0];
+        const e = await rejects(data.createOrder(buyer.id, { itemIds: [a.id, b.id], ...handDelivery }));
+        expect(e.code).toBe("MIXED_SELLERS");
+        expect(await statuses([a.id, b.id])).toEqual(["active", "active"]);
+      });
+
+      it("un article réservé ou vendu dans le lot : la commande échoue en entier, nomme les articles, ne réserve aucun autre", async () => {
+        const buyer = await signup("0821000406", "Acheteur Entier");
+        const rival = await signup("0821000407", "Acheteur Rival");
+        const [a, b, c] = await lot(3, 2000);
+        await data.createOrder(rival.id, { itemIds: [b.id], ...handDelivery }); // b est réservé par un autre
+        const e = await rejects(data.createOrder(buyer.id, { itemIds: [a.id, b.id, c.id], ...handDelivery }));
+        expect(e.code).toBe("ITEM_UNAVAILABLE");
+        expect(e.status).toBe(409);
+        expect(e.message).toContain(b.title);
+        expect(e.details?.itemIds).toBe(b.id);
+        expect(await statuses([a.id, b.id, c.id])).toEqual(["active", "reserved", "active"]);
+        expect(await data.listMyOrders(buyer.id)).toEqual([]);
+      });
+
+      it("le vendeur ne peut pas acheter son propre lot", async () => {
+        const items = await lot(2);
+        expect(code(await rejects(data.createOrder(MARIE(), { itemIds: items.map((i) => i.id), ...handDelivery })))).toBe("SELF_PURCHASE");
+        expect(await statuses(items.map((i) => i.id))).toEqual(["active", "active"]);
+      });
+
+      it("plafond de valeur par commande appliqué au TOTAL : 3 articles de 400 $ dépassent 1 000 $", async () => {
+        const buyer = await signup("0821000408", "Acheteur Plafond");
+        const items = await lot(3, 40_000);
+        const e = await rejects(data.createOrder(buyer.id, { itemIds: items.map((i) => i.id), ...handDelivery }));
+        expect(e.code).toBe("ORDER_TOO_LARGE");
+        expect(e.status).toBe(422);
+        expect(await statuses(items.map((i) => i.id))).toEqual(["active", "active", "active"]);
+        // deux articles (800 $) passent ; un article au plafond exact passe aussi
+        const ok = await data.createOrder(buyer.id, { itemIds: items.slice(0, 2).map((i) => i.id), ...handDelivery });
+        expect(ok.itemsMinor).toBe(80_000);
+        const top = (await lot(1, FEES.maxItemValueUsdMinor))[0];
+        expect((await data.createOrder(buyer.id, { itemIds: [top.id], ...handDelivery })).itemsMinor).toBe(FEES.maxItemValueUsdMinor);
+      });
+
+      it("plafond appliqué aussi en francs : le total converti est comparé au maximum", async () => {
+        const buyer = await signup("0821000409", "Acheteur Francs");
+        const items = await lot(3, 100_000_000, { currency: "CDF" }); // 1 000 000 FC chacun, soit environ 357 $ : trois dépassent 1 000 $
+        expect(code(await rejects(data.createOrder(buyer.id, { itemIds: items.map((i) => i.id), ...handDelivery })))).toBe("ORDER_TOO_LARGE");
+        const two = await data.createOrder(buyer.id, { itemIds: items.slice(0, 2).map((i) => i.id), ...handDelivery });
+        expect(two.currency).toBe("CDF");
+      });
+
+      it("annulation avant paiement et expiration libèrent TOUS les articles", async () => {
+        const buyer = await signup("0821000410", "Acheteur Libère");
+        const items = await lot(3);
+        const o1 = await data.createOrder(buyer.id, { itemIds: items.map((i) => i.id), ...handDelivery });
+        await data.cancelOrder(o1.id, buyer.id);
+        expect(await statuses(items.map((i) => i.id))).toEqual(["active", "active", "active"]);
+        const o2 = await data.createOrder(buyer.id, { itemIds: items.map((i) => i.id), ...handDelivery });
+        env.advance(FEES.orderPaymentTtlMs + 1);
+        expect((await data.getOrder(o2.id, buyer.id)).status).toBe("expired");
+        expect(await statuses(items.map((i) => i.id))).toEqual(["active", "active", "active"]);
+        // ils peuvent être recommandés immédiatement
+        const o3 = await data.createOrder(buyer.id, { itemIds: items.map((i) => i.id), ...handDelivery });
+        expect(o3.status).toBe("pending_payment");
+      });
+
+      it("annulation par le vendeur après paiement : remboursement intégral, tous les articles remis en vente, grand livre équilibré", async () => {
+        const buyer = await signup("0821000411", "Acheteur Rembourse");
+        const items = await lot(3, 4000);
+        const o = await data.createOrder(buyer.id, { itemIds: items.map((i) => i.id), ...handDelivery });
+        await payLot(buyer.id, o.id);
+        await data.cancelOrder(o.id, MARIE());
+        expect((await data.getOrder(o.id, buyer.id)).status).toBe("cancelled");
+        expect(await statuses(items.map((i) => i.id))).toEqual(["active", "active", "active"]);
+        expect(await account("order_escrow")).toBe(0);
+        expect(await account("seller_available")).toBe(0);
+        expect(await ledgerSum("USD")).toBe(0);
+        expect(env.refunds()).toBe(1);
+      });
+
+      it("un seul litige pour le lot : remboursement libère les trois articles, versement au vendeur les vend tous ; grand livre équilibré", async () => {
+        const buyer = await signup("0821000412", "Acheteur Litige");
+        const items = await lot(3, 4000);
+        const o = await data.createOrder(buyer.id, { itemIds: items.map((i) => i.id), ...handDelivery });
+        await payLot(buyer.id, o.id);
+        const d = await data.openDispute(o.id, buyer.id, { reason: "not_as_described", description: "Deux des trois articles sont abîmés." });
+        expect(code(await rejects(data.openDispute(o.id, MARIE(), { reason: "other", description: "Contestation du vendeur." })))).toBe("DISPUTE_EXISTS");
+        await data.resolveDispute(S("user-support-1"), d.id, "refund_buyer");
+        expect(await statuses(items.map((i) => i.id))).toEqual(["active", "active", "active"]);
+        expect(await account("order_escrow")).toBe(0);
+        expect(await ledgerSum("USD")).toBe(0);
+
+        const buyer2 = await signup("0821000413", "Acheteur Litige 2");
+        const o2 = await data.createOrder(buyer2.id, { itemIds: items.map((i) => i.id), ...handDelivery });
+        await payLot(buyer2.id, o2.id);
+        const d2 = await data.openDispute(o2.id, buyer2.id, { reason: "not_received", description: "Le vendeur ne s'est pas présenté." });
+        await data.resolveDispute(S("user-support-1"), d2.id, "release_seller");
+        expect(await statuses(items.map((i) => i.id))).toEqual(["sold", "sold", "sold"]);
+        expect(await account("order_escrow")).toBe(0);
+        expect(await ledgerSum("USD")).toBe(0);
+      });
+
+      it("commande payée jamais remise : le remboursement automatique libère tous les articles", async () => {
+        const buyer = await signup("0821000414", "Acheteur Oublie");
+        const items = await lot(2, 4000);
+        const o = await data.createOrder(buyer.id, { itemIds: items.map((i) => i.id), ...handDelivery });
+        await payLot(buyer.id, o.id);
+        env.advance(FEES.unhandedOrderMs + 1);
+        expect(await data.expireStalePaidOrders()).toBe(1);
+        expect(await statuses(items.map((i) => i.id))).toEqual(["active", "active"]);
+        expect(await ledgerSum("USD")).toBe(0);
+      });
+
+      it("livraison par coursier : frais calculés UNE fois pour la commande, égaux à ceux d'un article seul", async () => {
+        const buyer = await signup("0821000415", "Acheteur Coursier Lot");
+        const items = await lot(3, 3000);
+        const delivery = { deliveryMethod: "courier" as const, deliveryAreaId: S("area-com-limete"), deliveryLandmark: "Avenue de la Paix, portail bleu" };
+        const o = await data.createOrder(buyer.id, { itemIds: items.map((i) => i.id), ...delivery });
+        const single = await data.createOrder(buyer.id, { itemIds: (await lot(1, 3000)).map((i) => i.id), ...delivery });
+        expect(o.shippingMinor).toBeGreaterThan(0);
+        expect(o.shippingMinor).toBe(single.shippingMinor);
+        expect(o.totalMinor).toBe(o.itemsMinor + o.protectionFeeMinor + o.shippingMinor);
+        await payLot(buyer.id, o.id);
+        expect(await ledgerSum("USD")).toBe(0);
+        await data.shipOrder(o.id, MARIE(), { courierName: "Papy Moto", courierPhone: "0899000111" });
+        await data.confirmReceived(o.id, buyer.id);
+        env.advance(FEES.claimWindowMs + 1);
+        expect(await data.releaseDeliveredOrders()).toBe(1);
+        expect(await statuses(items.map((i) => i.id))).toEqual(["sold", "sold", "sold"]);
+        expect(await account("order_escrow")).toBe(0);
+        expect(await ledgerSum("USD")).toBe(0);
+      });
+
+      describe("panier", () => {
+        it("un panier vide est vide ; ajout, doublon refusé, retrait idempotent", async () => {
+          const buyer = await signup("0821000420", "Acheteur Panier");
+          expect(await data.getCart(buyer.id)).toEqual({ count: 0, lots: [] });
+          const [a, b] = await lot(2, 2000);
+          const c1 = await data.addToCart(buyer.id, a.id);
+          expect(c1.count).toBe(1);
+          expect(code(await rejects(data.addToCart(buyer.id, a.id)))).toBe("ALREADY_IN_CART");
+          const c2 = await data.addToCart(buyer.id, b.id);
+          expect(c2.lots).toHaveLength(1);
+          expect(c2.lots[0]).toMatchObject({ sellerId: MARIE(), currency: "USD", itemsMinor: 4000, protectionFeeMinor: protectionFee(4000, "USD"), totalMinor: 4000 + protectionFee(4000, "USD"), overLimit: false });
+          expect(c2.lots[0].lines.map((l) => l.itemId).sort()).toEqual([a.id, b.id].sort());
+          expect(c2.lots[0].quoteItemId).toBe([a.id, b.id].sort()[0]);
+          const c3 = await data.removeFromCart(buyer.id, a.id);
+          expect(c3.count).toBe(1);
+          expect((await data.removeFromCart(buyer.id, a.id)).count).toBe(1); // absent : pas d'erreur
+          expect(await data.getCart(S("user-patrick"))).toEqual({ count: 0, lots: [] }); // le panier d'un autre membre n'est pas le mien
+        });
+
+        it("refuse son propre article, un article vendu ou réservé, un article inconnu", async () => {
+          const buyer = await signup("0821000421", "Acheteur Refus");
+          const other = await signup("0821000422", "Acheteur Autre");
+          const mine = (await lot(1, 2000, {}, buyer.id))[0];
+          expect(code(await rejects(data.addToCart(buyer.id, mine.id)))).toBe("SELF_PURCHASE");
+          const [r, s] = await lot(2, 2000);
+          await data.createOrder(other.id, { itemIds: [r.id], ...handDelivery });
+          expect(code(await rejects(data.addToCart(buyer.id, r.id)))).toBe("ITEM_UNAVAILABLE");
+          const o = await data.createOrder(other.id, { itemIds: [s.id], ...handDelivery });
+          await payLot(other.id, o.id);
+          await data.confirmDelivery(o.id, MARIE(), deriveHandoverCode(o.id));
+          expect((await rejects(data.addToCart(buyer.id, s.id))).message).toMatch(/vendu/);
+          expect(code(await rejects(data.addToCart(buyer.id, "00000000-0000-4000-8000-000000000000")))).toBe("NOT_FOUND");
+          expect((await data.getCart(buyer.id)).count).toBe(0);
+        });
+
+        it("20 articles au plus", async () => {
+          const buyer = await signup("0821000423", "Acheteur Plein");
+          const items = await lot(21, 500);
+          for (const it of items.slice(0, 20)) await data.addToCart(buyer.id, it.id);
+          expect(code(await rejects(data.addToCart(buyer.id, items[20].id)))).toBe("CART_FULL");
+          expect((await data.getCart(buyer.id)).count).toBe(20);
+          // et pas plus de 20 articles dans une commande
+          expect(code(await rejects(data.createOrder(buyer.id, { itemIds: items.map((i) => i.id), ...handDelivery })))).toBe("VALIDATION");
+        });
+
+        it("un lot par vendeur ET par devise ; les frais sont ceux du lot, jamais mélangés", async () => {
+          const buyer = await signup("0821000424", "Acheteur Groupes");
+          const [a] = await lot(1, 2000);
+          const [b] = await lot(1, 3_500_000, { currency: "CDF" });
+          const [c] = await lot(1, 1500, {}, S("user-patrick"));
+          for (const it of [a, b, c]) await data.addToCart(buyer.id, it.id);
+          const cart = await data.getCart(buyer.id);
+          expect(cart.count).toBe(3);
+          expect(cart.lots.map((l) => [l.sellerId, l.currency]).sort()).toEqual([[MARIE(), "CDF"], [MARIE(), "USD"], [S("user-patrick"), "USD"]].sort());
+          const cdf = cart.lots.find((l) => l.currency === "CDF")!;
+          expect(cdf.protectionFeeMinor).toBe(protectionFee(3_500_000, "CDF"));
+        });
+
+        it("un article devenu indisponible est signalé et exclu du total ; la commande refuse tout le lot et nomme l'article", async () => {
+          const buyer = await signup("0821000425", "Acheteur Signalé");
+          const rival = await signup("0821000426", "Acheteur Concurrent");
+          const [a, b, c] = await lot(3, 2000);
+          for (const it of [a, b, c]) await data.addToCart(buyer.id, it.id);
+          await data.createOrder(rival.id, { itemIds: [b.id], ...handDelivery });
+          const cart = await data.getCart(buyer.id);
+          const l = cart.lots[0];
+          expect(l.lines.find((x) => x.itemId === b.id)).toMatchObject({ available: false, reason: "reserved" });
+          expect(l.itemsMinor).toBe(4000);
+          expect(l.orderableItemIds.sort()).toEqual([a.id, c.id].sort());
+          const e = await rejects(data.createOrder(buyer.id, { itemIds: [a.id, b.id, c.id], ...handDelivery }));
+          expect(e.code).toBe("ITEM_UNAVAILABLE");
+          expect(e.message).toContain(b.title);
+          expect(await statuses([a.id, c.id])).toEqual(["active", "active"]);
+          // le retrait de l'article puis la commande du reste réussissent
+          await data.removeFromCart(buyer.id, b.id);
+          const ok = await data.createOrder(buyer.id, { itemIds: (await data.getCart(buyer.id)).lots[0].orderableItemIds, ...handDelivery });
+          expect(ok.itemsMinor).toBe(4000);
+        });
+
+        it("commander un lot vide le panier de ces articles seulement ; un article libéré peut être ajouté de nouveau", async () => {
+          const buyer = await signup("0821000427", "Acheteur Vide");
+          const [a, b] = await lot(2, 2000);
+          const [p] = await lot(1, 1500, {}, S("user-patrick"));
+          for (const it of [a, b, p]) await data.addToCart(buyer.id, it.id);
+          const o = await data.createOrder(buyer.id, { itemIds: [a.id, b.id], ...handDelivery });
+          const left = await data.getCart(buyer.id);
+          expect(left.count).toBe(1);
+          expect(left.lots[0].sellerId).toBe(S("user-patrick"));
+          await data.cancelOrder(o.id, buyer.id);
+          expect((await data.addToCart(buyer.id, a.id)).count).toBe(2);
+        });
+
+        it("suppression du compte : le panier disparaît", async () => {
+          const buyer = await signup("0821000428", "Acheteur Parti");
+          const [a] = await lot(1, 2000);
+          await data.addToCart(buyer.id, a.id);
+          await data.deleteAccount(buyer.id);
+          expect(code(await rejects(data.addToCart(buyer.id, a.id)))).toBe("NOT_FOUND");
+          expect((await data.getCart(buyer.id)).count).toBe(0);
+        });
+
+        it("annonce retirée par son vendeur : signalée « plus disponible » dans le panier", async () => {
+          const buyer = await signup("0821000429", "Acheteur Retrait");
+          const seller = await signup("0811000430", "Vendeur Partant");
+          const [a, b] = await lot(2, 2000, {}, seller.id);
+          await data.addToCart(buyer.id, a.id);
+          await data.addToCart(buyer.id, b.id);
+          await data.deleteAccount(seller.id);
+          const cart = await data.getCart(buyer.id);
+          expect(cart.lots[0].lines.every((x) => !x.available && x.reason === "unavailable")).toBe(true);
+          expect(cart.lots[0].orderableItemIds).toEqual([]);
+        });
+      });
+    });
+    // ---- fin agent J
   });
 }

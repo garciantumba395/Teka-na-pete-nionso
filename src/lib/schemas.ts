@@ -130,3 +130,7 @@ export function parseId(raw: string, what = "Ressource"): string {
   if (!r.success) throw new AppError("NOT_FOUND", `${what} introuvable.`, 404);
   return r.data;
 }
+
+// ---- agent J : lots
+export const cartItem = z.object({ itemId: uuid });
+// ---- fin agent J

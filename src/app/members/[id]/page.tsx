@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
+import { AddToCartButton } from "@/components/client/AddToCartButton";
 import { Icon } from "@/components/icons";
 import { AppBar, Avatar, EmptyState, ListingCard, Stars } from "@/components/ui";
 import Link from "next/link";
@@ -20,6 +21,8 @@ export default async function MemberPage({ params }: Props) {
   if (!profile) notFound();
   const me = await currentUser();
   const [items, areas, reviews] = await Promise.all([data.listItems({ sellerId: id, includeSold: true }), data.listAreas(), data.listReviews(id)]);
+  const cart = me && me.id !== id ? await data.getCart(me.id) : null; // ---- agent J
+  const inCart = new Set(cart?.lots.flatMap((l) => l.lines.map((x) => x.itemId)) ?? []);
   const area = areas.find((a) => a.id === profile.areaId);
   return (
     <div style={{ maxWidth: "var(--layout-content-max)", margin: "0 auto" }}>
@@ -51,11 +54,17 @@ export default async function MemberPage({ params }: Props) {
         </section>
         <section aria-labelledby="their-items">
           <h2 id="their-items" className="h2" style={{ marginBottom: "var(--space-12)" }}>Annonces</h2>
+          {cart && cart.count > 0 && <p style={{ margin: "0 0 var(--space-12)" }}><Link href="/cart">Voir mon panier ({cart.count})</Link></p>}
           {items.length === 0 ? (
             <EmptyState title="Aucune annonce en ce moment">Reviens plus tard.</EmptyState>
           ) : (
             <ul className="grid" style={{ listStyle: "none", padding: 0, margin: 0 }}>
-              {items.map((it) => <li key={it.id}><ListingCard item={it} /></li>)}
+              {items.map((it) => (
+                <li key={it.id} style={{ display: "grid", gap: "var(--space-8)", alignContent: "start" }}>
+                  <ListingCard item={it} />
+                  {it.status === "active" && me?.id !== id && <AddToCartButton itemId={it.id} inCart={inCart.has(it.id)} className="btn btn-secondary btn-sm" label="Ajouter au panier" />}
+                </li>
+              ))}
             </ul>
           )}
         </section>

@@ -421,3 +421,41 @@ export interface ReportView {
   status: ReportStatus;
   createdAt: number;
 }
+
+// ---- agent J : lots (panier d'un même vendeur)
+/** Un article du panier. `available` : peut être commandé maintenant ; sinon `reason` dit pourquoi. */
+export interface CartLine {
+  itemId: string;
+  title: string;
+  photo: string | null;
+  priceMinor: number;
+  currency: Currency;
+  available: boolean;
+  /** « reserved » : un autre acheteur le paie ; « sold » ; « unavailable » : retiré ou masqué. */
+  reason: "reserved" | "sold" | "unavailable" | null;
+  addedAt: number;
+}
+
+/** Un lot = les articles d'UN vendeur dans UNE devise : il donne une seule commande. */
+export interface CartLot {
+  sellerId: string;
+  sellerName: string;
+  currency: Currency;
+  lines: CartLine[];
+  /** Sous-total et frais calculés par le serveur sur les seuls articles disponibles. */
+  itemsMinor: number;
+  protectionFeeMinor: number;
+  totalMinor: number;
+  /** Articles commandables (identifiants à envoyer à la commande). */
+  orderableItemIds: string[];
+  /** Article de référence pour le devis de livraison (frais calculés une seule fois pour la commande). */
+  quoteItemId: string | null;
+  /** true si le total dépasse le plafond par commande. */
+  overLimit: boolean;
+}
+
+export interface CartView {
+  count: number;
+  lots: CartLot[];
+}
+// ---- fin agent J

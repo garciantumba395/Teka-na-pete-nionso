@@ -1,5 +1,6 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import type { CourierFeeMode } from "../fees";
+import { assertLotOrderable, buildCartView, CART_MAX_ITEMS, type CartRow } from "../cart";
 import { COURIER_FEE_MODES, FEES, payoutFee, protectionFee, shippingFee, shippingZone } from "../fees";
 import { assertTransition } from "../fsm";
 import { coarsen, distanceKm } from "../geo";
@@ -117,6 +118,10 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
   interface EvidenceRec { id: string; disputeId: string; authorId: string; staff: boolean; photoId: string; note: string; createdAt: number }
   const privatePhotos = new Map<string, PrivatePhotoRec>();
   const evidenceRows: EvidenceRec[] = [];
+
+  // ---- agent J : lots
+  const carts = new Map<string, Map<string, number>>(); // userId -> (itemId -> date d'ajout)
+  // ---- fin agent J
 
   // ---- agent C : notifications
   const sms = opts.sms ?? new ConsoleSmsProvider();
@@ -446,6 +451,22 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
   }
 
   // ------------------------------------------------------------------------ API
+
+  // ---- agent J : lots
+  function cartView(userId: string) {
+    const rows: CartRow[] = [];
+    for (const [itemId, addedAt] of carts.get(userId) ?? []) {
+      const it = items.get(itemId);
+      if (!it) continue;
+      rows.push({
+        itemId, title: it.title, photo: it.photos[0] ?? null, priceMinor: it.priceMinor, currency: it.currency, status: it.status,
+        sellerId: it.sellerId, sellerName: users.get(it.sellerId)?.displayName ?? "Membre", addedAt,
+      });
+    }
+    return buildCartView(rows, FEES);
+  }
+  // ---- fin agent J
+
   const api: FakeData = {
     __provider: provider,
     __sms: sms,
@@ -557,6 +578,7 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
       deleted.add(userId);
       for (let i = notifs.length - 1; i >= 0; i--) if (notifs[i].userId === userId) notifs.splice(i, 1);
       smsPrefs.delete(userId);
+      carts.delete(userId); // ---- agent J
       await api.deleteAllSessions(userId);
     },
     async getPhoto() {
@@ -705,16 +727,10 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
       if (!ids.length) throw new AppError("VALIDATION", "Choisis au moins un article.", 422);
       const list = ids.map((id) => items.get(id));
       if (list.some((x) => !x)) throw notFound("Article");
-      const its = list as Item[];
-      if (its.some((i) => i.sellerId === buyerId)) throw new AppError("SELF_PURCHASE", "Tu ne peux pas acheter ton propre article.", 409);
-      if (new Set(its.map((i) => i.sellerId)).size > 1) throw new AppError("MIXED_SELLERS", "Un achat groupé ne concerne qu'un seul vendeur.", 409);
-      if (new Set(its.map((i) => i.currency)).size > 1) throw new AppError("MIXED_CURRENCY", "Les articles doivent être dans la même devise.", 409);
-      // Réservation atomique : vérification de tous les articles puis écriture, sans point d'attente entre les deux.
-      for (const i of its) {
-        if (i.status !== "active" || openItem.has(i.id)) throw new AppError("ITEM_UNAVAILABLE", "Cet article n'est plus disponible.", 409);
-      }
-      const currency = its[0].currency;
-      const itemsMinor = its.reduce((s, i) => s + i.priceMinor, 0);
+      // Ordre fixe (par identifiant) : même article de référence pour le devis de livraison que la couche PostgreSQL.
+      const its = (list as Item[]).sort((a, b) => (a.id < b.id ? -1 : 1));
+      // Réservation atomique : toutes les règles du lot sont vérifiées, puis tous les articles sont réservés, sans point d'attente entre les deux.
+      const { currency, itemsMinor } = assertLotOrderable(buyerId, its, FEES);
       const fee = protectionFee(itemsMinor, currency);
       // ---- agent D : livraison par coursier (commune de l'acheteur + repère obligatoires, frais selon la grille)
       let shippingMinor = 0;
@@ -730,13 +746,14 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
         id: randomUUID(), buyerId, sellerId: its[0].sellerId, status: "pending_payment", currency,
         itemsMinor, shippingMinor, protectionFeeMinor: fee, totalMinor: itemsMinor + shippingMinor + fee, autoReleaseAt: null,
         deliveryMethod: input.deliveryMethod, deliveryAreaId: input.deliveryAreaId ?? null,
-        deliveryLandmark: input.deliveryLandmark?.trim().slice(0, 200) || null, itemIds: ids,
+        deliveryLandmark: input.deliveryLandmark?.trim().slice(0, 200) || null, itemIds: its.map((i) => i.id),
         paymentExpiresAt: now() + FEES.orderPaymentTtlMs, paidAt: null, deliveredAt: null, completedAt: null, cancelledAt: null, createdAt: now(),
       };
       orders.set(order.id, order);
       for (const i of its) {
         i.status = "reserved";
         openItem.set(i.id, order.id);
+        carts.get(buyerId)?.delete(i.id); // ---- agent J : les articles commandés quittent le panier
       }
       return order;
     },
@@ -1527,6 +1544,31 @@ export function createFakeData(opts: FakeOptions = {}): FakeData {
       return c;
     },
     // ---- fin agent C : notifications
+
+    // ---- agent J : lots (panier d'un même vendeur)
+    async getCart(userId) {
+      if (!users.has(userId)) throw notFound("Compte");
+      return cartView(userId);
+    },
+    async addToCart(userId, itemId) {
+      if (!users.has(userId) || deleted.has(userId)) throw notFound("Compte");
+      const it = items.get(itemId);
+      if (!it || it.status === "draft") throw notFound("Article");
+      if (it.sellerId === userId) throw new AppError("SELF_PURCHASE", "Tu ne peux pas ajouter ton propre article au panier.", 409);
+      const cart = carts.get(userId) ?? new Map<string, number>();
+      if (cart.has(itemId)) throw new AppError("ALREADY_IN_CART", "Cet article est déjà dans ton panier.", 409);
+      if (it.status !== "active") throw new AppError("ITEM_UNAVAILABLE", it.status === "sold" ? "Cet article est déjà vendu." : "Cet article n'est plus disponible.", 409);
+      if (cart.size >= CART_MAX_ITEMS) throw new AppError("CART_FULL", `Ton panier est plein (${CART_MAX_ITEMS} articles au plus).`, 409);
+      cart.set(itemId, now());
+      carts.set(userId, cart);
+      return cartView(userId);
+    },
+    async removeFromCart(userId, itemId) {
+      if (!users.has(userId)) throw notFound("Compte");
+      carts.get(userId)?.delete(itemId);
+      return cartView(userId);
+    },
+    // ---- fin agent J
   };
 
   return api;

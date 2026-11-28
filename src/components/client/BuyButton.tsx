@@ -37,7 +37,7 @@ export function BuyButton({ itemId, label }: { itemId: string; label: string }) 
   }
 
   return (
-    <div style={{ flex: 1, display: "grid", gap: 4 }}>
+    <div className="cta-buy">
       <button className="btn btn-primary btn-lg" onClick={buy} disabled={busy} aria-busy={busy || undefined} aria-describedby={error ? "buy-err" : undefined}>
         {label}
       </button>
