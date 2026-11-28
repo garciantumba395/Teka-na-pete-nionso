@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
+import { AddToCartButton } from "@/components/client/AddToCartButton";
 import { BuyButton } from "@/components/client/BuyButton";
 import { DeliveryPicker } from "@/components/client/DeliveryChoice";
 import { StartChatButton } from "@/components/client/StartChatButton";
@@ -24,6 +25,7 @@ export default async function ItemPage({ params }: Props) {
   const me = await currentUser();
   const item = await getData().getItem(id, me?.id);
   if (!item) notFound();
+  const inCart = me ? (await getData().getCart(me.id)).lots.some((l) => l.lines.some((x) => x.itemId === item.id)) : false; // ---- agent J
 
   const own = me?.id === item.sellerId;
   const available = item.status === "active";
@@ -102,8 +104,9 @@ export default async function ItemPage({ params }: Props) {
         <div className="cta-bar"><StartChatButton itemId={item.id} className="btn btn-secondary btn-lg" /></div>
       )}
       {available && !own && (
-        <div className="cta-bar">
-          <StartChatButton itemId={item.id} label="Écrire" />
+        <div className="cta-bar cta-bar-3">
+          <div className="cta-sec"><StartChatButton itemId={item.id} label="Écrire" /></div>
+          <div className="cta-sec"><AddToCartButton itemId={item.id} inCart={inCart} /></div>
           <BuyButton itemId={item.id} label={`Acheter · ${formatMoney(item.protectedPriceMinor, item.currency)}`} />
         </div>
       )}

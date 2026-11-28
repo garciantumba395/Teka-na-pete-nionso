@@ -30,6 +30,7 @@ import type {
   Currency,
   DeliveryMethod,
   ShippingQuote,
+  CartView,
 } from "../types";
 import type { PublicProhibitedRule } from "../prohibited";
 import type { NotificationList, SmsPreferences } from "../notifications";
@@ -202,4 +203,13 @@ export interface DataLayer {
   /** Supprime les notifications LUES depuis plus de 90 jours. Retourne leur nombre. */
   purgeOldNotifications(): Promise<number>;
   // ---- fin agent C : notifications
+
+  // ---- agent J : lots (panier d'un même vendeur)
+  /** Panier du membre, groupé en lots (un vendeur, une devise). Sous-totaux et frais calculés par le serveur. */
+  getCart(userId: string): Promise<CartView>;
+  /** 404 article inconnu ; 409 SELF_PURCHASE, ITEM_UNAVAILABLE (réservé, vendu, retiré), ALREADY_IN_CART, CART_FULL (20 au plus). */
+  addToCart(userId: string, itemId: string): Promise<CartView>;
+  /** Idempotent : retirer un article absent ne fait pas d'erreur. */
+  removeFromCart(userId: string, itemId: string): Promise<CartView>;
+  // ---- fin agent J
 }

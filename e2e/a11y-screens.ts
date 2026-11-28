@@ -58,6 +58,19 @@ export function defineA11y(label: string) {
       await check("S03 recherche avec marque, taille et état", bp, "/search?brand=zephyr&size=M&condition=good&condition=new");
       await check("S21 notifications (vide)", bp, "/notifications"); // agent C
       await check("S22 réglages des notifications", bp, "/me/notifications"); // agent C
+      // ---- agent J : lots (panier)
+      await check("Panier (vide)", bp, "/cart");
+      const lotA = await apiListing(seller.request, { priceMinor: 2000 });
+      const lotB = await apiListing(seller.request, { priceMinor: 1500 });
+      await buyer.request.post("/api/v1/cart", { data: { itemId: lotA.id } });
+      await buyer.request.post("/api/v1/cart", { data: { itemId: lotB.id } });
+      await check("Fiche article avec « Ajouter au panier » (acheteur connecté)", bp, `/items/${lotA.id}`);
+      await check("Panier (lot de deux articles)", bp, "/cart");
+      await check("Panier (lot, choix de livraison ouvert)", bp, "/cart", async () => { await bp.getByRole("button", { name: /^Commander le lot/ }).click(); await bp.getByRole("button", { name: "Confirmer la commande du lot" }).waitFor(); });
+      await check("Profil public avec « Ajouter au panier »", bp, `/members/${seller.userId}`);
+      await buyer.request.post("/api/v1/cart/remove", { data: { itemId: lotA.id } });
+      await buyer.request.post("/api/v1/cart/remove", { data: { itemId: lotB.id } });
+      // ---- fin agent J
       // vendeur
       const sp = seller.page;
       await check("S09 commande payée (vendeur, demande d'annulation à traiter + saisie du code)", sp, `/orders/${paidId}`);

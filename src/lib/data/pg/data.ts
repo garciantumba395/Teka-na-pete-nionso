@@ -1,4 +1,5 @@
 import { createHash, createHmac, randomBytes, randomInt, randomUUID, timingSafeEqual } from "node:crypto";
+import { assertLotOrderable, buildCartView, CART_MAX_ITEMS, type CartRow } from "../../cart";
 import { APP_NAME } from "../../copy";
 import { payoutFee, protectionFee, shippingFee, shippingZone, type ShippingZone } from "../../fees";
 import { coarsen } from "../../geo";
@@ -115,6 +116,21 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
   const fixedOtp = prod ? undefined : (opts.otpCode ?? process.env.DEV_FIXED_OTP);
   const otpSecret = opts.otpSecret ?? process.env.OTP_SECRET ?? "dev-only-otp-secret-change-me";
   const getFees = createSettingsLoader(pool, now, opts.settingsTtlMs ?? 30_000);
+
+  // ---- agent J : lots
+  async function cartOf(q: Queryable, userId: string, fees?: Awaited<ReturnType<typeof getFees>>) {
+    const r = await q.query(
+      `select ci.item_id, ci.added_at, i.title, i.price_minor, i.currency, i.status, i.seller_id, p.display_name as seller_name,
+              (select storage_path from item_photos where item_id = i.id order by position limit 1) as path
+       from cart_items ci join items i on i.id = ci.item_id join profiles p on p.id = i.seller_id
+       where ci.user_id = $1`, [userId]);
+    const rows: CartRow[] = r.rows.map((x) => ({
+      itemId: x.item_id, title: x.title, photo: x.path ? photoUrl(x.path) : null, priceMinor: x.price_minor, currency: x.currency as Currency,
+      status: x.status, sellerId: x.seller_id, sellerName: x.seller_name, addedAt: x.added_at.getTime(),
+    }));
+    return buildCartView(rows, fees ?? (await getFees()));
+  }
+  // ---- fin agent J
   const prohibited = createProhibitedLoader(pool, now, opts.settingsTtlMs ?? 30_000); // agent E
   const queue: ProviderEvent[] = [];
 
@@ -605,6 +621,7 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
         await c.query(`update items set status = 'removed' where seller_id = $1 and status in ('active','draft')`, [userId]);
         await c.query(`delete from sessions where user_id = $1`, [userId]);
         await c.query(`delete from favourites where user_id = $1`, [userId]);
+        await c.query(`delete from cart_items where user_id = $1`, [userId]); // ---- agent J
         await c.query(`delete from devices where user_id = $1`, [userId]);
         await c.query(`delete from notifications where user_id = $1`, [userId]);
         await c.query(`delete from notification_preferences where user_id = $1`, [userId]);
@@ -838,12 +855,12 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
           // Verrou de ligne, dans un ORDRE FIXE (par id) : deux acheteurs concurrents sont sérialisés, sans interblocage.
           const rows = (await c.query(`select * from items where id = any($1::uuid[]) order by id for update`, [ids])).rows;
           if (rows.length !== ids.length) throw notFound("Article");
-          if (rows.some((i) => i.seller_id === buyerId)) throw new AppError("SELF_PURCHASE", "Tu ne peux pas acheter ton propre article.", 409);
-          if (new Set(rows.map((i) => i.seller_id)).size > 1) throw new AppError("MIXED_SELLERS", "Un achat groupé ne concerne qu'un seul vendeur.", 409);
-          if (new Set(rows.map((i) => i.currency)).size > 1) throw new AppError("MIXED_CURRENCY", "Les articles doivent être dans la même devise.", 409);
-          if (rows.some((i) => i.status !== "active")) throw new AppError("ITEM_UNAVAILABLE", "Cet article n'est plus disponible.", 409);
-          const currency = rows[0].currency as Currency;
-          const itemsMinor = rows.reduce((s, i) => s + i.price_minor, 0);
+          // Toutes les règles du lot (même code que la couche factice), puis réservation de TOUS les articles dans cette transaction : tout ou rien.
+          const { currency, itemsMinor } = assertLotOrderable(
+            buyerId,
+            rows.map((i) => ({ id: i.id, title: i.title, sellerId: i.seller_id, currency: i.currency as Currency, priceMinor: i.price_minor, status: i.status })),
+            fees,
+          );
           const fee = protectionFee(itemsMinor, currency, fees);
           // ---- agent D : livraison par coursier (commune de l'acheteur + repère obligatoires, frais selon la grille)
           let shippingMinor = 0;
@@ -870,7 +887,8 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
             await c.query(`insert into order_items (order_id, item_id, price_minor, currency) values ($1,$2,$3,$4)`, [o.id, i.id, i.price_minor, i.currency]);
             await c.query(`update items set status = 'reserved' where id = $1`, [i.id]);
           }
-          return orderOf({ ...o, item_ids: ids });
+          await c.query(`delete from cart_items where user_id = $1 and item_id = any($2::uuid[])`, [buyerId, ids]); // ---- agent J : les articles commandés quittent le panier
+          return orderOf({ ...o, item_ids: rows.map((i) => i.id as string) });
         });
       } catch (e) {
         // Filet de sécurité : l'index unique partiel order_items_one_open_per_item tranche si le verrou était contourné.
@@ -1640,6 +1658,39 @@ export function createPgData(pool: Pool, opts: PgOptions = {}): PgData {
       return (await pool.query(`delete from notifications where read_at is not null and read_at < $1`, [ts(now() - NOTIFICATIONS_RETENTION_DAYS * ONE_DAY)])).rowCount ?? 0;
     },
     // ---- fin agent C : notifications
+
+    // ---- agent J : lots (panier d'un même vendeur)
+    async getCart(userId) {
+      if (!isUuid(userId)) throw notFound("Compte");
+      return cartOf(pool, userId);
+    },
+    async addToCart(userId, itemId) {
+      if (!isUuid(userId)) throw notFound("Compte");
+      if (!isUuid(itemId)) throw notFound("Article");
+      const fees = await getFees(); // avant la transaction : ne jamais demander une 2e connexion du pool en tenant la première
+      return withTx(pool, async (c) => {
+        // Verrou par membre : le plafond de 20 articles tient même si deux ajouts arrivent en même temps.
+        await c.query(`select pg_advisory_xact_lock(hashtext($1))`, [`cart:${userId}`]);
+        const me = (await c.query(`select 1 from profiles where id = $1 and deleted_at is null`, [userId])).rows[0];
+        if (!me) throw notFound("Compte");
+        const it = (await c.query(`select id, seller_id, status from items where id = $1`, [itemId])).rows[0];
+        if (!it || it.status === "draft") throw notFound("Article");
+        if (it.seller_id === userId) throw new AppError("SELF_PURCHASE", "Tu ne peux pas ajouter ton propre article au panier.", 409);
+        const have = (await c.query(`select 1 from cart_items where user_id = $1 and item_id = $2`, [userId, itemId])).rowCount;
+        if (have) throw new AppError("ALREADY_IN_CART", "Cet article est déjà dans ton panier.", 409);
+        if (it.status !== "active") throw new AppError("ITEM_UNAVAILABLE", it.status === "sold" ? "Cet article est déjà vendu." : "Cet article n'est plus disponible.", 409);
+        const n = (await c.query(`select count(*)::int as n from cart_items where user_id = $1`, [userId])).rows[0].n as number;
+        if (n >= CART_MAX_ITEMS) throw new AppError("CART_FULL", `Ton panier est plein (${CART_MAX_ITEMS} articles au plus).`, 409);
+        await c.query(`insert into cart_items (user_id, item_id, added_at) values ($1,$2,$3)`, [userId, itemId, ts(now())]);
+        return cartOf(c, userId, fees);
+      });
+    },
+    async removeFromCart(userId, itemId) {
+      if (!isUuid(userId)) throw notFound("Compte");
+      if (isUuid(itemId)) await pool.query(`delete from cart_items where user_id = $1 and item_id = $2`, [userId, itemId]);
+      return cartOf(pool, userId);
+    },
+    // ---- fin agent J
 
     async listPayouts(userId) {
       const r = await pool.query(`select * from payouts where user_id = $1 order by requested_at desc limit 100`, [userId]);

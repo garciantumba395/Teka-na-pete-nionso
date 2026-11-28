@@ -109,3 +109,12 @@ a.chip { text-decoration: none; }
 .notif-new { font-size: var(--text-xs-size); font-weight: 700; padding: 0 var(--space-8); border-radius: var(--radius-pill); background: var(--color-accent); color: var(--color-on-accent); }
 .notif-actions { display: flex; justify-content: space-between; align-items: center; gap: var(--space-12); flex-wrap: wrap; }
 /* ---- fin agent C : notifications */
+
+/* ---- agent J : lots (panier d'un même vendeur) */
+.cta-buy { flex: 1; display: grid; gap: var(--space-4); min-width: 0; }
+.cta-bar-3 { flex-wrap: wrap; }
+.cta-bar-3 > .cta-sec { flex: 1 1 0; min-width: 0; }
+.cta-bar-3 > .cta-sec .btn { padding-inline: var(--space-8); white-space: normal; text-align: center; }
+.cta-bar-3 > .cta-buy { order: -1; flex: 1 1 100%; }
+@media (min-width: 560px) { .cta-bar-3 > .cta-buy { order: 0; flex: 2 1 0; } }
+/* ---- fin agent J */

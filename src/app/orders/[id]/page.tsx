@@ -151,7 +151,7 @@ export default async function OrderPage({ params }: { params: Promise<{ id: stri
         )}
 
         <section className="stack" aria-labelledby="detail">
-          <h2 id="detail" className="h2">Détail</h2>
+          <h2 id="detail" className="h2">{order.items.length > 1 ? `Détail du lot (${order.items.length} articles)` : "Détail"}</h2>
           <ul style={{ listStyle: "none", padding: 0, margin: 0, display: "grid", gap: 8 }}>
             {order.items.map((it) => (
               <li key={it.id} style={{ display: "flex", gap: 12, alignItems: "center" }}>

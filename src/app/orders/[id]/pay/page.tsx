@@ -27,7 +27,7 @@ export default async function PayPage({ params }: { params: Promise<{ id: string
 
   return (
     <div className="narrow">
-      <AppBar title="Paiement" back={`/items/${order.items[0]?.id ?? ""}`} />
+      <AppBar title="Paiement" back={order.items.length > 1 ? "/cart" : `/items/${order.items[0]?.id ?? ""}`} />
       <div className="pad stack-lg">
         <section className="stack" aria-labelledby="recap">
           <h2 id="recap" className="h2">Ta commande</h2>
